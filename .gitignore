@@ -1,0 +1,25 @@
+# ===== 敏感信息(绝不提交)=====
+# 真实 apiKey 存放于此;docker-compose 经 env_file 引用,ov.conf 内用 ${VAR} 占位
+secrets.env
+.env
+*.env.local
+
+# ===== OpenViking 运行态数据(不纳入版本控制)=====
+# 容器以 root 写入:vectordb / queue / sessions / 日志 / pid 等
+/workspace/
+
+# ===== 编辑器 / IDE / 系统 =====
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-workspace
+
+# ===== Python(预留本地脚本)=====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
