@@ -49,6 +49,22 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 > 本仓库无 build / lint / test —— 它是部署配置,不是代码项目。验证手段是上面的 `doctor` + `health`。
 
+## 运维脚本(自动化)
+
+仓库根目录下三个脚本(已 `chmod +x`),对标 ollama 仓的同名脚本:
+
+- **`update-openviking.sh`** — 自动更新:`docker compose pull` → `up -d --remove-orphans` → 清悬空镜像,全程写 `update-openviking.log`(超 8 万行轮转)。**关键:`up -d` 后轮询容器到 `healthy`,再跑 `docker exec openviking openviking-server doctor` 做端到端验证**——healthcheck 只查端口(见坑 #2),不验证 `${VAR}` 展开 / 后端连通。doctor 失败只告警不退出(它依赖本机 qwen 后端 + 远程 kimi,任一未就绪都会失败,非镜像更新问题)。`up -d` 等同 down+up,顺带让 ov.conf/secrets.env 变更生效。
+- **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除 openviking 容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
+- **`setup-cron.sh`** — 幂等设定 crontab:每天 **6:30** 跑 `update-openviking.sh`(marker 去重)。时间错开 ollama 的 6:00,避免同机同时拉镜像 / 重建。
+
+```bash
+./setup-cron.sh          # 设定每天 6:30 自动更新(一次性)
+./update-openviking.sh   # 立即手动更新一次
+./cleanup-containers.sh  # 停并移除容器
+```
+
+> 三个脚本本身**进 git**;它们写的 `update-openviking.log`(及轮转临时 `*.tmp`)已被 `.gitignore` 的 `*.log`/`*.tmp` 忽略。
+
 ## 关键坑(openviking 0.3.23 源码核对,改配置前必读)
 
 1. **改 `ov.conf` 后必须 `docker compose down && up -d`。** `restart`/`reload` 无效:ov.conf 是单文件 bind-mount,宿主文件被编辑器原子替换后 inode 变化,容器仍挂载旧 inode;`expandvars` 也只在启动读文件那一次执行。
@@ -70,4 +86,5 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 - `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
 - `ov.conf` — openviking 主配置(占位符版,**进 git**)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
+- `cleanup-containers.sh` / `update-openviking.sh` / `setup-cron.sh` — 运维脚本(清理 / 自动更新 / 设 cron),**进 git**;详见上文「运维脚本」。
 - `workspace/` — openviking 运行态数据(vectordb / queue / sessions / pid),容器以 root 写,**gitignore**。

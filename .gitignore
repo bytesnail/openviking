@@ -18,6 +18,11 @@ Thumbs.db
 .vscode/
 *.sublime-workspace
 
+# ===== 运行时日志 =====
+# update-openviking.sh 持续写入并按行数轮转
+*.log
+*.tmp
+
 # ===== Python(预留本地脚本)=====
 __pycache__/
 *.py[cod]
