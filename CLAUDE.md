@@ -82,6 +82,8 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 7. **非对称 embedding**:ov.conf 的 `embedding.dense` 用 `query_param:"query"` + `document_param:"document"` 启用。query 侧经 8021 代理注入官方前缀(实时),document 侧裸文本。改这个配置后**已入库的 document 向量无需重建**(两种方式余弦一致)。
 
+8. **vlm/query_planner 必须显式设 `"temperature":1`。** kimi-for-coding 是强制 reasoning 模型,只收 `temperature=1`(<1 报 `only 1 is allowed for this model`;>1 报 `must not be greater than 1`);而 `VLMConfig.temperature` 默认 `0.0`,ov.conf 不覆盖 → openviking 实发 `0.0` → 每次 vlm/query_planner 真实 chat completion 必被 kimi 400。**容器照常 healthy,`doctor` 照报 `VLM: PASS`**(`doctor` 的 `check_vlm` 只校验配置/api_key 存在,**不发 chat**),极易潜伏(本仓曾因此静默挂了数天未被发现)。验证 vlm/query_planner 可用性**只能靠真实调用**,例如:`docker exec -i openviking python3 -c "import asyncio;from openviking_cli.utils.config import get_openviking_config as g;c=g();print(asyncio.run(c.vlm.get_completion_async('1+1=?')))"`,或直接 `curl` `/v1/chat/completions` 带 `temperature=1` 的最小请求。**`doctor` 的 `VLM: PASS` 不是 vlm 可用性的判据。**
+
 ## 文件
 
 - `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
