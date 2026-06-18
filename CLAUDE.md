@@ -15,6 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 架构与网络(理解一切配置的前提)
 
 - openviking 容器 `network_mode: host` → **容器内 `127.0.0.1` 就是宿主机**。所有"本地后端"地址都写 `127.0.0.1`。容器对外监听 `0.0.0.0:1933`。
+- **对外暴露注意**:host 网络下容器直接监听宿主**所有网卡**的 `1933`(ov.conf `server.host:"0.0.0.0"` + `auth_mode:"api_key"`),同 LAN 任意主机可达,仅靠 `${OPENVIKING_ROOT_API_KEY}` 鉴权。需要收口时用防火墙 / 绑定特定网卡,不要只依赖 api_key。
 - 本机后端(仅监听宿主 `127.0.0.1`,不对外暴露):
   - **embedding**:`127.0.0.1:8021` 是一层零依赖 Python 透明代理(按请求体 `input_type` 为 query 时注入 qwen3 官方前缀),转发到内部 `127.0.0.1:8031` 的 llama-server(Qwen3-Embedding-0.6B,维度 **1024**)。
   - **reranker**:`127.0.0.1:8022`(llama-server,qwen3-reranker-0.6b)。
@@ -63,7 +64,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 ./cleanup-containers.sh  # 停并移除容器
 ```
 
-> 三个脚本本身**进 git**;它们写的 `update-openviking.log`(及轮转临时 `*.tmp`)已被 `.gitignore` 的 `*.log`/`*.tmp` 忽略。
+> 三个脚本本身**进 git**;它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止 cron 与手动触发重叠)均已被 `.gitignore` 忽略。
 
 ## 关键坑(openviking 0.3.23 源码核对,改配置前必读)
 
