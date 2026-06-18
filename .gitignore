@@ -22,6 +22,8 @@ Thumbs.db
 # update-openviking.sh 持续写入并按行数轮转
 *.log
 *.tmp
+# update-openviking.sh 的并发互斥锁（flock fd 持有，自动创建）
+.update-openviking.lock
 
 # ===== Python(预留本地脚本)=====
 __pycache__/

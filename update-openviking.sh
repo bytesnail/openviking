@@ -59,6 +59,22 @@ if [ ! -f "$COMPOSE_FILE" ]; then
     exit 1
 fi
 
+# secrets.env 是 ov.conf 里 ${VAR} 占位符的唯一来源（docker-compose env_file 注入）。
+# 缺失时容器照常 healthy，但所有 ${VAR} 停留在字面值、后端全 401（见 CLAUDE.md 坑 #2）—— up 之前先拦下。
+if [ ! -f "${COMPOSE_DIR}/secrets.env" ]; then
+    log "❌ 未找到 secrets.env —— \${VAR} 占位符不会被展开（坑 #2），容器会 healthy 但后端全 401，退出"
+    exit 1
+fi
+
+# 并发互斥：cron（6:30）与手动触发可能重叠，同一时间只允许一个实例。
+# 否则 rotate_log 的 tail>tmp>mv 与另一实例的 tee -a 抢 inode 会丢日志行，且并发 compose 重建会互相竞争。
+LOCK_FILE="${COMPOSE_DIR}/.update-openviking.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "⚠️ 另一个 openviking 更新实例正在运行，跳过本次" >&2
+    exit 0
+fi
+
 rotate_log
 
 # ── 拉取新镜像 ────────────────────────────────────────
