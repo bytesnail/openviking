@@ -47,6 +47,15 @@ wait_healthy() {
 }
 
 # ── 前置检查 ──────────────────────────────────────────
+# 版本 tag 必须显式指定（不再默认 latest —— latest 是滚动 tag，可能指向含 bug 的版本，
+# 详见 CLAUDE.md 坑 #11：v0.4.4 的 role.value bug）。例：./update-openviking.sh v0.4.3
+TAG="${1:-}"
+if [ -z "$TAG" ]; then
+    echo "用法: $0 <image-tag>   例: $0 v0.4.3   （支持 v0.4.3 / v0.4.4 / latest / main 等）" >&2
+    exit 1
+fi
+IMAGE="openviking/openviking:${TAG}"
+
 cd "$COMPOSE_DIR"
 
 if ! docker compose version &>/dev/null; then
@@ -77,8 +86,11 @@ fi
 
 rotate_log
 
-# ── 拉取新镜像 ────────────────────────────────────────
-log "开始拉取新镜像…"
+# ── 更新 compose 镜像 tag 并拉取 ──────────────────────
+# sed 改 docker-compose.yml 的 image 行到指定 tag（支持 v0.4.3 / latest / main 等），
+# 这样 compose 永远锁在显式版本，cron/手动触发都不会被滚动的 latest 带走。
+log "将镜像 tag 设为 ${IMAGE} 并拉取…"
+sed -i "s|image: openviking/openviking:.*|image: ${IMAGE}|" "$COMPOSE_FILE"
 if ! docker compose -f "$COMPOSE_FILE" pull 2>&1 | tee -a "$LOG_FILE"; then
     log "❌ 拉取镜像失败，退出"
     exit 1

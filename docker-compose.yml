@@ -1,6 +1,6 @@
 services:
   openviking:
-    image: openviking/openviking:latest
+    image: openviking/openviking:v0.4.3
     container_name: openviking
     network_mode: host
     env_file:
