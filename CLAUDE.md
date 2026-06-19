@@ -50,18 +50,20 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 > 本仓库无 build / lint / test —— 它是部署配置,不是代码项目。验证手段是上面的 `doctor` + `health`。
 
-## 运维脚本(自动化)
+## 运维脚本(手动版本锁定)
+
+> **升级策略:不自动升级。** openviking 版本迭代快且偶有回归(如 v0.4.4 的 role.value 阻塞 bug,见坑 #11),自动追 `latest` 风险高。改为:**手动选版本 → 端到端测试确认(功能正常 + ov.conf 适配)→ 手动升级**。
 
 仓库根目录下三个脚本(已 `chmod +x`),对标 ollama 仓的同名脚本:
 
-- **`update-openviking.sh`** — 自动更新:`docker compose pull` → `up -d --remove-orphans` → 清悬空镜像,全程写 `update-openviking.log`(超 8 万行轮转)。**关键:`up -d` 后轮询容器到 `healthy`,再跑 `docker exec openviking openviking-server doctor` 做端到端验证**——healthcheck 只查端口(见坑 #2),不验证 `${VAR}` 展开 / 后端连通。doctor 失败只告警不退出(它依赖本机 qwen 后端 + 远程 kimi,任一未就绪都会失败,非镜像更新问题)。`up -d` 等同 down+up,顺带让 ov.conf/secrets.env 变更生效。
-- **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除 openviking 容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
-- **`setup-cron.sh`** — 幂等设定 crontab:每天 **6:30** 跑 `update-openviking.sh`(marker 去重)。时间错开 ollama 的 6:00,避免同机同时拉镜像 / 重建。
+- **`update-openviking.sh <tag>`** — **手动**升级到指定版本(**必填 tag**,如 `v0.4.3`;不再默认 `latest`)。流程:`sed` 把 docker-compose.yml 的 image 锁到 `openviking/openviking:<tag>` → `pull` → `up -d` → 轮询 `healthy` → `doctor` → 清悬空镜像;全程写 `update-openviking.log`(超 8 万行轮转)。**锁 tag 后 compose 不会被滚动的 latest 带走。** doctor 失败只告警不退出(依赖本机 qwen + 远程 kimi)。⚠️ doctor 的 `VLM: PASS` 不是 vlm 可用性判据(坑 #8),真实验证要端到端测入库/检索。
+- **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
+- **`setup-cron.sh`** — 幂等设定 crontab(每天 6:30 自动更新)。**当前已停用**(改为手动策略);需要时 `./setup-cron.sh` 重新开启。
 
 ```bash
-./setup-cron.sh          # 设定每天 6:30 自动更新(一次性)
-./update-openviking.sh   # 立即手动更新一次
-./cleanup-containers.sh  # 停并移除容器
+./update-openviking.sh v0.4.3   # 手动升级到 v0.4.3(必填 tag)
+./cleanup-containers.sh         # 停并移除容器
+./setup-cron.sh                 # (重新)开启自动更新 —— 当前未启用
 ```
 
 > 三个脚本本身**进 git**;它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止 cron 与手动触发重叠)均已被 `.gitignore` 忽略。
@@ -84,9 +86,13 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 8. **vlm/query_planner 必须显式设 `"temperature":1`。** kimi-for-coding 是强制 reasoning 模型,只收 `temperature=1`(<1 报 `only 1 is allowed for this model`;>1 报 `must not be greater than 1`);而 `VLMConfig.temperature` 默认 `0.0`,ov.conf 不覆盖 → openviking 实发 `0.0` → 每次 vlm/query_planner 真实 chat completion 必被 kimi 400。**容器照常 healthy,`doctor` 照报 `VLM: PASS`**(`doctor` 的 `check_vlm` 只校验配置/api_key 存在,**不发 chat**),极易潜伏(本仓曾因此静默挂了数天未被发现)。验证 vlm/query_planner 可用性**只能靠真实调用**,例如:`docker exec -i openviking python3 -c "import asyncio;from openviking_cli.utils.config import get_openviking_config as g;c=g();print(asyncio.run(c.vlm.get_completion_async('1+1=?')))"`,或直接 `curl` `/v1/chat/completions` 带 `temperature=1` 的最小请求。**`doctor` 的 `VLM: PASS` 不是 vlm 可用性的判据。**
 
+  **另(vlm timeout):** vlm/query_planner 的 `timeout` 默认 `60s` 对 kimi reasoning 偏小 —— 文件级 summary / 目录级 overview 会超时(memory extraction 任务轻、勉强够)。本仓 `vlm=300` / `qp=180`。超时表现:日志 `openai.APITimeoutError: Request timed out`、abstract 空(`(no abstract)`)、向量未建(search 召回但 score 0%)。
+
 9. **vlm/query_planner 的 `max_tokens` 要给 reasoning 留余量(本仓 vlm=131072 / qp=65536,别退回默认 32768)。** kimi-for-coding 强制 reasoning(`supports_thinking_type:"only"`):每次输出 = `reasoning_content`(先)+ `content`(后),**共享 `max_tokens` 预算且 reasoning 优先消耗**;reasoning 把预算用尽时 `content` 还没生成就被 `finish_reason=length` 截断 → `content=""`。openviking 只取 `message.content`、丢弃 `reasoning_content` → **静默拿到空结果**(不报错、healthy、doctor PASS),文档照样入库但摘要/结构化字段为空、检索质量塌掉。根因:openviking 不认 kimi-for-coding 为 reasoning 模型(`_is_reasoning_model` 只认 `gpt-5/o1/o3/o4`),无"reasoning 吃 token 要预留"的逻辑;`KimiVLM` 默认 `max_tokens=32768` 偏小。`max_tokens` 是上限而非固定消耗,设大后日常成本/延迟不变,只抬高长 reasoning 的最坏上限(kimi 对该参数不卡上限;`context_length=262144` 才是 prompt+output 总预算的真正约束,大 prompt 时 output 实际上限被动态压低但不报错)。排查:vlm 返回空 / 日志 `finish_reason=length` 即被吃光;`reasoning_tokens` 字段 kimi 实测不单独返回,不可靠。**另:ov.conf 的 `thinking` 字段对 kimi provider 无效**(只对 `openai`+DashScope 往请求体加 `enable_thinking`),kimi-for-coding 强制 reasoning **无法关闭**;本仓 `vlm`/`query_planner` 设 `thinking:true` 仅反映此实际状态——改它不改变行为,也省不掉 reasoning 开销(想压成本只能靠更小的 `max_tokens` 限制思考上限,或换非 reasoning 模型)。
 
 10. **`embedding.text_source`(默认 `content_only`)与 `max_input_tokens`(默认 4096)的非显而易见行为。** text_source 三值 `content_only`/`summary_first`/`summary_only`,但 **`summary_first` 与 `summary_only` 行为完全相同**(源码里总在同一 `in` 集合,无拼接/无差异),实际只有两种模式。摘要在**入库时无条件由 vlm 生成**(与 text_source 无关,用于 `.overview.md`/`.abstract.md`),故切 summary 模式**零额外 vlm 成本**——只是让向量复用已生成摘要。`content_only`:文本文件用正文、非文本(图片等)用摘要;summary 模式:文本文件用摘要(摘要为空则回退正文)。`max_input_tokens` 对所有送 embedding 的文本做**头部截断**(尾部拼 `...(truncated for embedding)`),与 text_source 无关——content_only 长文档只取头部约 `max_input_tokens` tokens。**改 text_source / max_input_tokens 只影响新入库文件,旧向量不变,要重算需走 reindex(不删 vectordb,维度没变)。** 另:dense 是语义检索、**不是字面匹配**,代码符号/精确关键词的精确查询是其结构弱项,需 sparse 才能补;而 **sparse/hybrid 当前只支持 `volcengine`/`vikingdb` 云 provider**(本地 `openai` provider 的 sparse/hybrid 是 `NotImplementedError`,无 local 实现),本地开源 sparse 模型(BGE-M3/SPLADE)暂接不进。
+
+11. **v0.4.4 有 role.value 阻塞 bug,本仓已降级 v0.4.3。** v0.4.4 的 PR#2709 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 等全部 `AttributeError: 'str' object has no attribute 'value'` → **经 MCP 入库全崩**(无摘要无向量,search 全空;doctor/healthy 照常,是假象)。仅 v0.4.4 受影响(v0.4.3 及之前无此 bug);修复 PR#2728 已合并 main 但未发版(详见 GitHub issue #2718)。**升级前务必端到端测入库(memory/resource),别只看 doctor。**
 
 ## 文件
 
