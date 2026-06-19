@@ -92,6 +92,10 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 - `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
 - `ov.conf` — openviking 主配置(占位符版,**进 git**)。
+- `STORAGE_MODEL.md` — 三层存储模型与检索数据流(原文/摘要/向量分离,max_input_tokens 影响边界)。
+- `CONFIG_REFERENCE.md` — ov.conf 字段/默认值/provider 支持矩阵/extra:forbid 速查。
+- `SPARSE_HYBRID.md` — sparse/hybrid 架构现状、本地接入障碍、SOTA 模型、接入路径。
+- `KIMI_FOR_CODING.md` — vlm/query_planner 后端 kimi-for-coding 完整特性档案(K2.7 / temp=1 / 强制 reasoning)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
 - `cleanup-containers.sh` / `update-openviking.sh` / `setup-cron.sh` — 运维脚本(清理 / 自动更新 / 设 cron),**进 git**;详见上文「运维脚本」。
 - `workspace/` — openviking 运行态数据(vectordb / queue / sessions / pid),容器以 root 写,**gitignore**。
