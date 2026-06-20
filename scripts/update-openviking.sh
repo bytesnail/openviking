@@ -8,6 +8,7 @@ LOG_FILE="${SCRIPT_DIR}/update-openviking.log"
 MAX_LOG_LINES=80000   # 日志超过此行数则裁掉前一半（约 8 万行，数月日志量）
 CONTAINER="openviking"
 HEALTH_TIMEOUT=150    # up 后等待容器变 healthy 的最长秒数（healthcheck start_period 30s + 若干次 30s interval）
+DOCTOR_TIMEOUT=180    # doctor 端到端探测的最长秒数（防 vlm/网络层 hang 卡死脚本 → flock 永不释放 → 饿死所有后续 cron）
 
 # ── 日志函数 ──────────────────────────────────────────
 log() {
@@ -37,6 +38,12 @@ wait_healthy() {
         if [ "$status" = "healthy" ]; then
             log "✅ 容器已 healthy（耗时约 ${elapsed}s）"
             return 0
+        fi
+        # 过了 start_period 仍 unhealthy = 启动/配置崩溃（如 ov.conf 触发 pydantic 校验失败、
+        # 或坑 #11 类启动期 bug）。立即短路退出，不必空等满 HEALTH_TIMEOUT。
+        if [ "$status" = "unhealthy" ]; then
+            log "❌ 容器进入 unhealthy（配置或启动崩溃，详见 docker logs openviking），退出"
+            return 1
         fi
         if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
             log "❌ 容器在 ${HEALTH_TIMEOUT}s 内未变 healthy（当前状态: ${status:-未知}），退出"
@@ -81,21 +88,26 @@ fi
 LOCK_FILE="${SCRIPT_DIR}/.update-openviking.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "⚠️ 另一个 openviking 更新实例正在运行，跳过本次" >&2
+    # 同时写日志：否则 cron 被长时间运行的手动实例反复拦下时，日志里毫无痕迹、排查极困难。
+    log "⚠️ 另一个 openviking 更新实例正在运行，跳过本次"
     exit 0
 fi
 
 rotate_log
 
-# ── 更新 compose 镜像 tag 并拉取 ──────────────────────
-# sed 改 docker-compose.yml 的 image 行到指定 tag（支持 v0.4.3 / latest / main 等），
-# 这样 compose 永远锁在显式版本，cron/手动触发都不会被滚动的 latest 带走。
-log "将镜像 tag 设为 ${IMAGE} 并拉取…"
-sed -i "s|image: openviking/openviking:.*|image: ${IMAGE}|" "$COMPOSE_FILE"
-if ! docker compose -f "$COMPOSE_FILE" pull 2>&1 | tee -a "$LOG_FILE"; then
-    log "❌ 拉取镜像失败，退出"
+# ── 拉取镜像（先验证可拉取，再改 compose）──────────────
+# 关键顺序：先 `docker pull` 把新 tag 拉下来并验证其存在/可达，成功后才 sed 改 docker-compose.yml。
+# 若反过来（先 sed 后 pull），tag 拼错或 registry 不存在时 pull 失败退出，但 compose.yml 已被改成
+# 不可用 tag、旧可工作版本丢失，下次 up 也起不来 —— 先 pull 后 sed 从根上杜绝这个半破坏状态。
+log "拉取镜像 ${IMAGE}（成功后再锁定到 compose）…"
+if ! docker pull "$IMAGE" 2>&1 | tee -a "$LOG_FILE"; then
+    log "❌ 拉取镜像失败（确认 tag 拼写正确 / registry 可达），docker-compose.yml 未改动，退出"
     exit 1
 fi
+
+# sed 把 docker-compose.yml 的 image 行锁到指定 tag —— compose 永远钉在显式版本，
+# cron/手动触发都不会被滚动的 latest 带走（坑 #11:v0.4.4 role.value bug 即 latest 滚动引入）。
+sed -i "s|image: openviking/openviking:.*|image: ${IMAGE}|" "$COMPOSE_FILE"
 
 # ── 使用 docker compose up 重建有变更的容器 ───────────
 # up -d 会重建容器，等同 down+up —— 这同时让 ov.conf / secrets.env 的变更生效（坑 #1）。
@@ -114,8 +126,8 @@ fi
 # doctor 做端到端探测：展开 ${VAR} + probe embedding/vlm 连通（CLAUDE.md 推荐的最可靠验证）。
 # 失败只告警不退出 —— 它依赖本机后端（systemd qwen-llama@embedding-gpu / reranker-gpu、远程 kimi），
 # 任一未就绪都会失败，但这不代表 openviking 镜像更新本身失败。
-log "运行 doctor 做端到端连通验证…"
-if docker exec "$CONTAINER" openviking-server doctor 2>&1 | tee -a "$LOG_FILE"; then
+log "运行 doctor 做端到端连通验证（上限 ${DOCTOR_TIMEOUT}s）…"
+if timeout -k 10 "$DOCTOR_TIMEOUT" docker exec "$CONTAINER" openviking-server doctor 2>&1 | tee -a "$LOG_FILE"; then
     log "✅ doctor 通过"
 else
     log "⚠️ doctor 未完全通过（可能是后端服务未就绪或密钥未注入，非镜像更新问题）—— 请人工核查"
