@@ -1,6 +1,6 @@
 # OpenViking 配置参考(ov.conf)
 
-> **版本基线**:基于容器内 `openviking-server v0.4.4` 源码核对。版本随 `latest` 镜像更新,以 `openviking-server --version` 为准。
+> **版本基线**:源码核对基于 `openviking v0.4.4`;机制在 v0.4.3(本仓当前部署版本)一致。源码行号为核对版本、跨版本可能偏移,复核以 `grep` 为准。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`「运维脚本」)。
 > 定位:调 `ov.conf` 时查**字段 / 默认值 / provider 支持 / `extra:forbid` 约束**的速查表。
 > 配置陷阱见 `CLAUDE.md`「关键坑」;数据存储/检索行为见 `STORAGE_MODEL.md`。
 
@@ -29,7 +29,7 @@
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `dense` | `EmbeddingModelConfig` | 自动填本地 bge-small-zh | dense 向量配置 |
+| `dense` | `EmbeddingModelConfig` | 自动填本地 bge-small-zh-v1.5-f16 | dense 向量配置(本仓显式配 Qwen3,不走默认) |
 | `sparse` | `EmbeddingModelConfig` | None | 稀疏向量(**仅 volcengine/vikingdb**,见 SPARSE_HYBRID.md) |
 | `hybrid` | `EmbeddingModelConfig` | None | 单模型同时出 dense+sparse(**仅 volcengine/vikingdb**) |
 | `circuit_breaker` | object | failure_threshold=5 / reset_timeout=60 / max_reset_timeout=600 | embedding 熔断 |

@@ -39,7 +39,7 @@ openviking 的多个严重问题(v0.4.4 入库全崩、vlm timeout 致摘要空)
 **实现**(`docker exec -i openviking python3` 跑):
 
 ```python
-import httpx, json
+import os, httpx, json
 BASE = "http://127.0.0.1:1933/mcp"
 KEY = os.environ["OPENVIKING_ROOT_API_KEY"]
 H = {"Authorization": f"Bearer {KEY}",
@@ -163,14 +163,14 @@ txt(tool("list", {"uri":"viking://user/default/memories","recursive":True}))  # 
 ### 4.4 副作用与成本
 
 - **kimi token 消耗**:每次入库都调 vlm 生成 summary/overview(reasoning 模型,不便宜)。resource 链路尤重(文件 summary + 目录 overview 两次+)。测试要有预算意识,别反复灌大数据。
-- **default user 污染(Q4,实测确认)**:测试数据写在 `viking://user/default/...`。**无法用独立 user 隔离**——`X-OpenViking-User` header 只在 "trusted mode" 下生效(当前 root_api_key 模式带该 header 直接 `403 X-OpenViking-User can only assert identity in trusted mode`);而 trusted mode 要求 header + URL 都带 account/user 且会信任身份断言(有安全含义),**不为测试开**。所以防污染靠:① 当前 default user 无真实数据时,`forget viking://user/default/memories recursive` 安全;② **将来 default user 有真实数据时,改用"测前 `ls` 快照 + 测后按独特关键词定位、精确 `forget` 测试 uri"**(不 recursive 整树)。
+- **default user 污染(已用专用 account 规避)**:早期测试数据写在 `viking://user/default/...`。不能用 `X-OpenViking-User` header 隔离——该 header 只在 trusted mode 生效,当前 api_key 模式带它直接 `403 can only assert identity in trusted mode`(不为测试开 trusted)。**现行隔离方案见 §7.0**:用 admin API 建专用 account=`e2e`/user=`tester` + 专属 user_key,数据物理落 `/local/e2e/user/tester/`,与 default/生产隔离,测后 `DELETE account` 级联清。下面的 `forget`/快照法是 default user 时代的备选(已不主用,仅在无法建专用 account 时参考):① default user 无真实数据时 `forget viking://user/default/memories recursive` 安全;② 有真实数据时"测前 `ls` 快照 + 测后按独特关键词定位、精确 `forget` 测试 uri"(不 recursive 整树)。
 - **vectordb(Q3 澄清)**:`forget` 删除 viking_fs 条目 **+ 对应的向量记录**(`ls`/`search` 全空 = 数据删干净)。vectordb 保留的是 `collection_meta`(schema:字段/维度/索引类型),这是**结构**而非数据——测试不改维度/schema,保留是正常的、**不是残留**,无需重建。
 
 ---
 
 ## 5. 当前测试结果(v0.4.3 + vlm timeout=1200)
 
-> 前提:已从 v0.4.4 降级 v0.4.3(见 §6.1)、vlm timeout 调到 300(§6.2)。
+> 前提:已从 v0.4.4 降级 v0.4.3(见 §6.1)、vlm timeout 调到 1200 / qp 600(§6.2)。
 
 ### 5.1 memory 链路 ✅
 

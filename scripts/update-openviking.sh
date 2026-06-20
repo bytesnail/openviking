@@ -8,7 +8,7 @@ LOG_FILE="${SCRIPT_DIR}/update-openviking.log"
 MAX_LOG_LINES=80000   # 日志超过此行数则裁掉前一半（约 8 万行，数月日志量）
 CONTAINER="openviking"
 HEALTH_TIMEOUT=150    # up 后等待容器变 healthy 的最长秒数（healthcheck start_period 30s + 若干次 30s interval）
-DOCTOR_TIMEOUT=180    # doctor 端到端探测的最长秒数（防 vlm/网络层 hang 卡死脚本 → flock 永不释放 → 饿死所有后续 cron）
+DOCTOR_TIMEOUT=180    # doctor 端到端探测的最长秒数（防 vlm/网络层 hang 卡死脚本 → flock 永不释放 → 后续所有触发都被拦下）
 
 # ── 日志函数 ──────────────────────────────────────────
 log() {
@@ -83,7 +83,7 @@ if [ ! -f "${COMPOSE_DIR}/secrets.env" ]; then
     exit 1
 fi
 
-# 并发互斥：cron（6:30）与手动触发可能重叠，同一时间只允许一个实例。
+# 并发互斥：手动触发可能重叠（同一时间只允许一个实例）。
 # 否则 rotate_log 的 tail>tmp>mv 与另一实例的 tee -a 抢 inode 会丢日志行，且并发 compose 重建会互相竞争。
 LOCK_FILE="${SCRIPT_DIR}/.update-openviking.lock"
 exec 9>"$LOCK_FILE"
@@ -106,7 +106,7 @@ if ! docker pull "$IMAGE" 2>&1 | tee -a "$LOG_FILE"; then
 fi
 
 # sed 把 docker-compose.yml 的 image 行锁到指定 tag —— compose 永远钉在显式版本，
-# cron/手动触发都不会被滚动的 latest 带走（坑 #11:v0.4.4 role.value bug 即 latest 滚动引入）。
+# 不会被滚动的 latest 带走（坑 #11:v0.4.4 的 role.value bug 就是被 latest 滚到带 bug 版本踩中的教训）。
 sed -i "s|image: openviking/openviking:.*|image: ${IMAGE}|" "$COMPOSE_FILE"
 
 # ── 使用 docker compose up 重建有变更的容器 ───────────

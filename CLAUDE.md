@@ -68,9 +68,9 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 ./scripts/cleanup-containers.sh         # 停并移除容器
 ```
 
-> 两个脚本本身**进 git**(在 `scripts/`);它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止 cron 与手动触发重叠)均已被 `.gitignore` 忽略。
+> 两个脚本本身**进 git**(在 `scripts/`);它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止手动触发重叠)均已被 `.gitignore` 忽略。
 
-## 关键坑(基于容器内源码核对 · 版本随 `latest` 镜像更新,以 `openviking-server --version` 为准,改配置前必读)
+## 关键坑(基于容器内源码核对 · 版本以 `openviking-server --version` 为准,本仓手动锁定、不自动追 latest,改配置前必读)
 
 1. **改 `ov.conf` 后必须 `docker compose down && up -d`。** `restart`/`reload` 无效:ov.conf 是单文件 bind-mount,宿主文件被编辑器原子替换后 inode 变化,容器仍挂载旧 inode;`expandvars` 也只在启动读文件那一次执行。
 
@@ -94,7 +94,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 10. **`embedding.text_source`(默认 `content_only`)与 `max_input_tokens`(默认 4096)的非显而易见行为。** text_source 三值 `content_only`/`summary_first`/`summary_only`,但 **`summary_first` 与 `summary_only` 行为完全相同**(源码里总在同一 `in` 集合,无拼接/无差异),实际只有两种模式。摘要在**入库时无条件由 vlm 生成**(与 text_source 无关,用于 `.overview.md`/`.abstract.md`),故切 summary 模式**零额外 vlm 成本**——只是让向量复用已生成摘要。`content_only`:文本文件用正文、非文本(图片等)用摘要;summary 模式:文本文件用摘要(摘要为空则回退正文)。`max_input_tokens` 对所有送 embedding 的文本做**头部截断**(尾部拼 `...(truncated for embedding)`),与 text_source 无关——content_only 长文档只取头部约 `max_input_tokens` tokens。**改 text_source / max_input_tokens 只影响新入库文件,旧向量不变,要重算需走 reindex(不删 vectordb,维度没变)。** 另:dense 是语义检索、**不是字面匹配**,代码符号/精确关键词的精确查询是其结构弱项,需 sparse 才能补;而 **sparse/hybrid 当前只支持 `volcengine`/`vikingdb` 云 provider**(本地 `openai` provider 的 sparse/hybrid 是 `NotImplementedError`,无 local 实现),本地开源 sparse 模型(BGE-M3/SPLADE)暂接不进。
 
-11. **v0.4.4 有 role.value 阻塞 bug,本仓已降级 v0.4.3。** v0.4.4 的 PR#2709 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 等全部 `AttributeError: 'str' object has no attribute 'value'` → **经 MCP 入库全崩**(无摘要无向量,search 全空;doctor/healthy 照常,是假象)。仅 v0.4.4 受影响(v0.4.3 及之前无此 bug);修复 PR#2728 已合并 main 但未发版(详见 GitHub issue #2718)。**升级前务必端到端测入库(memory/resource),别只看 doctor。**
+11. **v0.4.4 有 role.value 阻塞 bug,本仓已降级 v0.4.3。** v0.4.4 的 PR#2709 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 等全部 `AttributeError: 'str' object has no attribute 'value'` → **经 MCP 入库全崩**(无摘要无向量,search 全空;doctor/healthy 照常,是假象)。仅 v0.4.4 受影响(v0.4.3 及之前无此 bug);修复 PR#2728 已合并 main 但未发版(详见 GitHub issue #2718)。截至 2026-06-20,最新 release 仍是带 bug 的 v0.4.4,无 v0.4.5+;修复仅存在于 main,故继续钉 v0.4.3。**升级前务必端到端测入库(memory/resource),别只看 doctor;**下一个含 PR#2728 的版本发布后,按 `docs/E2E_TESTING.md` §8 测过再手动升级。
 
 ## 文件
 
