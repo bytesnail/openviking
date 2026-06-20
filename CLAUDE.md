@@ -104,6 +104,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 - `KIMI_FOR_CODING.md` — vlm/query_planner 后端 kimi-for-coding 完整特性档案(K2.7 / temp=1 / 强制 reasoning)。
 - `E2E_TESTING.md` — 端到端测试方法与记录(MCP 测试架构、覆盖矩阵、副作用管控、升级前 checklist + 可复用脚本)。
 - `MULTI_USER.md` — 多 user(多租户)部署与使用指南(account/user/peer 模型、user key 隔离、admin API、各 MCP client 配置)。
+- `UPGRADE_0.4.md` — 0.3→0.4 升级变化(User/Peer 模型/legacy 迁移/多模态等)+ 本项目适配分析(legacy 残留处理 + 可选增强)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
 - `cleanup-containers.sh` / `update-openviking.sh` / `setup-cron.sh` — 运维脚本(清理 / 自动更新 / 设 cron),**进 git**;详见上文「运维脚本」。
 - `workspace/` — openviking 运行态数据(vectordb / queue / sessions / pid),容器以 root 写,**gitignore**。
