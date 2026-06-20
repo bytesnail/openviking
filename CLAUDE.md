@@ -53,6 +53,8 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 ## 运维脚本(手动版本锁定)
 
 > **升级策略:不自动升级。** openviking 版本迭代快且偶有回归(如 v0.4.4 的 role.value 阻塞 bug,见坑 #11),自动追 `latest` 风险高。改为:**手动选版本 → 端到端测试确认(功能正常 + ov.conf 适配)→ 手动升级**。
+>
+> **何时才考虑升级**(当前钉在 v0.4.3,稳定可用就不动):① 新版本有我们需要的新特性;② 修复了我们在意的 v0.4.3 bug;③ v0.4.3 自己出现新的严重/阻塞性 bug。否则不升。**正式升级前必须先用新版本端到端测(E2E_TESTING.md §8),确认不引入阻塞**——v0.4.4 就是反面教材(带 role.value bug,doctor 还报 PASS)。
 
 仓库根目录下三个脚本(已 `chmod +x`),对标 ollama 仓的同名脚本:
 
