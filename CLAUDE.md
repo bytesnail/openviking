@@ -56,7 +56,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 >
 > **何时才考虑升级**(当前钉在 v0.4.3,稳定可用就不动):① 新版本有我们需要的新特性;② 修复了我们在意的 v0.4.3 bug;③ v0.4.3 自己出现新的严重/阻塞性 bug。否则不升。**正式升级前必须先用新版本端到端测(E2E_TESTING.md §8),确认不引入阻塞**——v0.4.4 就是反面教材(带 role.value bug,doctor 还报 PASS)。
 
-仓库根目录下三个脚本(已 `chmod +x`),对标 ollama 仓的同名脚本:
+仓库 `scripts/` 目录下两个脚本(已 `chmod +x`):
 
 - **`update-openviking.sh <tag>`** — **手动**升级到指定版本(**必填 tag**,如 `v0.4.3`;不再默认 `latest`)。流程:`sed` 把 docker-compose.yml 的 image 锁到 `openviking/openviking:<tag>` → `pull` → `up -d` → 轮询 `healthy` → `doctor` → 清悬空镜像;全程写 `update-openviking.log`(超 8 万行轮转)。**锁 tag 后 compose 不会被滚动的 latest 带走。** doctor 失败只告警不退出(依赖本机 qwen + 远程 kimi)。⚠️ doctor 的 `VLM: PASS` 不是 vlm 可用性判据(坑 #8),真实验证要端到端测入库/检索。
 - **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
@@ -64,11 +64,11 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 > 原 `setup-cron.sh`(设定自动更新 cron)已删除——手动版本锁定策略下不再自动升级;若将来要恢复自动,`crontab -e` 加一行即可。
 
 ```bash
-./update-openviking.sh v0.4.3   # 手动升级到 v0.4.3(必填 tag)
-./cleanup-containers.sh         # 停并移除容器
+./scripts/update-openviking.sh v0.4.3   # 手动升级到 v0.4.3(必填 tag)
+./scripts/cleanup-containers.sh         # 停并移除容器
 ```
 
-> 三个脚本本身**进 git**;它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止 cron 与手动触发重叠)均已被 `.gitignore` 忽略。
+> 两个脚本本身**进 git**(在 `scripts/`);它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止 cron 与手动触发重叠)均已被 `.gitignore` 忽略。
 
 ## 关键坑(基于容器内源码核对 · 版本随 `latest` 镜像更新,以 `openviking-server --version` 为准,改配置前必读)
 
@@ -100,13 +100,14 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 - `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
 - `ov.conf` — openviking 主配置(占位符版,**进 git**)。
-- `STORAGE_MODEL.md` — 三层存储模型与检索数据流(原文/摘要/向量分离,max_input_tokens 影响边界)。
-- `CONFIG_REFERENCE.md` — ov.conf 字段/默认值/provider 支持矩阵/extra:forbid 速查。
-- `SPARSE_HYBRID.md` — sparse/hybrid 架构现状、本地接入障碍、SOTA 模型、接入路径。
-- `KIMI_FOR_CODING.md` — vlm/query_planner 后端 kimi-for-coding 完整特性档案(K2.7 / temp=1 / 强制 reasoning)。
-- `E2E_TESTING.md` — 端到端测试方法与记录(MCP 测试架构、覆盖矩阵、副作用管控、升级前 checklist + 可复用脚本)。
-- `MULTI_USER.md` — 多 user(多租户)部署与使用指南(account/user/peer 模型、user key 隔离、admin API、各 MCP client 配置)。
-- `UPGRADE_0.4.md` — 0.3→0.4 升级变化(User/Peer 模型/legacy 迁移/多模态等)+ 本项目适配分析(legacy 残留处理 + 可选增强)。
+- `docs/` — 专题文档目录(7 篇,均进 git):
+  - `STORAGE_MODEL.md` — 三层存储模型与检索数据流(原文/摘要/向量分离,max_input_tokens 影响边界)。
+  - `CONFIG_REFERENCE.md` — ov.conf 字段/默认值/provider 支持矩阵/extra:forbid 速查。
+  - `SPARSE_HYBRID.md` — sparse/hybrid 架构现状、本地接入障碍、SOTA 模型、接入路径。
+  - `KIMI_FOR_CODING.md` — vlm/query_planner 后端 kimi-for-coding 完整特性档案(K2.7 / temp=1 / 强制 reasoning)。
+  - `E2E_TESTING.md` — 端到端测试方法与记录(MCP 测试架构、覆盖矩阵、副作用管控、升级前 checklist + 可复用脚本)。
+  - `MULTI_USER.md` — 多 user(多租户)部署与使用指南(account/user/peer 模型、user key 隔离、admin API、各 MCP client 配置)。
+  - `UPGRADE_0.4.md` — 0.3→0.4 升级变化(User/Peer 模型/legacy 迁移/多模态等)+ 本项目适配分析(legacy 残留处理 + 可选增强)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
-- `cleanup-containers.sh` / `update-openviking.sh` / `setup-cron.sh` — 运维脚本(清理 / 自动更新 / 设 cron),**进 git**;详见上文「运维脚本」。
+- `scripts/cleanup-containers.sh` / `scripts/update-openviking.sh` — 运维脚本(清理 / 手动升级),**进 git**;详见上文「运维脚本」。(原 `setup-cron.sh` 已删)
 - `workspace/` — openviking 运行态数据(vectordb / queue / sessions / pid),容器以 root 写,**gitignore**。

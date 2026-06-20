@@ -4,7 +4,7 @@ set -euo pipefail
 # openviking 是纯 docker-compose 项目（单容器），清理 = 整个项目 down。
 # 用 compose down 而非逐个 docker rm -f：语义更干净，也会顺带清掉 compose 残余；
 # bind-mount 的 workspace/（含 vectordb / sessions）与 ov.conf 默认不受影响（down 不删 volume / bind 目录）。
-COMPOSE_DIR="$(cd "$(dirname "$0")" && pwd)"
+COMPOSE_DIR="$(cd "$(dirname "$0")/.." && pwd)"  # 脚本在 scripts/，..=项目根(compose 所在)
 COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
 
 if [ ! -f "$COMPOSE_FILE" ]; then

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-COMPOSE_DIR="$(cd "$(dirname "$0")" && pwd)"  # 脚本所在目录即 compose 目录，避免硬编码绝对路径
+COMPOSE_DIR="$(cd "$(dirname "$0")/.." && pwd)"  # 脚本在 scripts/，..=项目根(compose 所在)
 COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
 LOG_FILE="${COMPOSE_DIR}/update-openviking.log"
 MAX_LOG_LINES=80000   # 日志超过此行数则裁掉前一半（约 8 万行，数月日志量）
