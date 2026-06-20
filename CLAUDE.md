@@ -58,12 +58,12 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 - **`update-openviking.sh <tag>`** — **手动**升级到指定版本(**必填 tag**,如 `v0.4.3`;不再默认 `latest`)。流程:`sed` 把 docker-compose.yml 的 image 锁到 `openviking/openviking:<tag>` → `pull` → `up -d` → 轮询 `healthy` → `doctor` → 清悬空镜像;全程写 `update-openviking.log`(超 8 万行轮转)。**锁 tag 后 compose 不会被滚动的 latest 带走。** doctor 失败只告警不退出(依赖本机 qwen + 远程 kimi)。⚠️ doctor 的 `VLM: PASS` 不是 vlm 可用性判据(坑 #8),真实验证要端到端测入库/检索。
 - **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
-- **`setup-cron.sh`** — 幂等设定 crontab(每天 6:30 自动更新)。**当前已停用**(改为手动策略);需要时 `./setup-cron.sh` 重新开启。
+
+> 原 `setup-cron.sh`(设定自动更新 cron)已删除——手动版本锁定策略下不再自动升级;若将来要恢复自动,`crontab -e` 加一行即可。
 
 ```bash
 ./update-openviking.sh v0.4.3   # 手动升级到 v0.4.3(必填 tag)
 ./cleanup-containers.sh         # 停并移除容器
-./setup-cron.sh                 # (重新)开启自动更新 —— 当前未启用
 ```
 
 > 三个脚本本身**进 git**;它们写的 `update-openviking.log`、轮转临时 `*.tmp`、并发互斥锁 `.update-openviking.lock`(`update-openviking.sh` 用 flock 防止 cron 与手动触发重叠)均已被 `.gitignore` 忽略。
