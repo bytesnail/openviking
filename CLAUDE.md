@@ -102,6 +102,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 - `CONFIG_REFERENCE.md` — ov.conf 字段/默认值/provider 支持矩阵/extra:forbid 速查。
 - `SPARSE_HYBRID.md` — sparse/hybrid 架构现状、本地接入障碍、SOTA 模型、接入路径。
 - `KIMI_FOR_CODING.md` — vlm/query_planner 后端 kimi-for-coding 完整特性档案(K2.7 / temp=1 / 强制 reasoning)。
+- `E2E_TESTING.md` — 端到端测试方法与记录(MCP 测试架构、覆盖矩阵、副作用管控、升级前 checklist + 可复用脚本)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
 - `cleanup-containers.sh` / `update-openviking.sh` / `setup-cron.sh` — 运维脚本(清理 / 自动更新 / 设 cron),**进 git**;详见上文「运维脚本」。
 - `workspace/` — openviking 运行态数据(vectordb / queue / sessions / pid),容器以 root 写,**gitignore**。
