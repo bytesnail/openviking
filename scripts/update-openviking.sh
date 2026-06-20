@@ -2,8 +2,9 @@
 set -euo pipefail
 
 COMPOSE_DIR="$(cd "$(dirname "$0")/.." && pwd)"  # 脚本在 scripts/，..=项目根(compose 所在)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"      # 脚本自身目录（scripts/）：log/lock 等运行产物写这里，保持项目根干净
 COMPOSE_FILE="${COMPOSE_DIR}/docker-compose.yml"
-LOG_FILE="${COMPOSE_DIR}/update-openviking.log"
+LOG_FILE="${SCRIPT_DIR}/update-openviking.log"
 MAX_LOG_LINES=80000   # 日志超过此行数则裁掉前一半（约 8 万行，数月日志量）
 CONTAINER="openviking"
 HEALTH_TIMEOUT=150    # up 后等待容器变 healthy 的最长秒数（healthcheck start_period 30s + 若干次 30s interval）
@@ -77,7 +78,7 @@ fi
 
 # 并发互斥：cron（6:30）与手动触发可能重叠，同一时间只允许一个实例。
 # 否则 rotate_log 的 tail>tmp>mv 与另一实例的 tee -a 抢 inode 会丢日志行，且并发 compose 重建会互相竞争。
-LOCK_FILE="${COMPOSE_DIR}/.update-openviking.lock"
+LOCK_FILE="${SCRIPT_DIR}/.update-openviking.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     echo "⚠️ 另一个 openviking 更新实例正在运行，跳过本次" >&2
