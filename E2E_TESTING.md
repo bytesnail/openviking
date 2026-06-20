@@ -255,7 +255,39 @@ summary/overview 的 vlm 输入上限是 `semantic.max_file_content_chars=30000`
 
 ## 7. 可复用测试脚本(附录)
 
-> 直接 `docker exec -i openviking python3 - << 'PYEOF' ... PYEOF` 跑。需先 `source secrets.env` 拿 key(脚本内从容器环境读)。
+> **专用测试 account/user(隔离 + 干净清理)**:account = `e2e`、user = `tester`。**测试前 ensure → 测试中用 tester 的 user_key 调 MCP → 测试后 DELETE account 级联清**。不用 default user(污染真实数据)、不用 root_api_key 跑业务(无隔离 + 新版禁止 root 访问 /mcp)。
+
+### 7.0 测试前:ensure 专用 account/user(幂等)
+
+```bash
+set -a; source /mnt/hdd/tools/openviking/secrets.env; set +a
+ROOT="$OPENVIKING_ROOT_API_KEY"; B="http://127.0.0.1:1933"
+# account e2e 不存在则建(已存在则忽略)
+curl -s -X POST $B/api/v1/admin/accounts -H "X-API-Key: $ROOT" \
+  -H "Content-Type: application/json" -d '{"account_id":"e2e","admin_user_id":"admin"}' >/dev/null 2>&1 || true
+# tester user 不存在则建(返回 user_key);存在则轮换 key
+TESTER_KEY=$(curl -s -X POST $B/api/v1/admin/accounts/e2e/users -H "X-API-Key: $ROOT" \
+  -H "Content-Type: application/json" -d '{"user_id":"tester","role":"user"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('result',{}).get('user_key',''))" 2>/dev/null)
+[ -z "$TESTER_KEY" ] && TESTER_KEY=$(curl -s -X POST $B/api/v1/admin/accounts/e2e/users/tester/key \
+  -H "X-API-Key: $ROOT" | python3 -c "import sys,json;print(json.load(sys.stdin)['result']['user_key'])")
+echo "tester_key=${TESTER_KEY:0:24}..."
+```
+
+> 之后 §7.1/§7.2 的 MCP 脚本用这个 `TESTER_KEY`(通过 `docker exec -e KEY="$TESTER_KEY" openviking python3 ...` 传入,脚本内 `KEY=os.environ["KEY"]`)。数据落到 `viking://user/tester/`(物理 `/local/e2e/user/tester/`),与 default/生产**物理隔离**。
+
+### 7.0b 测试后:DELETE account 级联清理(最干净)
+
+```bash
+# 删整个 e2e account → 级联清该 account 所有 user 数据 + 向量(官方:账户删除级联清理 viking:// + vectordb)
+curl -s -X DELETE $B/api/v1/admin/accounts/e2e -H "X-API-Key: $ROOT"
+# 验证无残留(account 列表无 e2e)
+curl -s $B/api/v1/admin/accounts -H "X-API-Key: $ROOT" \
+  | python3 -c "import sys,json;print([a['account_id'] for a in json.load(sys.stdin)['result']])"
+docker exec openviking rm -f /tmp/test.md /tmp/big.md 2>/dev/null || true
+```
+
+> ⚠️ **不要**用 `DELETE user` 当清理——实测它只删 user 注册、**不删 viking_fs 物理数据**(残留)。也不要 `forget .../memories`——memory extraction 进行中会报 `Resource is being processed`。**只有 DELETE account 级联清存储+向量,一次干净**。
 
 ### 7.1 memory 链路
 
@@ -271,8 +303,7 @@ print(txt(tool("remember", {"messages":msgs})))
 # 轮询等 extraction(§3.2)...
 for q in ["我平时用什么编辑器写代码","Zephyr-9 生产网段","怎么开启 postgresql 逻辑复制"]:
     print(txt(tool("search", {"query":q,"limit":5,"min_score":0.1})))
-# 清理:
-print(txt(tool("forget", {"uri":"viking://user/default/memories","recursive":True})))
+# 清理:见 §7.0b —— DELETE account e2e 级联清(不要 forget memories,extraction 进行中会 Resource is being processed)
 ```
 
 ### 7.2 resource 链路(本地上传)
@@ -289,8 +320,7 @@ print(txt(tool("add_resource", {"temp_file_id":tfid})))     # → Resource added
 # 轮询等 summary+overview+向量化(target_uri=viking://resources)...
 print(txt(tool("search", {"query":"<独特关键词>","target_uri":"viking://resources","limit":5,"min_score":0.2})))
 print(txt(tool("read", {"uris":"viking://resources/test/test.md"})))   # 完整原文
-# 清理:
-print(txt(tool("forget", {"uri":"viking://resources/test","recursive":True})))
+# 清理:见 §7.0b —— DELETE account e2e 级联清
 ```
 
 ---
@@ -304,11 +334,12 @@ print(txt(tool("forget", {"uri":"viking://resources/test","recursive":True})))
 1. **查 release notes / issue**:看新版本是否动过 auth/role/session/semantic_processor/embedding 等核心模块(本轮 bug 就在 auth 重构里);确认上版本的已知 bug 是否已修。
 2. **拉镜像 + 起**(用 `./update-openviking.sh <新tag>`):等 healthy。
 3. **`doctor`**:连通性探活(仅参考,不是判据)。
-4. **memory 链路**(§7.1):remember → 轮询 → search/read。**判据:能召回 + abstract 非空合理。**
-5. **resource 链路**(§7.2):add_resource → 轮询 → search/read。**判据:summary/overview 生成(无 timeout)+ search 召回 + read 完整。**
-6. **配置点抽查**:独特关键词召回(content_only)、abstract 质量(vlm temperature/timeout)、rerank 排序、read 完整。
-7. **清理**:forget 测试数据 + ls 验证空 + 删临时文件。
-8. **通过则正式用;有问题 `./update-openviking.sh v0.4.3` 回退**。
+4. **ensure 专用测试 account/user**(§7.0):建 account=`e2e` + user=`tester`,拿 tester 的 user_key。**测试一律用 tester key(非 root)**,数据落 `viking://user/tester/`。
+5. **memory 链路**(§7.1):remember → 轮询 → search/read。**判据:能召回 + abstract 非空合理。**
+6. **resource 链路**(§7.2):add_resource → 轮询 → search/read。**判据:summary/overview 生成(无 timeout)+ search 召回 + read 完整。**
+7. **配置点抽查**:独特关键词召回(content_only)、abstract 质量(vlm temperature/timeout)、rerank 排序、read 完整。
+8. **清理**(§7.0b):**DELETE account `e2e`** 级联清(不要 forget / DELETE user)+ 删容器 `/tmp` 测试文件 + 验证 account 列表无 e2e。
+9. **通过则正式用;有问题 `./update-openviking.sh v0.4.3` 回退**。
 
 ### 8.2 重点关注回归点(基于已知坑)
 
@@ -321,7 +352,7 @@ print(txt(tool("forget", {"uri":"viking://resources/test","recursive":True})))
 
 - **绝不只看 doctor/healthy 就放行**——本轮两个严重问题它都报 PASS。
 - **绝不只测 memory 就放行**——resource 链路更重,是 timeout/summarization 问题的首发地。
-- **测完必清理 + 验证无残留**(default user 若有真实数据,改用隔离 uri 或独立测试 user)。
+- **测完必清理 + 验证无残留**:用**专用 account `e2e`**(物理隔离 default/生产)+ 测后 **DELETE account 级联清**;**不要**用 default user、不要用 root 跑业务、不要用 `DELETE user`/`forget memories` 当清理(残留物理数据 / `Resource is being processed`)。
 
 ---
 

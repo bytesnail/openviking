@@ -131,9 +131,20 @@ done
 
 > 同一软件的多个 agent(如两个 claude code 会话)要隔离,就建 `claude-code-1`/`claude-code-2` 等 user。
 
-### 6.3 各 MCP client 配置(用自己的 user_key)
+### 6.3 接入 MCP client:两种方式(关键:选对 auth 模式)
 
-**通用**:MCP server URL `http://<host>:1933/mcp`,header 用自己的 user_key(`X-API-Key` 或 `Authorization: Bearer`)。
+隔离 user 有两种方式,**取决于 ov.conf 的 `auth_mode`**:
+
+| 方式 | auth_mode | client 怎么指定 user | 适用 |
+|---|---|---|---|
+| **A. user key 自带身份** | `api_key`(当前) | 每个 client 用自己的 **user key**(`X-API-Key`/`Authorization`),**不发 header**,key 自动路由 | 自定义 MCP 配置、直接 HTTP、自写集成 |
+| **B. header 断言身份** | `trusted` | client 发 `X-OpenViking-Account`/`X-OpenViking-User` header(+ root key) | **官方插件**(claude-code/opencode 等都发 header) |
+
+> ⚠️ **官方插件 ≠ api_key 模式**:实测 api_key 模式带 `X-OpenViking-User` 一律 `403 can only assert identity in trusted mode`(不管 user key 还是 root、不管一致与否)。**官方 `claude-code-memory-plugin`/`opencode-memory-plugin` 固定发 header → 要用它们必须切 trusted 模式(§6.4)**。留在 api_key 模式就只能用方式 A(自定义 MCP 配 user key,不发 header)。
+
+#### 方式 A:api_key 模式 + user key(自定义 MCP,当前模式)
+
+每个 client 的 MCP 配置填自己的 user_key,**不发任何 X-OpenViking-* header**:
 
 **Claude Code**(`~/.claude.json` 或项目 `.mcp.json`):
 ```json
@@ -141,15 +152,39 @@ done
   "mcpServers": {
     "openviking": {
       "url": "http://127.0.0.1:1933/mcp",
-      "headers": { "X-API-Key": "<claude-code 的 user_key>" }
+      "headers": { "X-API-Key": "<该 client 的 user_key>" }
     }
   }
 }
 ```
 
-**opencode / hermes / openclaw**:在各自的 MCP server 配置里填同样的 `url` + `X-API-Key: <该 client 的 user_key>`(opencode 用 `mcp_servers` 配置;openclaw 有专门插件 `examples/openclaw-plugin`)。
+**任何支持远程(streamable HTTP)MCP 的 client**(opencode / hermes / cursor / 自写脚本):在各自 MCP server 配置里填 `url` + `X-API-Key: <user_key>`(或 `Authorization: Bearer <user_key>`)。**不要**加 `X-OpenViking-Account/User`(api_key 模式会 403)。
 
-**关键**:每个 client 只换 `user_key` 这一项,openviking 自动按 key 路由到对应 user,记忆隔离。
+**关键**:每个 client 只换 `user_key` 这一项,openviking 按 key 自动路由,记忆隔离。
+
+#### 方式 B:trusted 模式 + header(官方插件,体验最佳)
+
+官方 `examples/claude-code-memory-plugin`、`examples/opencode-memory-plugin` 用 `ovcli.conf`/env + `X-OpenViking-Account/User` header 隔离(带自动 recall/capture,体验比纯 MCP 工具好)。要用它们:
+
+1. ov.conf 切 trusted(§6.4);
+2. 装 plugin(各 plugin README 有 `setup-helper/install.sh` 一键脚本,或 `claude plugin install claude-code-memory-plugin@openviking-plugins-local`);
+3. `~/.openviking/ovcli.conf` 填连接 + 每个 client/agent 自己的 account/user:
+   ```json
+   { "url":"http://127.0.0.1:1933","api_key":"<root_api_key>","account":"myhome","user":"claude-code" }
+   ```
+   或用 env `OPENVIKING_URL` / `OPENVIKING_API_KEY` / `OPENVIKING_ACCOUNT` / `OPENVIKING_USER`(每个 client 设自己的 `OPENVIKING_USER`)。
+
+> openclaw 见 `examples/openclaw-plugin`;codex CLI 见 `examples/codex-memory-plugin`——同样是 url+身份(header/env)模式,装各自 plugin 即可。
+
+### 6.4 切 trusted 模式(用官方插件 / 方式 B 时)
+
+ov.conf `server` 段改 `auth_mode`:
+```jsonc
+"server": { "host":"0.0.0.0", "auth_mode":"trusted", "root_api_key":"${OPENVIKING_ROOT_API_KEY}" }
+```
+`down && up -d`。此后信任 `X-OpenViking-Account/User` header(每请求仍需 root_api_key;非 localhost 强制要求 root key)。安全含义见 §9——trusted = 信任身份断言,只在可信网络/网关后用。
+
+> 切 trusted 后,方式 A 的 user key 仍可用(user key 自带身份,trusted 也接受)——两种方式可并存。但 api_key 模式下方式 B(header)不行(403)。
 
 ---
 
