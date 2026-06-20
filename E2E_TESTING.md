@@ -163,12 +163,12 @@ txt(tool("list", {"uri":"viking://user/default/memories","recursive":True}))  # 
 ### 4.4 副作用与成本
 
 - **kimi token 消耗**:每次入库都调 vlm 生成 summary/overview(reasoning 模型,不便宜)。resource 链路尤重(文件 summary + 目录 overview 两次+)。测试要有预算意识,别反复灌大数据。
-- **default user 污染**:测试写在 `viking://user/default/...`,若该 user 有真实数据,`forget .../memories recursive` 会误删。**测试环境专用 default user、或测试前确认该 user 无真实数据**。
-- **vectordb 累积**:forget 删 viking_fs 条目 + 向量记录,但 local vectordb 的内部结构(如 collection_meta)不变。测试不会改维度/schema(维度没变无需重建)。
+- **default user 污染(Q4,实测确认)**:测试数据写在 `viking://user/default/...`。**无法用独立 user 隔离**——`X-OpenViking-User` header 只在 "trusted mode" 下生效(当前 root_api_key 模式带该 header 直接 `403 X-OpenViking-User can only assert identity in trusted mode`);而 trusted mode 要求 header + URL 都带 account/user 且会信任身份断言(有安全含义),**不为测试开**。所以防污染靠:① 当前 default user 无真实数据时,`forget viking://user/default/memories recursive` 安全;② **将来 default user 有真实数据时,改用"测前 `ls` 快照 + 测后按独特关键词定位、精确 `forget` 测试 uri"**(不 recursive 整树)。
+- **vectordb(Q3 澄清)**:`forget` 删除 viking_fs 条目 **+ 对应的向量记录**(`ls`/`search` 全空 = 数据删干净)。vectordb 保留的是 `collection_meta`(schema:字段/维度/索引类型),这是**结构**而非数据——测试不改维度/schema,保留是正常的、**不是残留**,无需重建。
 
 ---
 
-## 5. 当前测试结果(v0.4.3 + vlm timeout=300)
+## 5. 当前测试结果(v0.4.3 + vlm timeout=1200)
 
 > 前提:已从 v0.4.4 降级 v0.4.3(见 §6.1)、vlm timeout 调到 300(§6.2)。
 
@@ -203,7 +203,7 @@ txt(tool("list", {"uri":"viking://user/default/memories","recursive":True}))  # 
 | `text_source: content_only` | 独特关键词正文召回 | ✅ |
 | `max_input_tokens: 6144` | 中等文件全文覆盖 | ✅ |
 | `vlm.temperature: 1` | vlm 生成高质量 abstract | ✅ |
-| `vlm.timeout: 300` | resource summary/overview 不超时 | ✅ |
+| `vlm.timeout: 1200` / `qp.timeout: 600` | resource summary/overview 不超时 | ✅ |
 | `dense.dimension: 1024` | collection_meta + 入库成功 | ✅ |
 | `rerank`(本地 qwen3-reranker) | 多结果 100%/99% 排序 | ✅ |
 
@@ -221,13 +221,24 @@ txt(tool("list", {"uri":"viking://user/default/memories","recursive":True}))  # 
 
 **解决**:降级 v0.4.3(ab656e24 还没进,v0.4.3 无此 bug)。**doctor 全程报 PASS,完全是假象。**
 
-### 6.2 vlm timeout=60 太短(调到 300)
+### 6.2 vlm timeout 偏短(单位:**秒**;当前 vlm=1200 / qp=600)
 
-**现象**:v0.4.3 下 memory 成功(58s),但 resource 203s 仍搜不到、abstract 空 `(no abstract)`、search 召回 score 0%。
+**现象**:v0.4.3 默认 timeout=60s 下,memory 成功(58s),但 resource 203s 仍搜不到、abstract 空 `(no abstract)`、search 召回 score 0%。
 
 **定位**:`docker logs` 看到 `Failed to generate summary ... openai.APITimeoutError: Request timed out`(每次正好卡 60s)。文件级 summary + 目录 overview 比 memory extraction 重,kimi reasoning 在 60s 内跑不完 → 超时 → abstract 空 → 向量也没正确建。
 
-**解决**:ov.conf 给 `vlm`/`query_planner` 加 `timeout`(vlm=300 / qp=180),down/up。重测 resource 268s 完成、全通。
+**解决**:ov.conf 给 `vlm`/`query_planner` 加 `timeout`(**单位秒**)。先后调过 300/180 → 最终 **vlm=1200 / qp=600**(给 reasoning 留充足余量;max_concurrent 限并发,大 timeout 不增日常成本,只抬最坏上限)。
+
+**实测数据点(Q1:能否按文件大小类推 timeout?)**:
+
+| 文件 | 大小 | summary+overview+向量化耗时 |
+|---|---|---|
+| qubit.md | ~600 字符 | 268s(首次,含 vlm 冷启动) |
+| big.md | 8763 字符 | 120s |
+
+summary/overview 的 vlm 输入上限是 `semantic.max_file_content_chars=30000`(与 embedding 的 `max_input_tokens=6144` 是两码事)。**反直觉:8763 字符比 600 字符还快**——kimi 是 reasoning 模型,耗时由"它决定思考多久"决定、不是输入大小,**不能按文件大小线性类推**。两个数据点都 <300s,但 reasoning 有随机性(qubit 那次 268s 贴近 300),故最终给到 1200 留足余量。
+
+**embedding/rerank 的 timeout(无需配)**:它们在 ov.conf **无可配 timeout 字段**(只有 circuit_breaker 的熔断 timeout),实际请求 timeout **硬编码**——openai rerank=30s、openai embedding 走 SDK 默认。本地 qwen3 秒级响应,够用;限制是硬编码不可配,换远程慢服务时 rerank 30s 可能不够。
 
 **启发**:`VLMConfig.timeout` 默认 60s 对 reasoning 模型偏小;**调 vlm 配置后必须用 resource 链路(重任务)复测**,memory(轻任务)测不出 timeout 问题。
 
