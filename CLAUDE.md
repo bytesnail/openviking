@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 仓库性质
 
-这不是源码项目,而是 **openviking**(volcengine OpenViking,上下文数据库 / MCP server,docker 镜像 `openviking/openviking:latest`)的**本机部署配置仓**。仓库只含 `docker-compose.yml` + `ov.conf` + 密钥管理文件;openviking 自身运行在容器内,源码在镜像里(`/app/.venv/lib/python3.13/site-packages/openviking_cli/` 与 `openviking`)。
+这不是源码项目,而是 **openviking**(volcengine OpenViking,上下文数据库 / MCP server,docker 镜像 `openviking/openviking`,本仓手动锁 tag、不追 `latest`,当前 **v0.4.5**)的**本机部署配置仓**。仓库只含 `docker-compose.yml` + `ov.conf` + 密钥管理文件;openviking 自身运行在容器内,源码在镜像里(`/app/.venv/lib/python3.13/site-packages/openviking_cli/` 与 `openviking`)。
 
 部署形态:embedding/rerank 后端为本机 **qwen3_embed**(llama.cpp `llama-server`),vlm/query_planner 用远程 **kimi** API。
 
@@ -54,7 +54,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 > **升级策略:不自动升级。** openviking 版本迭代快且偶有回归(如 v0.4.4 的 role.value 阻塞 bug,见坑 #11),自动追 `latest` 风险高。改为:**手动选版本 → 端到端测试确认(功能正常 + ov.conf 适配)→ 手动升级**。
 >
-> **何时才考虑升级**(当前钉在 v0.4.3,稳定可用就不动):① 新版本有我们需要的新特性;② 修复了我们在意的 v0.4.3 bug;③ v0.4.3 自己出现新的严重/阻塞性 bug。否则不升。**正式升级前必须先用新版本端到端测(E2E_TESTING.md §8),确认不引入阻塞**——v0.4.4 就是反面教材(带 role.value bug,doctor 还报 PASS)。
+> **何时才考虑升级**(当前钉在 v0.4.5,稳定可用就不动):① 新版本有我们需要的新特性;② 修复了我们在意的 v0.4.5 bug;③ v0.4.5 自己出现新的严重/阻塞性 bug。否则不升。**正式升级前必须先用新版本端到端测(E2E_TESTING.md §8),确认不引入阻塞**——v0.4.4 就是反面教材(带 role.value bug,doctor 还报 PASS)。
 
 仓库 `scripts/` 目录下两个脚本(已 `chmod +x`):
 
@@ -64,7 +64,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 > 原 `setup-cron.sh`(设定自动更新 cron)已删除——手动版本锁定策略下不再自动升级;若将来要恢复自动,`crontab -e` 加一行即可。
 
 ```bash
-./scripts/update-openviking.sh v0.4.3   # 手动升级到 v0.4.3(必填 tag)
+./scripts/update-openviking.sh v0.4.5   # 手动升级到 v0.4.5(必填 tag)
 ./scripts/cleanup-containers.sh         # 停并移除容器
 ```
 
@@ -94,7 +94,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 10. **`embedding.text_source`(默认 `content_only`)与 `max_input_tokens`(默认 4096,本仓设 6144)的非显而易见行为。** text_source 三值 `content_only`/`summary_first`/`summary_only`,但 **`summary_first` 与 `summary_only` 行为完全相同**(源码里总在同一 `in` 集合,无拼接/无差异),实际只有两种模式。摘要在**入库时无条件由 vlm 生成**(与 text_source 无关,用于 `.overview.md`/`.abstract.md`),故切 summary 模式**零额外 vlm 成本**——只是让向量复用已生成摘要。`content_only`:文本文件用正文、非文本(图片等)用摘要;summary 模式:文本文件用摘要(摘要为空则回退正文)。`max_input_tokens` 对所有送 embedding 的文本做**头部截断**(尾部拼 `...(truncated for embedding)`),与 text_source 无关——content_only 长文档只取头部约 `max_input_tokens` tokens。**改 text_source / max_input_tokens 只影响新入库文件,旧向量不变,要重算需走 reindex(不删 vectordb,维度没变)。** 另:dense 是语义检索、**不是字面匹配**,代码符号/精确关键词的精确查询是其结构弱项,需 sparse 才能补;而 **sparse/hybrid 当前只支持 `volcengine`/`vikingdb` 云 provider**(本地 `openai` provider 的 sparse/hybrid 是 `NotImplementedError`,无 local 实现),本地开源 sparse 模型(BGE-M3/SPLADE)暂接不进。
 
-11. **v0.4.4 有 role.value 阻塞 bug,本仓已降级 v0.4.3。** v0.4.4 的 PR#2709 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 等全部 `AttributeError: 'str' object has no attribute 'value'` → **经 MCP 入库全崩**(无摘要无向量,search 全空;doctor/healthy 照常,是假象)。仅 v0.4.4 受影响(v0.4.3 及之前无此 bug);修复 PR#2728 已合并 main 但未发版(详见 GitHub issue #2718)。截至 2026-06-20,最新 release 仍是带 bug 的 v0.4.4,无 v0.4.5+;修复仅存在于 main,故继续钉 v0.4.3。**升级前务必端到端测入库(memory/resource),别只看 doctor;**下一个含 PR#2728 的版本发布后,按 `docs/E2E_TESTING.md` §8 测过再手动升级。
+11. **role.value 阻塞 bug:v0.4.4 受影响,v0.4.5 已修复(本仓已升 v0.4.5)。** v0.4.4 的 PR#2709 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 等全部 `AttributeError: 'str' object has no attribute 'value'` → **经 MCP 入库全崩**(无摘要无向量,search 全空;doctor/healthy 照常,是假象)。仅 v0.4.4 受影响(v0.4.3 及之前无此 bug);**修复 PR#2728 已在 v0.4.5(2026-06-24 发布)正式发版**(详见 GitHub issue #2718),覆盖 storage/resource/session/queue/watch/summarizer/semantic-processing 全路径。本仓已于 2026-06-25 升级 v0.4.5 并端到端复测通过(memory+resource 双链路,role.value bug 不复现,见 `docs/E2E_TESTING.md` §5)。**教训保留:① 自动追 `latest` 会被滚到带 bug 版本(本仓曾因此踩中 v0.4.4)——故手动锁 tag;② doctor/healthy 是假象,升级前后都务必端到端测入库(memory/resource),别只看 doctor。**
 
 ## 文件
 

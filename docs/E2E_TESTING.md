@@ -1,6 +1,6 @@
 # OpenViking 端到端测试方法与记录
 
-> **版本基线**:测试在 `openviking/openviking:v0.4.3` + 本仓当前 ov.conf 上完成(2026-06)。
+> **版本基线**:原始测试在 `openviking/openviking:v0.4.3` + 本仓当前 ov.conf 上完成(2026-06);**2026-06-25 在 v0.4.5 上复测通过**(见 §5.4)。
 > **定位**:记录 openviking 端到端测试的**设计思路、实现方式、数据/副作用管控、当前结果、踩过的坑**,以及**升级前复测的可操作 checklist + 可复用脚本**。
 > 相关:`STORAGE_MODEL.md`(数据行为)、`KIMI_FOR_CODING.md`(vlm 后端)、`CLAUDE.md` 坑 #8/#11。
 
@@ -207,6 +207,17 @@ txt(tool("list", {"uri":"viking://user/default/memories","recursive":True}))  # 
 | `dense.dimension: 1024` | collection_meta + 入库成功 | ✅ |
 | `rerank`(本地 qwen3-reranker) | 多结果 100%/99% 排序 | ✅ |
 
+### 5.4 v0.4.5 复测(2026-06-25 升级验证)
+
+升级到 v0.4.5(含 role.value bug 修复 PR#2728)后,按 §8 checklist 用专用 account `e2e`/user `tester` 复测两条链路,**全过**:
+
+| 链路 | 耗时 | 结果 |
+|---|---|---|
+| memory | extraction 52s | ✅ 3 查询全精准命中(99%/100%/100%),abstract 非空高质量;**role.value bug 不复现** |
+| resource | summary+overview+向量化 41s | ✅ search 召回 2 条(目录级 `.overview.md` + 文件级)均 100%,独特关键词(tritium_ratio=0.45 / Q_factor=1.2)命中,read 完整 |
+
+要点:① role.value bug(memory extraction / resource summarization / forget 全崩)在 v0.4.5 已修,双链路正常;② vlm timeout 配置(vlm=1200 / qp=600)在新版仍生效,resource 链路 41s 完成无超时;③ dimension=1024 不变、collection_meta 兼容,无需重建 vectordb;④ ov.conf 无需适配;⑤ 测后 DELETE account `e2e` 级联清,vectordb 无残留。**doctor 全程报 PASS(含 Embedding/VLM),但一如既往是假象——本次仍以真实 MCP 入库/检索为判据。**
+
 ---
 
 ## 6. 测试中发现的问题与解决
@@ -219,7 +230,7 @@ txt(tool("list", {"uri":"viking://user/default/memories","recursive":True}))  # 
 
 **根因**:v0.4.4 的 [PR#2709](https://github.com/volcengine/OpenViking/pull/2709) 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 全崩 → 无摘要无向量。仅 v0.4.4 受影响。([issue #2718](https://github.com/volcengine/OpenViking/issues/2718),修复 [PR#2728](https://github.com/volcengine/OpenViking/pull/2728) 已合并 main 但未发版。)
 
-**解决**:降级 v0.4.3(ab656e24 还没进,v0.4.3 无此 bug)。**doctor 全程报 PASS,完全是假象。**
+**解决**:降级 v0.4.3(ab656e24 还没进,v0.4.3 无此 bug)。**doctor 全程报 PASS,完全是假象。** **后续(2026-06-25):PR#2728 已在 v0.4.5 正式发版,bug 已修;本仓已升 v0.4.5 并复测通过(§5.4),不再需要停留在 v0.4.3。**
 
 ### 6.2 vlm timeout 偏短(单位:**秒**;当前 vlm=1200 / qp=600)
 
