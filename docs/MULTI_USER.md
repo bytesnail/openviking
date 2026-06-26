@@ -102,7 +102,7 @@ base64url(account_id) . base64url(user_id) . base64url(secret)
 
 ```jsonc
 "server": {
-  "host": "0.0.0.0",          // 已有;host 网络注意对外暴露(见 CLAUDE.md)
+  "host": "127.0.0.1",        // 本仓现值;此字段被 OPENVIKING_SERVER_HOST 覆盖、不决定 bind(坑 #12)
   "auth_mode": "api_key",     // 已有
   "root_api_key": "${OPENVIKING_ROOT_API_KEY}"   // 已有,只用于 admin
 }
@@ -232,7 +232,7 @@ curl -s -X DELETE $B/api/v1/admin/accounts/$ACC -H "X-API-Key: $ROOT"
 
 1. **root_api_key 只做 admin**(建/删 user、轮换 key);**不要拿它配给 client 跑业务**——它路由到 default user、无隔离,且 openviking 新版会禁止 root 访问数据 API(`/mcp`)。本仓历史测试用 root 调 `/mcp` 能通是 v0.4.3 的行为,**升级后可能失效**,生产请一律用 user key。
 2. **user key 即密码**:泄露即等于该 user 的全部记忆暴露。泄露立刻 `POST .../users/{uid}/key` 轮换。
-3. **host 0.0.0.0**:openviking 监听所有网卡(见 CLAUDE.md),同 LAN 可达。user key 是唯一防线。需收口用防火墙/绑特定网卡。
+3. **网络暴露**:本仓 1933 实际 bind 由 docker-compose.yml 的 `OPENVIKING_SERVER_HOST` 决定(优先于 ov.conf `server.host`,见 CLAUDE.md 坑 #12),当前 `127.0.0.1` = **仅本机、LAN 不可达**。若为多机/远程 client 改成 `0.0.0.0` 或某 LAN IP 开放访问,则 user key 是唯一防线,需配合防火墙 / 绑特定网卡收口。
 4. **account 才是物理隔离**:不同 account 的数据连向量库都分开。要彻底隔离(如工作 vs 个人),用不同 account 而非同 account 不同 user。
 5. **trusted 模式风险**:仅在可信网关后用;直连开 trusted = 任何人能伪造任意 user 身份(若没配 root key)。
 
