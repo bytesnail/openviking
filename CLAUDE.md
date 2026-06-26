@@ -14,8 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 架构与网络(理解一切配置的前提)
 
-- openviking 容器 `network_mode: host` → **容器内 `127.0.0.1` 就是宿主机**。所有"本地后端"地址都写 `127.0.0.1`。容器对外监听 `0.0.0.0:1933`。
-- **对外暴露注意**:host 网络下容器直接监听宿主**所有网卡**的 `1933`(ov.conf `server.host:"0.0.0.0"` + `auth_mode:"api_key"`),同 LAN 任意主机可达,仅靠 `${OPENVIKING_ROOT_API_KEY}` 鉴权。需要收口时用防火墙 / 绑定特定网卡,不要只依赖 api_key。
+- openviking 容器 `network_mode: host` → **容器内 `127.0.0.1` 就是宿主机**。所有"本地后端"地址都写 `127.0.0.1`。容器对外监听 `127.0.0.1:1933`(**仅本机**,见下条与坑 #12)。
+- **对外暴露(已收口为仅本机)**:本部署只服务本机 MCP client、不对外。1933 实际 bind 由 docker-compose.yml 的 `OPENVIKING_SERVER_HOST=127.0.0.1` 决定(见坑 #12:它优先于 ov.conf 的 `server.host`),故即便 `network_mode: host` 也只监听宿主 loopback,**LAN 不可达**。⚠️ host 网络模式本身仍允许监听宿主全部网卡——若将来要开放远程访问,把 `OPENVIKING_SERVER_HOST` 改成 `0.0.0.0` 或某 LAN IP(并配合 api_key / 防火墙),不要只依赖 api_key。
 - 本机后端(仅监听宿主 `127.0.0.1`,不对外暴露):
   - **embedding**:`127.0.0.1:8021` 是一层零依赖 Python 透明代理(按请求体 `input_type` 为 query 时注入 qwen3 官方前缀),转发到内部 `127.0.0.1:8031` 的 llama-server(Qwen3-Embedding-0.6B,维度 **1024**)。
   - **reranker**:`127.0.0.1:8022`(llama-server,qwen3-reranker-0.6b)。
@@ -96,9 +96,11 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 11. **role.value 阻塞 bug:v0.4.4 受影响,v0.4.5 已修复(本仓已升 v0.4.5)。** v0.4.4 的 PR#2709 把 `class Role(str, Enum)` 改成 `class Role(str)`(移除 Enum),但所有 `ctx.role.value` 调用没更新 → memory extraction / resource summarization / forget 等全部 `AttributeError: 'str' object has no attribute 'value'` → **经 MCP 入库全崩**(无摘要无向量,search 全空;doctor/healthy 照常,是假象)。仅 v0.4.4 受影响(v0.4.3 及之前无此 bug);**修复 PR#2728 已在 v0.4.5(2026-06-24 发布)正式发版**(详见 GitHub issue #2718),覆盖 storage/resource/session/queue/watch/summarizer/semantic-processing 全路径。本仓已于 2026-06-25 升级 v0.4.5 并端到端复测通过(memory+resource 双链路,role.value bug 不复现,见 `docs/E2E_TESTING.md` §5)。**教训保留:① 自动追 `latest` 会被滚到带 bug 版本(本仓曾因此踩中 v0.4.4)——故手动锁 tag;② doctor/healthy 是假象,升级前后都务必端到端测入库(memory/resource),别只看 doctor。**
 
+12. **`server.host` 被 entrypoint 的 `OPENVIKING_SERVER_HOST` 覆盖 —— 改 ov.conf 的 `server.host` 不改实际 bind(本仓已踩)。** 镜像入口不是直接跑 `openviking-server`,而是 `/usr/local/bin/openviking-entrypoint` 这层 wrapper:它读 `SERVER_HOST="${OPENVIKING_SERVER_HOST:-0.0.0.0}"`,再以 **CLI 参数** `openviking-server --host "$SERVER_HOST"` 启动。CLI `--host` 优先级高于 ov.conf 的 `server.host`,故 **ov.conf 的 `server.host` 在本镜像下不决定实际 bind**(被覆盖、形同摆设)。要改 1933 监听地址,**只改 docker-compose.yml 的 `OPENVIKING_SERVER_HOST`**(本仓 `127.0.0.1`=仅本机;默认 `0.0.0.0`=全网卡含 LAN)+ down/up;ov.conf 的 `server.host` 保留 `127.0.0.1` 仅作意图声明 / 双保险。**核查 bind 别只看 ov.conf/config**:`docker exec python3 -c "from openviking.server.config import load_server_config as l;print(l().host)"` 看到的是 ov.conf 值(独立进程、不带 CLI 覆盖),会误导;要以 `ss -tlnp | grep 1933` 看实际 bind 地址、或看进程命令行 `openviking-server --host ...` 的实际值为准。**教训:核查容器实际监听要追到 entrypoint + 进程命令行,不能只看库代码(bootstrap.py)的配置加载路径。**
+
 ## 文件
 
-- `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
+- `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + `environment: OPENVIKING_SERVER_HOST=127.0.0.1`(决定 1933 实际 bind,见坑 #12)+ 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
 - `ov.conf` — openviking 主配置(占位符版,**进 git**)。
 - `docs/` — 专题文档目录(7 篇,均进 git):
   - `STORAGE_MODEL.md` — 三层存储模型与检索数据流(原文/摘要/向量分离,max_input_tokens 影响边界)。

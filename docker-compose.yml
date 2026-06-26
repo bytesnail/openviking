@@ -5,6 +5,11 @@ services:
     network_mode: host
     env_file:
       - secrets.env
+    environment:
+      # 容器入口 openviking-entrypoint 以此变量拼成 `openviking-server --host` 的 CLI 参数,
+      # 优先级高于 ov.conf 的 server.host —— 本镜像下 server.host 被该 CLI 参数覆盖、不决定实际 bind。
+      # 默认 0.0.0.0 会监听宿主全部网卡(含 LAN,仅靠 api_key 兜底);设 127.0.0.1 = 仅本机访问。
+      OPENVIKING_SERVER_HOST: "127.0.0.1"
     volumes:
       # 相对路径以 compose 文件所在目录解析，与运维脚本的 $(dirname "$0") 定位保持一致；
       # 否则仓库迁移后仍把旧的绝对路径挂进容器，docker 对不存在的 bind 源会建空目录 → 容器读到空 ov.conf 静默生效。
