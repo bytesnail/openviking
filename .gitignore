@@ -5,7 +5,7 @@ secrets.env
 *.env.local
 
 # ===== OpenViking 运行态数据(不纳入版本控制)=====
-# 容器以 root 写入:vectordb / queue / sessions / 日志 / pid 等
+# 容器以 root 写入:vectordb 等运行态数据(具体顶层目录以实际为准,见 CLAUDE.md 文件段)
 /workspace/
 
 # ===== 编辑器 / IDE / 系统 =====
