@@ -1,6 +1,6 @@
 # kimi-for-coding(VLM / QueryPlanner 后端)特性档案
 
-> **版本基线**:`openviking v0.4.4` 源码核对 + 实测 `api.kimi.com/coding/v1`(2026-06);机制在 v0.4.3(本仓当前部署版本)一致。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`)。
+> **版本基线**:`openviking v0.4.4` 源码核对 + 实测 `api.kimi.com/coding/v1`(2026-06);机制在 v0.4.5(本仓当前部署版本)一致。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`)。
 > 定位:openviking 的 vlm/query_planner 后端 `kimi-for-coding` 的**完整行为档案**——它是什么、有什么脾气、openviking 怎么处理它、怎么配、怎么验。
 > 配置陷阱浓缩在 `CLAUDE.md` 坑 #8/#9;本档是完整背景。
 

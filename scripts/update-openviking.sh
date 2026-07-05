@@ -56,10 +56,10 @@ wait_healthy() {
 
 # ── 前置检查 ──────────────────────────────────────────
 # 版本 tag 必须显式指定（不再默认 latest —— latest 是滚动 tag，可能指向含 bug 的版本，
-# 详见 CLAUDE.md 坑 #11：v0.4.4 的 role.value bug）。例：./update-openviking.sh v0.4.3
+# 详见 CLAUDE.md 坑 #11：v0.4.4 的 role.value bug）。例：./update-openviking.sh v0.4.5
 TAG="${1:-}"
 if [ -z "$TAG" ]; then
-    echo "用法: $0 <image-tag>   例: $0 v0.4.3   （支持 v0.4.3 / v0.4.4 / latest / main 等）" >&2
+    echo "用法: $0 <image-tag>   例: $0 v0.4.5   （支持 v0.4.5 / v0.4.4 / latest / main 等）" >&2
     exit 1
 fi
 IMAGE="openviking/openviking:${TAG}"

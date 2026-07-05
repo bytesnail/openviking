@@ -30,3 +30,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+
+# ===== AI coding agent 本地态 =====
+# opencode/codex 等 agent 的会话/状态/plan 本地文件,绝不应进 git
+.omo/
+.codex/
+.opencode/

@@ -1,6 +1,6 @@
 # OpenViking 配置参考(ov.conf)
 
-> **版本基线**:源码核对基于 `openviking v0.4.4`;机制在 v0.4.3(本仓当前部署版本)一致。源码行号为核对版本、跨版本可能偏移,复核以 `grep` 为准。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`「运维脚本」)。
+> **版本基线**:源码核对基于 `openviking v0.4.4`;机制在 v0.4.5(本仓当前部署版本)一致(v0.4.4 有 role.value 阻塞 bug、v0.4.5 已修,见 `CLAUDE.md` 坑 #11)。源码行号为核对版本、跨版本可能偏移,复核以 `grep` 为准。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`「运维脚本」)。
 > 定位:调 `ov.conf` 时查**字段 / 默认值 / provider 支持 / `extra:forbid` 约束**的速查表。
 > 配置陷阱见 `CLAUDE.md`「关键坑」;数据存储/检索行为见 `STORAGE_MODEL.md`。
 
@@ -133,8 +133,9 @@
 "rerank": { "provider":"openai", "api_base":"http://127.0.0.1:8022/v1/rerank",
   "api_key":"no-key", "model":"qwen3-reranker-0.6b-q8_0.gguf" }
 "vlm":          { "provider":"kimi", "api_base":"https://api.kimi.com/coding/v1",
-  "model":"kimi-for-coding", "temperature":1, "max_tokens":131072, "thinking":true, "max_concurrent":10 }
-"query_planner":{ ...同 vlm,但 "max_tokens":65536 }
+  "model":"kimi-for-coding", "temperature":1, "max_tokens":131072, "timeout":1200,
+  "thinking":true, "max_concurrent":10 }
+"query_planner":{ ...同 vlm,但 "max_tokens":65536, "timeout":600 }
 ```
 
 ---

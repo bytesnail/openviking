@@ -1,6 +1,6 @@
 # OpenViking Sparse / Hybrid 检索:现状与接入路径
 
-> **版本基线**:源码核对基于 `openviking v0.4.4`;机制在 v0.4.3(本仓当前部署版本)一致。源码行号为核对版本、跨版本可能偏移,复核以 `grep` 为准。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`)。
+> **版本基线**:源码核对基于 `openviking v0.4.4`;机制在 v0.4.5(本仓当前部署版本)一致(v0.4.4 有 role.value 阻塞 bug、v0.4.5 已修,见 `CLAUDE.md` 坑 #11)。源码行号为核对版本、跨版本可能偏移,复核以 `grep` 为准。本仓手动锁定版本、不自动追 latest(见 `CLAUDE.md`)。
 > 定位:讲清 openviking 的 sparse/hybrid **现在能不能用、本地为什么接不进、将来怎么接**。
 > 相关:`CONFIG_REFERENCE.md`(provider 矩阵)、`STORAGE_MODEL.md`(检索流程)、`CLAUDE.md` 坑 #10。
 

@@ -58,7 +58,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 仓库 `scripts/` 目录下两个脚本(已 `chmod +x`):
 
-- **`update-openviking.sh <tag>`** — **手动**升级到指定版本(**必填 tag**,如 `v0.4.3`;不再默认 `latest`)。流程:`sed` 把 docker-compose.yml 的 image 锁到 `openviking/openviking:<tag>` → `pull` → `up -d` → 轮询 `healthy` → `doctor` → 清悬空镜像;全程写 `update-openviking.log`(超 8 万行轮转)。**锁 tag 后 compose 不会被滚动的 latest 带走。** doctor 失败只告警不退出(依赖本机 qwen + 远程 kimi)。⚠️ doctor 的 `VLM: PASS` 不是 vlm 可用性判据(坑 #8),真实验证要端到端测入库/检索。
+- **`update-openviking.sh <tag>`** — **手动**升级到指定版本(**必填 tag**,如 `v0.4.5`;不再默认 `latest`)。流程:`sed` 把 docker-compose.yml 的 image 锁到 `openviking/openviking:<tag>` → `pull` → `up -d` → 轮询 `healthy` → `doctor` → 清悬空镜像;全程写 `update-openviking.log`(超 8 万行轮转)。**锁 tag 后 compose 不会被滚动的 latest 带走。** doctor 失败只告警不退出(依赖本机 qwen + 远程 kimi)。⚠️ doctor 的 `VLM: PASS` 不是 vlm 可用性判据(坑 #8),真实验证要端到端测入库/检索。
 - **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
 
 > 原 `setup-cron.sh`(设定自动更新 cron)已删除——手动版本锁定策略下不再自动升级;若将来要恢复自动,`crontab -e` 加一行即可。
@@ -112,4 +112,4 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
   - `UPGRADE_0.4.md` — 0.3→0.4 升级变化(User/Peer 模型/legacy 迁移/多模态等)+ 本项目适配分析(legacy 残留处理 + 可选增强)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
 - `scripts/cleanup-containers.sh` / `scripts/update-openviking.sh` — 运维脚本(清理 / 手动升级),**进 git**;详见上文「运维脚本」。(原 `setup-cron.sh` 已删)
-- `workspace/` — openviking 运行态数据(vectordb / queue / sessions / pid),容器以 root 写,**gitignore**。
+- `workspace/` — openviking 运行态数据(顶层实际为 `bot/` / `_system/` / `vectordb/` / `viking/` + `.openviking.pid`;`_system/queue/` 为内置队列),容器以 root 写,**gitignore**。

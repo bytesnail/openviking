@@ -1,6 +1,6 @@
 # OpenViking 多 User(多租户)部署与使用
 
-> **版本基线**:`openviking/openviking:v0.4.3`(2026-06 实测验证)。
+> **版本基线**:`openviking/openviking:v0.4.5`(2026-06-25 升级复测);早期在 v0.4.3 上首测(2026-06)。
 > **定位**:openviking 多租户机制的**完整设置 / 部署 / 使用指南**——这是把 openviking 正式接入多个 MCP client(opencode / claude code / hermes / openclaw 等)、隔离不同软件与不同 agent 记忆的基础。
 > 相关:`E2E_TESTING.md`(端到端测试)、`CLAUDE.md`(坑 + 架构)。官方文档:[Authentication and Multi-Tenancy](https://zread.ai/volcengine/OpenViking/21-authentication-and-multi-tenancy)。
 
@@ -70,7 +70,7 @@ base64url(account_id) . base64url(user_id) . base64url(secret)
 
 | key 类型 | resolve 结果 | 能访问 |
 |---|---|---|
-| **root_api_key** | `role=ROOT`,account/user=None(填 default) | **admin API**;数据 API(`/mcp`)v0.4.3 能访问(路由 default),**新版禁止** |
+| **root_api_key** | `role=ROOT`,account/user=None(填 default) | **admin API**;数据 API(`/mcp`)当前版本(v0.4.5)实测仍能访问(路由到 default user、无隔离);官方已表态未来会禁止 root 访问数据 API,**生产不要依赖** |
 | **user key** | `role=USER/ADMIN, account=X, user=Y` | **自动路由到 user Y**;数据 API 正常;admin 仅限本 account(ADMIN) |
 
 **结论:每个 client 用自己的 user key 调 `/mcp`,自动落到 `viking://user/{该user}/...`,无需 `X-OpenViking-*` header。**
@@ -188,7 +188,7 @@ ov.conf `server` 段改 `auth_mode`:
 
 ---
 
-## 7. 实测验证(本轮,v0.4.3)
+## 7. 实测验证(本轮,v0.4.5 复现 v0.4.3 结论)
 
 ```
 建 account=e2e-team, user=opencode / claude-code(各自 user_key)
@@ -230,7 +230,7 @@ curl -s -X DELETE $B/api/v1/admin/accounts/$ACC -H "X-API-Key: $ROOT"
 
 ## 9. 安全注意
 
-1. **root_api_key 只做 admin**(建/删 user、轮换 key);**不要拿它配给 client 跑业务**——它路由到 default user、无隔离,且 openviking 新版会禁止 root 访问数据 API(`/mcp`)。本仓历史测试用 root 调 `/mcp` 能通是 v0.4.3 的行为,**升级后可能失效**,生产请一律用 user key。
+1. **root_api_key 只做 admin**(建/删 user、轮换 key);**不要拿它配给 client 跑业务**——它路由到 default user、无隔离。当前 v0.4.5 实测 root 仍能访问数据 API(`/mcp`),但官方明确未来会禁止,**生产请一律用 user key**,别依赖 root 走业务。
 2. **user key 即密码**:泄露即等于该 user 的全部记忆暴露。泄露立刻 `POST .../users/{uid}/key` 轮换。
 3. **网络暴露**:本仓 1933 实际 bind 由 docker-compose.yml 的 `OPENVIKING_SERVER_HOST` 决定(优先于 ov.conf `server.host`,见 CLAUDE.md 坑 #12),当前 `127.0.0.1` = **仅本机、LAN 不可达**。若为多机/远程 client 改成 `0.0.0.0` 或某 LAN IP 开放访问,则 user key 是唯一防线,需配合防火墙 / 绑特定网卡收口。
 4. **account 才是物理隔离**:不同 account 的数据连向量库都分开。要彻底隔离(如工作 vs 个人),用不同 account 而非同 account 不同 user。
