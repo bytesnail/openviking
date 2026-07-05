@@ -41,6 +41,12 @@ curl -fsS http://127.0.0.1:1933/health
 # 端到端诊断:展开 ${VAR} + probe embedding/vlm 连通(最可靠的健康验证)
 docker exec openviking openviking-server doctor
 
+# 真实 vlm chat（最可靠可用性判据 —— doctor PASS 不证明 vlm 真能用，见坑 #8）
+docker exec -i openviking python3 -c "import asyncio;from openviking_cli.utils.config import get_openviking_config as g;c=g();print(asyncio.run(c.vlm.get_completion_async('1+1=?')))"
+
+# 核查 1933 实际 bind（坑 #12：ov.conf 的 server.host 被入口 OPENVIKING_SERVER_HOST 覆盖，以 ss 实测为准）
+ss -tlnp | grep 1933
+
 # 确认密钥已注入容器
 docker exec openviking env | grep OPENVIKING
 
@@ -48,7 +54,7 @@ docker exec openviking env | grep OPENVIKING
 systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 ```
 
-> 本仓库无 build / lint / test —— 它是部署配置,不是代码项目。验证手段是上面的 `doctor` + `health`。
+> 本仓库无 build / lint / test —— 它是部署配置，不是代码项目。**健康核查 = `doctor`/`health`（连通性）+ 上面那条真实 vlm chat（可用性，坑 #8 专为绕过 doctor 假象）+ `ss` 核查 bind（坑 #12）**。
 
 ## 运维脚本(手动版本锁定)
 
@@ -62,6 +68,8 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 - **`cleanup-containers.sh`** — `docker compose down --remove-orphans` 停并移除容器。bind-mount 的 `workspace/`、`ov.conf` 不受影响。
 
 > 原 `setup-cron.sh`(设定自动更新 cron)已删除——手动版本锁定策略下不再自动升级;若将来要恢复自动,`crontab -e` 加一行即可。
+
+> **Stale 镜像 tag 不会自动清**:`docker image prune -f` 只清 dangling(无 tag)镜像，滚动 tag(`:latest`/`:main`)与旧锁版本(如升级后的 `:v0.4.3`)累积占盘却不会被脚本清。定期核查 `docker images openviking/openviking`，手动 `docker rmi openviking/openviking:<旧tag>` 回收(本仓当前保留 `:v0.4.5` 在用 + `:v0.4.3` 作为近期回滚保险)。
 
 ```bash
 ./scripts/update-openviking.sh v0.4.5   # 手动升级到 v0.4.5(必填 tag)
