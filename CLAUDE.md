@@ -61,6 +61,8 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 > **升级策略:不自动升级。** openviking 版本迭代快且偶有回归(如 v0.4.4 的 role.value 阻塞 bug,见坑 #11),自动追 `latest` 风险高。改为:**手动选版本 → 端到端测试确认(功能正常 + ov.conf 适配)→ 手动升级**。
 >
 > **何时才考虑升级**(当前钉在 v0.4.5,稳定可用就不动):① 新版本有我们需要的新特性;② 修复了我们在意的 v0.4.5 bug;③ v0.4.5 自己出现新的严重/阻塞性 bug。否则不升。**正式升级前必须先用新版本端到端测(E2E_TESTING.md §8),确认不引入阻塞**——v0.4.4 就是反面教材(带 role.value bug,doctor 还报 PASS)。
+>
+> **2026-07-11 核实结论:暂勿升级到 v0.4.6+。** 四个候选(v0.4.6–v0.4.9)都被 open 回归 **#3134**(search/find 丢 ~90% L2 文档级命中、auto-recall 注入率 100%→22%;根因在 `hierarchical_retriever.py` 检索层、**与向量后端无关,local 同样中招**,本仓 hermes memory 正是 L2 文档级)阻塞;v0.4.8+ 还引入 **#3101**(StreamableHTTP shutdown SEGV、`Failed to flush/close index default`,**与坑 #13 索引损坏同源**)。**升级动机已证伪**:0.4.x 存储全程兼容、VikingFS git-backed 是 opt-in,**不存在"版本差距过大无法升级"**,可等 #3135/#3101 修复进正式版 + 发布满 1–2 周后**直接跳版本**升级。完整决策分析 + 升级前/中/后 checklist + 回滚见 **`docs/UPGRADE_PLAN.md`**。
 
 仓库 `scripts/` 目录下两个脚本(已 `chmod +x`):
 
@@ -118,7 +120,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
 
 - `docker-compose.yml` — host 网络 + `env_file: [secrets.env]` + `environment: OPENVIKING_SERVER_HOST=127.0.0.1`(决定 1933 实际 bind,见坑 #12)+ 把 `ov.conf` 挂到容器 `/app/.openviking/ov.conf` + `workspace` 挂载。
 - `ov.conf` — openviking 主配置(占位符版,**进 git**)。
-- `docs/` — 专题文档目录(7 篇,均进 git):
+- `docs/` — 专题文档目录(8 篇,均进 git):
   - `STORAGE_MODEL.md` — 三层存储模型与检索数据流(原文/摘要/向量分离,max_input_tokens 影响边界)。
   - `CONFIG_REFERENCE.md` — ov.conf 字段/默认值/provider 支持矩阵/extra:forbid 速查。
   - `SPARSE_HYBRID.md` — sparse/hybrid 架构现状、本地接入障碍、SOTA 模型、接入路径。
@@ -126,6 +128,7 @@ systemctl --user is-active qwen-llama@embedding-gpu qwen-llama@reranker-gpu
   - `E2E_TESTING.md` — 端到端测试方法与记录(MCP 测试架构、覆盖矩阵、副作用管控、升级前 checklist + 可复用脚本)。
   - `MULTI_USER.md` — 多 user(多租户)部署与使用指南(account/user/peer 模型、user key 隔离、admin API、各 MCP client 配置)。
   - `UPGRADE_0.4.md` — 0.3→0.4 升级变化(User/Peer 模型/legacy 迁移/多模态等)+ 本项目适配分析(legacy 残留处理 + 可选增强)。
+  - `UPGRADE_PLAN.md` — **从 v0.4.5 往后的升级决策与完整计划**(2026-07-11 核实:#3134/#3101 阻塞 v0.4.6–v0.4.9 → 暂留 v0.4.5;含存储兼容性分析、风险评估、目标版本选择、升级前/中/后 checklist、回滚、监控清单)。
 - `secrets.env` — 真实密钥(**gitignore,不进 git**);`secrets.env.example` 是可提交的模板。
 - `scripts/cleanup-containers.sh` / `scripts/update-openviking.sh` — 运维脚本(清理 / 手动升级),**进 git**;详见上文「运维脚本」。(原 `setup-cron.sh` 已删)
 - `workspace/` — openviking 运行态数据(顶层实际为 `bot/` / `_system/` / `vectordb/` / `viking/` + `.openviking.pid`;`_system/queue/` 为内置队列),容器以 root 写,**gitignore**。
