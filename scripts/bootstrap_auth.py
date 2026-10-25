@@ -50,11 +50,11 @@ def _atomic_write_secret(path, content):
         raise
 
 
-def _post_accounts(base_url, root_key, timeout=30):
-    """返回 (status:int, result:dict|None)。连接失败 status=0。"""
+def _post_json(url, body, root_key, timeout=30):
+    """POST JSON with root key; return (status:int, payload:dict|None); status=0 on connection failure."""
     req = urllib.request.Request(
-        base_url.rstrip("/") + "/api/v1/admin/accounts",
-        data=json.dumps({"account_id": "default", "admin_user_id": "default"}).encode(),
+        url,
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {root_key}"},
         method="POST",
     )
@@ -63,12 +63,31 @@ def _post_accounts(base_url, root_key, timeout=30):
             return resp.status, json.loads(resp.read() or b"null")
     except urllib.error.HTTPError as err:
         try:
-            body = json.loads(err.read() or b"null")
+            payload = json.loads(err.read() or b"null")
         except ValueError:
-            body = None
-        return err.code, body
+            payload = None
+        return err.code, payload
     except (urllib.error.URLError, OSError):
         return 0, None
+
+
+def _post_accounts(base_url, root_key, timeout=30):
+    return _post_json(
+        base_url.rstrip("/") + "/api/v1/admin/accounts",
+        {"account_id": "default", "admin_user_id": "default"},
+        root_key,
+        timeout,
+    )
+
+
+def _register_default_user(base_url, root_key, timeout=30):
+    """Register an admin user under the auto-created default account on v0.5.2 first startup (accounts endpoint returns 409)."""
+    return _post_json(
+        base_url.rstrip("/") + "/api/v1/admin/accounts/default/users",
+        {"user_id": "default", "role": "admin"},
+        root_key,
+        timeout,
+    )
 
 
 def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
@@ -97,7 +116,14 @@ def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env) -> bool:
         payload = json.loads(proc.stdout.decode() or "null")
     except ValueError:
         return False
-    return payload.get("healthy") is True
+    if not isinstance(payload, dict):
+        return False
+    # 真实 CLI 输出为 {"ok":true,"result":{"healthy":true,...}};兼容顶层形态
+    result = payload.get("result")
+    healthy = payload.get("healthy")
+    if isinstance(result, dict):
+        healthy = result.get("healthy", healthy)
+    return healthy is True
 
 
 def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
@@ -141,6 +167,10 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
 
     # ---- 首次初始化 ----
     status, payload = _post_accounts(base_url, root_key, timeout)
+    if status == 409:
+        # v0.5.2 服务端首启自动创建无 user 的空壳 default 账户:
+        # 回退为在既有账户下注册 admin user(响应同样含 user_key)
+        status, payload = _register_default_user(base_url, root_key, timeout)
     if status == 401 or status == 403:
         print("错误:root key 被服务端拒绝(无效或已轮换)", file=sys.stderr)
         return RC_INVALID_ROOT_KEY
@@ -148,12 +178,13 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
         status == 200 and isinstance(payload, dict) and payload.get("status") != "ok"
     ):
         print(
-            "错误:default 账户已存在但本地 user key 缺失,需人工恢复/轮换",
+            "错误:default 账户/user 已存在但本地 user key 缺失,需人工恢复/轮换"
+            "(可调 POST /api/v1/admin/accounts/default/users/default/key 轮换)",
             file=sys.stderr,
         )
         return RC_MANUAL_RECOVERY
     if status != 200:
-        print(f"错误:创建账户失败(admin API status={status})", file=sys.stderr)
+        print(f"错误:账户初始化失败(admin API status={status})", file=sys.stderr)
         return RC_UPSTREAM
 
     result = (payload or {}).get("result") if isinstance(payload, dict) else None
@@ -168,7 +199,22 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
     return _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env)
 
 
+def _ensure_cli_language(ov_bin, env):
+    """真实 CLI 首跑要求显示语言;尽力设置,失败不阻断(已有设置时幂等)。"""
+    try:
+        subprocess.run(
+            [ov_bin, "language", "zh-CN"],
+            env={**env, "OPENVIKING_CLI_CONFIG_FILE": env.get("OPENVIKING_CLI_CONFIG_FILE", "")},
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
+    _ensure_cli_language(ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path})
     proc = _run_ov(
         ov_bin,
         [

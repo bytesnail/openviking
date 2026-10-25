@@ -28,30 +28,60 @@ USER_KEY = "USERKEY-test-1111111111111111111111111111"
 
 
 class FakeOvServer:
-    """实现 bootstrap_auth 依赖的三个接口:POST /api/v1/admin/accounts、
-    GET /health(带 User key 认证)。账户创建一次后,再创建返回 409。"""
+    """实现 bootstrap_auth 依赖的接口:POST /api/v1/admin/accounts、
+    POST /api/v1/admin/accounts/default/users(v0.5.2 首启自动建空壳账户后的
+    正规注册路径)、GET /health(带 User key 认证)。"""
 
     def __init__(self):
-        self.account_exists = False
+        self.shell_account_exists = True   # v0.5.2 服务端首启行为
+        self.user_exists = False
         self.accepted_user_key = None
         self.accounts_calls = 0
+        self.users_calls = 0
         self.drop_user_key = False  # 模拟 trusted 模式缺 user_key 字段
         server = self
 
         class Handler(BaseHTTPRequestHandler):
+            def _auth_root(self):
+                if self.headers.get("Authorization") == f"Bearer {ROOT_KEY}":
+                    return True
+                self._json(401, {"status": "error", "message": "invalid root key"})
+                return False
+
             def do_POST(self):
-                if self.path != "/api/v1/admin/accounts":
-                    self._json(404, {"error": "not found"})
+                if self.path == "/api/v1/admin/accounts":
+                    server.accounts_calls += 1
+                    if not self._auth_root():
+                        return
+                    if server.shell_account_exists:
+                        self._json(409, {
+                            "status": "error",
+                            "error": {"code": "ALREADY_EXISTS",
+                                      "message": "Account already exists: default"},
+                        })
+                        return
+                    server.shell_account_exists = True
+                    self._register_result(
+                        {"account_id": "default", "admin_user_id": "default"}
+                    )
                     return
-                server.accounts_calls += 1
-                if self.headers.get("Authorization") != f"Bearer {ROOT_KEY}":
-                    self._json(401, {"status": "error", "message": "invalid root key"})
+                if self.path == "/api/v1/admin/accounts/default/users":
+                    server.users_calls += 1
+                    if not self._auth_root():
+                        return
+                    if server.user_exists:
+                        self._json(409, {
+                            "status": "error",
+                            "error": {"code": "ALREADY_EXISTS",
+                                      "message": "User already exists: default"},
+                        })
+                        return
+                    server.user_exists = True
+                    self._register_result({"account_id": "default", "user_id": "default"})
                     return
-                if server.account_exists:
-                    self._json(409, {"status": "error", "message": "account exists"})
-                    return
-                server.account_exists = True
-                result = {"account_id": "default", "admin_user_id": "default"}
+                self._json(404, {"error": "not found"})
+
+            def _register_result(self, result):
                 if not server.drop_user_key:
                     result["user_key"] = USER_KEY
                     server.accepted_user_key = USER_KEY
@@ -97,6 +127,12 @@ OV_STUB = f'''#!/usr/bin/env python3
 import json, os, sys, urllib.request, urllib.error
 cfg_path = os.environ["OPENVIKING_CLI_CONFIG_FILE"]
 args = sys.argv[1:]
+if args[:1] == ["language"]:
+    # 模拟真实 CLI:语言设置写入独立 settings 文件
+    settings = os.path.join(os.path.dirname(cfg_path), "ovcli.settings.conf")
+    with open(settings, "w") as fh:
+        json.dump({{"language": args[1] if len(args) > 1 else "en"}}, fh)
+    sys.exit(0)
 if args[:3] == ["config", "add", "custom"]:
     if os.environ.get("OV_STUB_CONFIG_FAIL") == "1":
         sys.exit(3)
@@ -113,10 +149,11 @@ if args[:1] == ["health"]:
     req.add_header("Authorization", "Bearer " + conf["profiles"][conf["active"]]["api_key"])
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            print(json.dumps({{"healthy": resp.status == 200}}))
-            sys.exit(0 if resp.status == 200 else 1)
+            healthy = resp.status == 200
+            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy}}}}))
+            sys.exit(0 if healthy else 1)
     except Exception:
-        print(json.dumps({{"healthy": False}}))
+        print(json.dumps({{"ok": False, "result": {{"healthy": False}}}}))
         sys.exit(1)
 print(json.dumps({{"error": "unknown command"}}), file=sys.stderr)
 sys.exit(2)
@@ -177,13 +214,27 @@ def test_missing_root_key_errors(sandbox, ovserver, capsys):
     assert_no_key_material(capsys)
 
 
-def test_first_init_success(sandbox, ovserver, capsys):
+def test_first_init_via_user_registration(sandbox, ovserver, capsys):
+    """v0.5.2 首启自动建空壳 default 账户:POST /accounts 409 后回退注册 user。"""
     rc = run_bootstrap(sandbox, ovserver)
     assert rc == 0
     assert sandbox.user_key.read_text() == USER_KEY
     assert stat.S_IMODE(sandbox.user_key.stat().st_mode) == 0o600
     assert stat.S_IMODE(sandbox.cli_cfg.stat().st_mode) == 0o600
-    assert ovserver.accounts_calls == 1
+    assert ovserver.accounts_calls == 1 and ovserver.users_calls == 1
+    # CLI 首跑需要语言设置,bootstrap 必须先行设置
+    settings = sandbox.cli_cfg.parent / "ovcli.settings.conf"
+    assert settings.exists() and "zh-CN" in settings.read_text()
+    assert_no_key_material(capsys)
+
+
+def test_first_init_when_no_shell_account(sandbox, ovserver, capsys):
+    """无空壳账户的服务器(未来版本行为):POST /accounts 直接成功。"""
+    ovserver.shell_account_exists = False
+    rc = run_bootstrap(sandbox, ovserver)
+    assert rc == 0
+    assert sandbox.user_key.read_text() == USER_KEY
+    assert ovserver.accounts_calls == 1 and ovserver.users_calls == 0
     assert_no_key_material(capsys)
 
 
@@ -193,8 +244,9 @@ def test_rerun_idempotent_no_second_account(sandbox, ovserver):
     assert ovserver.accounts_calls == 1  # 幂等:不重复创建账户
 
 
-def test_account_exists_but_key_missing_errors(sandbox, ovserver, capsys):
-    ovserver.account_exists = True
+def test_account_and_user_exist_but_key_missing_errors(sandbox, ovserver, capsys):
+    """账户与 user 都已存在而本地 key 丢失:进入人工恢复,不重复创建。"""
+    ovserver.user_exists = True
     rc = run_bootstrap(sandbox, ovserver)
     assert rc != 0
     assert not sandbox.user_key.exists()   # 不伪造恢复
