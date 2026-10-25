@@ -185,6 +185,22 @@ def test_already_wrapped_input_not_double_wrapped():
     assert out == body and wrapped is False
 
 
+def test_image_only_parts_get_content_wrapper():
+    """纯图(无 text part)也属"非空且全为受支持 parts",须包装(2026-10-26 补测缺口)。"""
+    parts = [dict(IMAGE_PART)]
+    out, wrapped = ea.transform_body({"model": "m", "input": parts})
+    assert wrapped is True
+    assert out["input"] == [{"content": parts}]
+
+
+def test_text_only_parts_list_wrapped():
+    """全 text part 的列表同样包装,不当作文本批处理。"""
+    parts = [dict(TEXT_PART), dict(TEXT_PART)]
+    out, wrapped = ea.transform_body({"model": "m", "input": parts})
+    assert wrapped is True
+    assert out["input"] == [{"content": parts}]
+
+
 def test_unsupported_part_type_rejected():
     with pytest.raises(ea.RequestError):
         ea.transform_body({"input": [{"type": "audio", "audio": {"url": "x"}}]})

@@ -62,8 +62,8 @@ curl -fsS http://127.0.0.1:1933/ready
 - `doctor` 须全项通过(embedding 探针为真实请求,返回 768 维)。
 - `smoke_models.py` 发起 2 次 GLM 真实调用与 1 次 rerank 真实请求,消耗少量
   Coding Plan 用量;`ov health -o json` 须含 `"healthy": true`。
-- 扩展功能面(2026-10-26 全量通过):`python3 tests/e2e_adapter_probe.py`
-  (适配器实况 6 项)与 `bash tests/e2e_auth_matrix.sh`(认证边界 8 项)不
+- 扩展功能面(2026-10-26 两轮全量通过):`python3 tests/e2e_adapter_probe.py`
+  (适配器实况 7 项)与 `bash tests/e2e_auth_matrix.sh`(认证边界 8 项)不
   消耗 GLM,可随时重跑;完整矩阵、发现(F1–F4)与复测方法见
   `docs/testing/2026-10-26-openviking-functional-test.md`。
 - 端到端(§9.4):

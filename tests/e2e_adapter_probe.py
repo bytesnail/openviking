@@ -80,6 +80,13 @@ def main():
     check("multimodal-shape", status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768,
           f"http={status} n_vectors={len(vecs)}")
 
+    # 2b. 纯图 parts(无 text part)同样包装且可用(2026-10-26 补测)
+    img_only = [{"type": "image_url", "image_url": {"url": data_url(FIXTURES / "red.png")}}]
+    status, body = post(ADAPTER + "/v1/embeddings", {"model": "embeddinggemma-2", "input": img_only})
+    vecs = body.get("data", []) if isinstance(body, dict) else []
+    check("image-only-parts", status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768,
+          f"http={status} n_vectors={len(vecs)}")
+
     # 3. 红蓝语义:red 图向量与查询相似度高于 blue
     v_red = embed(ADAPTER, red_parts)
     blue_parts = [

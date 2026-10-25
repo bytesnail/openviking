@@ -125,7 +125,7 @@
 ```bash
 cd /mnt/usr/tools/openviking
 python3 -m pytest tests/ -q                        # 单元:适配器协议 + 认证初始化(无外部依赖)
-python3 tests/e2e_adapter_probe.py                 # 适配器实况 6 项(需服务在位,不耗 GLM)
+python3 tests/e2e_adapter_probe.py                 # 适配器实况 7 项(需服务在位,不耗 GLM)
 bash tests/e2e_auth_matrix.sh                      # 认证边界 8 项(不耗 GLM)
 docker compose exec -T openviking openviking-server doctor      # 10 项,含真实 embedding 探针
 docker compose exec -T openviking python -I -B /opt/openviking/scripts/smoke_models.py  # 2 次 GLM + rerank
@@ -152,3 +152,57 @@ docker compose exec -T openviking ov rm viking://resources/<唯一名> --recursi
 - find 红图:0.9400/red、0.9240/red、0.8400/blue;find 蓝图:0.8926/blue #1。
 - get 往返:容器内 md5 `8ac657e29ef7368c808774811bca46db` 与夹具一致。
 - 终态:`ov status` healthy:true errors:[];任务全部 completed;`viking://resources` 空,vector count 24。
+
+## 8. 补充测试(第二轮,2026-10-26,关闭缺口 2/3/4/5/6)
+
+针对首轮审计列出的缺口补测,全部通过;新增观察 2 项(非故障)。新夹具
+`tests/fixtures/{photo-a.jpg, photo-b.jpg, large.jpg, multi/}`(PIL 生成的
+场景图:日落海面/夜晚星空/4000×3000 白天田野/三图目录)。
+
+### 8.1 缺口 2|夹具形态(JPEG、大图、多图、场景级语义)
+
+| 用例 | 结果 | 证据 |
+|---|---|---|
+| JPEG 摄入(photo-a/photo-b) | ✅ | 任务 completed,meta `format: jpeg` |
+| 大图 4000×3000(12MP/254KB) | ✅ | 摄入+embedding+VLM 53.5s success;**O1:`is_large_image` 仍为 False,阈值高于 12MP/254KB,特殊路径未触发** |
+| 多图资源(3 图目录统一分析) | ✅ | 3 文件入库,统一摘要分别准确描述三图 |
+| 场景级语义质量 | ✅ | 三份摘要互异且准确(日落黄昏/夜间天体/极简图形集);细粒度描述(天空渐变、右侧落日、左侧几何结构)与画面吻合 |
+
+### 8.2 缺口 3|图像二进制下载往返
+
+`ov get` 下载 photo-a.jpg / large.jpg / red.png,md5 与夹具逐一相同
+(`a2809f41…`、`d1428af5…`、`ca46ae24…`)✅
+
+### 8.3 缺口 4|查询形态与纯图输入
+
+- `find --image` 四种查询形态(local path / data URI / viking:// URI /
+  HTTP URL,后者经本机回环临时 http.server)返回**完全一致**的排序:
+  同图 multi 副本 #1(0.927)、本体 #2(0.912)、白天田野 #3(0.874),
+  夜空未进前三 ✅。**O2:同像素两份最终分差来自 rerank 侧摘要文本不同,
+  向量分一致(符合机制)**。
+- 适配器纯图输入(无 text part)三层验证:单测新增 2 用例(33/33 通过)、
+  实况 HTTP 200 恰好 1 个 768 维向量、探针沉淀为常驻检查(现 7/7)✅
+
+### 8.4 缺口 5|Studio UI(agent-browser,截图存 `docs/testing/assets/`)
+
+登录(User key,输入框全程掩码)→ 仪表盘 → 文件系统树/目录视图
+(Directory Coverage/Detailed Description)→ 文件详情 → 语义检索
+"日落海面上的太阳":**Top1 = supp-photo-a/.abstract.md(0.837)**,同图
+multi 副本、夜空场景依相关度排布 ✅。仪表盘 Token 图表时间轴自 10/13 起
+(部署日之前),为固定 14 天窗口的视觉现象,未深究。
+
+### 8.5 缺口 6|真实并发
+
+| 层 | 结果 | 证据 |
+|---|---|---|
+| 适配器 8 路并发多模态 embedding | ✅ 8/8 | 墙钟 0.7s,单请求 0.14–0.66s,零错误 |
+| 服务端 6 路并发 `ov find`(embedding 查询+rerank 全链路) | ✅ 6/6 | 全部 ok,各返回 7 条,top1 一致,零锁冲突 |
+
+### 8.6 资源消耗与清理
+
+- GLM 实调:4 个摄入任务(photo-a、photo-b、large、multi 含 3 图)。
+- 清理:supp-* 4 资源树已删(`ov ls viking://resources` 为空)、容器临时
+  下载已删、两个 agent-browser 会话已关闭。操作记录:补测初期一次
+  `export` 未随 Bash 调用保持,命令落入共享默认浏览器会话(还原了无关
+  标签页;fill 未生效、click 落点为该页禁用按钮,无副作用),随后改用
+  命名会话正确完成全部流程。
