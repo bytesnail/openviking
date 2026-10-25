@@ -1,0 +1,6 @@
+/.env
+/secrets.env
+/state/
+/backups/
+__pycache__/
+.pytest_cache/
