@@ -62,6 +62,10 @@ curl -fsS http://127.0.0.1:1933/ready
 - `doctor` 须全项通过(embedding 探针为真实请求,返回 768 维)。
 - `smoke_models.py` 发起 2 次 GLM 真实调用与 1 次 rerank 真实请求,消耗少量
   Coding Plan 用量;`ov health -o json` 须含 `"healthy": true`。
+- 扩展功能面(2026-10-26 全量通过):`python3 tests/e2e_adapter_probe.py`
+  (适配器实况 6 项)与 `bash tests/e2e_auth_matrix.sh`(认证边界 8 项)不
+  消耗 GLM,可随时重跑;完整矩阵、发现(F1–F4)与复测方法见
+  `docs/testing/2026-10-26-openviking-functional-test.md`。
 - 端到端(§9.4):
 
 ```bash
@@ -71,7 +75,15 @@ docker compose exec -T openviking ov find "紫鸢尾-7 号信标的校准码"
 docker compose exec -T openviking ov ls viking://resources
 ```
 
-冒烟资源保留供检查;确认 URI 后可单独删除,不做自动递归清理。
+- `--to` 必须指向不存在的 URI:已存在时是"替换"语义,旧内容会被更新掉
+  (多资源导入每资源独立 `--to`,或先 `mkdir` 再用 `--parent`)。
+- 图片资源语义任务实测 64–66s,超过 CLI 60s 默认超时:`--wait` 会报
+  DEADLINE_EXCEEDED 但服务端任务仍会完成;图片建议不带 `--wait` 提交,
+  轮询 `ov task list` 确认。同目录变更任务在途时,紧随的变更可能报
+  `[CONFLICT] lock acquire timed out`,排空后重试即可。
+
+冒烟资源保留供检查;确认 URI 后可单独删除,不做自动递归清理
+(2026-10-26 功能测试后已按此删除并验证,可用上述命令重建)。
 
 ## 日常操作
 
