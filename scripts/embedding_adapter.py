@@ -194,9 +194,9 @@ class AdapterHandler(BaseHTTPRequestHandler):
         if wrapped:
             try:
                 parsed = json.loads(upstream_raw)
-                vectors = parsed.get("data")
             except ValueError:
-                vectors = None
+                parsed = None
+            vectors = parsed.get("data") if isinstance(parsed, dict) else None
             if not isinstance(vectors, list) or len(vectors) != 1:
                 LOG.warning("multimodal vector count invalid")
                 raise RequestError(

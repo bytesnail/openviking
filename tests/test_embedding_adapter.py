@@ -258,6 +258,18 @@ def test_multimodal_zero_vectors_502(adapter, upstream):
     assert status == 502
 
 
+def test_multimodal_null_json_502(adapter, upstream):
+    upstream.response_body = None  # 上游返回字面 null:合法 JSON 但非对象
+    status, _ = http_post(adapter.base_url, "/v1/embeddings", mm_body())
+    assert status == 502
+
+
+def test_multimodal_array_json_502(adapter, upstream):
+    upstream.response_body = [1, 2, 3]  # 合法 JSON 数组,无 data 字段
+    status, _ = http_post(adapter.base_url, "/v1/embeddings", mm_body())
+    assert status == 502
+
+
 def test_upstream_http_500_maps_to_generic_502(adapter, upstream):
     upstream.response_status = 500
     status, payload = http_post(adapter.base_url, "/v1/embeddings", mm_body())
@@ -307,6 +319,29 @@ def test_invalid_json_400(adapter):
         adapter.base_url, "/v1/embeddings", None, raw_body=b"{not-json"
     )
     assert status == 400
+
+
+def test_non_object_json_body_400(adapter):
+    # 合法 JSON 但非对象(数组/数字/null)→ 400,不是 5xx
+    for raw in (b"[1,2]", b"42", b"null"):
+        status, _ = http_post(
+            adapter.base_url, "/v1/embeddings", None, raw_body=raw
+        )
+        assert status == 400
+
+
+def test_missing_content_length_411(adapter):
+    import http.client
+
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", adapter.server_address[1], timeout=10
+    )
+    conn.putrequest("POST", "/v1/embeddings")
+    conn.putheader("Content-Type", "application/json")
+    conn.endheaders()  # 不发送 Content-Length
+    resp = conn.getresponse()
+    assert resp.status == 411
+    conn.close()
 
 
 def test_get_embeddings_405(adapter):
