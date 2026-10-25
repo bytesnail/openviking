@@ -370,6 +370,24 @@ OPENVIKING_ROOT_API_KEY=<prepare.sh 随机生成，不输出>
 
 Studio 使用 User/Admin key 访问数据；root key 仅用于管理。用户需要在本地自行读取相应文件完成 Studio 登录，不能把密钥粘贴到对话。
 
+### 7.3 实施勘误（2026-10-26，均经源码取证与实测验证）
+
+- **首启空壳账户**：v0.5.2 服务端首启自动创建无 user 的空壳 default 账户
+  （`server/api_keys/legacy.py` `load()` 首启路径），§7.2.3 的
+  `POST /api/v1/admin/accounts` 对 default 必返回 409 ALREADY_EXISTS。实施
+  改为：POST /accounts 得 409 时回退
+  `POST /api/v1/admin/accounts/default/users`（`{"user_id":"default","role":"admin"}`），
+  响应同样含 `result.user_key`（`server/routers/admin.py` register_user）；
+  user 已存在而本地 key 缺失才进入 §7.2.7 人工恢复，轮换端点为
+  `POST /api/v1/admin/accounts/default/users/default/key`。
+- **CLI 语言前提**：真实 CLI 首跑任意命令前需 `ov language`（写入
+  `state/ovcli.settings.conf`，不写 HOME）；bootstrap 已内置尽力设置。
+- **`ov health -o json` 形态**：实际为 `{"ok":…,"result":{"healthy":…}}`
+  嵌套结构，解析须取 `result.healthy`。
+- **图像传参**：`OpenAIVLM._prepare_image` 对非 `http(s)://` 字符串一律按
+  文件路径打开；图像必须传 bytes（自动检测 mime）或本地路径，data-URL
+  字符串不可用。
+
 ## 8. 准备、启动与日常操作
 
 README 运行手册提供以下流程，实际命令在实施阶段生成并验证：

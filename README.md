@@ -16,6 +16,7 @@
 
 ## 前提
 
+- `secrets.env` 已存在且含非占位 `Z_AI_API_KEY`(缺失时 `prepare.sh` 会明确报错;`OPENVIKING_ROOT_API_KEY` 可由其自动生成)。
 - `model-serving/bin/serve.sh status` 显示两个模型运行(18351/18352 在位)。
 - 当前用户 UID/GID 为 `1000:1000`(与 `compose.yaml` 的 `user` 一致;其他用户部署须先显式改 Compose 与 `scripts/prepare.sh` 中的常量)。
 - 端口 1933、18353 空闲。
@@ -40,7 +41,10 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 
 - root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入)。
 - User key:`state/secrets/user_api_key`(600)。
-- CLI 配置:`state/ovcli.conf`(600,含密钥)。
+- CLI 配置:`state/ovcli.conf` 与 `state/ovcli.conf.local`(两者均 600 且
+  内容相同,均含 User key;轮换/清理密钥时须一并处理)。
+- `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
+  创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
 
 Studio(`http://127.0.0.1:1933/studio`)登录用 User key:在本地终端自行
 `cat state/secrets/user_api_key` 读取,不要复制进对话或日志。
