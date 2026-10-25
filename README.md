@@ -77,10 +77,13 @@ docker compose exec -T openviking ov ls viking://resources
 
 - `--to` 必须指向不存在的 URI:已存在时是"替换"语义,旧内容会被更新掉
   (多资源导入每资源独立 `--to`,或先 `mkdir` 再用 `--parent`)。
-- 图片资源语义任务实测 64–66s,超过 CLI 60s 默认超时:`--wait` 会报
-  DEADLINE_EXCEEDED 但服务端任务仍会完成;图片建议不带 `--wait` 提交,
-  轮询 `ov task list` 确认。同目录变更任务在途时,紧随的变更可能报
-  `[CONFLICT] lock acquire timed out`,排空后重试即可。
+- 图片资源语义任务实测 64–66s,曾超过 CLI 60s 默认超时导致 `--wait` 报
+  DEADLINE_EXCEEDED(服务端任务仍会完成)。2026-10-26 已在
+  `state/ovcli.conf` 与 `state/ovcli.conf.local` 顶层写入 `"timeout": 300`
+  (无 CLI 旗标,`ov config edit` 不含该项;`ov config show` 确认实际生效,
+  图片 `--wait` 实测通过)。若未来任务更慢仍超时,可继续调高该值,或退回
+  不带 `--wait` 提交 + 轮询 `ov task list`。同目录变更任务在途时,紧随的
+  变更可能报 `[CONFLICT] lock acquire timed out`,排空后重试即可。
 
 冒烟资源保留供检查;确认 URI 后可单独删除,不做自动递归清理
 (2026-10-26 功能测试后已按此删除并验证,可用上述命令重建)。

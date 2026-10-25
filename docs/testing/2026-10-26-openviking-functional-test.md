@@ -86,7 +86,7 @@
 
 - **现象**:图片 `add-resource --wait` 与 `ov wait` 均报 `DEADLINE_EXCEEDED: operation timed out`(POST `/api/v1/resources` 或 `/api/v1/system/wait`),但服务端任务实际 **success**(任务耗时 64–66s)。
 - **根因**:Rust CLI 配置默认 `timeout: 60.0` 秒(`crates/ov_cli/src/config.rs` `default_timeout`,序列化名 `timeout`),短于图片资源语义任务实测时长;文本任务 45–52s 未触发。
-- **缓解**:`ov add-resource`(不带 `--wait`)立即返回 task_id,轮询 `ov task list -o json` 确认;或在 `state/ovcli.conf` 的 CLI 配置中调高 `timeout` 字段(本次未改动部署状态,未实测该字段运行效果)。
+- **缓解(2026-10-26 已实施并验证)**:`state/ovcli.conf` 与 `state/ovcli.conf.local` 顶层已写入 `"timeout": 300`(改文件是唯一途径——`ov config edit`/`add` 均无 timeout 旗标);`ov config validate` 通过,`ov config show` 确认 CLI 实际加载 `timeout: 300.0`,图片 `add-resource --wait` 实测完整返回 success(51s,验证资源已删)。备选姿势:不带 `--wait` 提交 + 轮询 `ov task list -o json`。
 
 ### F2|同目录变更的锁竞争(0ms 即拒,重试即愈)
 
@@ -140,7 +140,8 @@ docker compose exec -T openviking ov find --image /opt/openviking/fixtures/red.p
 docker compose exec -T openviking ov rm viking://resources/<唯一名> --recursive --wait
 ```
 
-图片资源建议不带 `--wait` 提交后轮询 `ov task list -o json`(F1)。
+图片资源可直接 `--wait`(CLI timeout 已调至 300s,见 F1);若任务时长
+逼近或超过该值,退回不带 `--wait` 提交 + 轮询 `ov task list -o json`。
 
 ## 7. 证据附录(关键原始输出摘录)
 
