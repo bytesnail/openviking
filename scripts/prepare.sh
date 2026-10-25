@@ -47,22 +47,35 @@ done
 
 # ---------- secrets.env 解析(只解析,不执行) ----------
 read_var() { # read_var NAME -> 输出值(调用方捕获,不回显);变量不存在时输出空串
-  grep -E "^${1}=" "$SECRETS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f 2- || true
+  # 与 docker compose env_file 同语义:去首尾空白后剥成对单/双引号
+  # (实测 compose 对 KEY="v" 注入 v;不剥则校验值≠容器实际注入值)
+  local raw
+  raw="$(grep -E "^${1}=" "$SECRETS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f 2- || true)"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  case "$raw" in
+    \"*\") [ "${#raw}" -ge 2 ] && raw="${raw#\"}" && raw="${raw%\"}" ;;
+    \'*\') [ "${#raw}" -ge 2 ] && raw="${raw#\'}" && raw="${raw%\'}" ;;
+  esac
+  case "$raw" in
+    *[![:space:]]*) ;;  # 含非空白字符,保留原样(引号内的合法内部空白不动)
+    *) raw="" ;;        # 剥引号后纯空白 → 视为空
+  esac
+  printf '%s' "$raw"
 }
 
 zai_key="$(read_var Z_AI_API_KEY)"
-[ -n "$zai_key" ] || fail "secrets.env 缺少 Z_AI_API_KEY 或值为空"
+[ -n "$zai_key" ] || fail "secrets.env 缺少 Z_AI_API_KEY 或值为空(含成对引号的空值)"
 # 纯 X 占位符(如 xxxxx / XXXXX)视为未配置
 if [ -z "${zai_key//[xX]/}" ]; then
   fail "Z_AI_API_KEY 是纯 X 占位符,视为未配置"
 fi
 
-root_key="$(read_var OPENVIKING_ROOT_API_KEY)"
-if grep -qE '^OPENVIKING_ROOT_API_KEY=[[:space:]]*$' "$SECRETS_FILE"; then
-  fail "OPENVIKING_ROOT_API_KEY 已存在但为空;按设计不覆盖,请人工轮换后再执行"
-fi
-
-if [ -z "$root_key" ]; then
+if grep -qE '^OPENVIKING_ROOT_API_KEY=' "$SECRETS_FILE"; then
+  root_key="$(read_var OPENVIKING_ROOT_API_KEY)"
+  [ -n "$root_key" ] || fail "OPENVIKING_ROOT_API_KEY 已存在但为空(含成对引号的空值);按设计不覆盖,请人工轮换后再执行"
+  root_key_status="已存在,保持不变"
+else
   # 密码学安全随机 32 字节 hex;直接追加,不动已有内容
   new_key="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
   last_char="$(tail -c 1 "$SECRETS_FILE")"
@@ -71,8 +84,6 @@ if [ -z "$root_key" ]; then
   fi
   printf 'OPENVIKING_ROOT_API_KEY=%s\n' "$new_key" >> "$SECRETS_FILE"
   root_key_status="已生成(32 字节 hex)"
-else
-  root_key_status="已存在,保持不变"
 fi
 chmod 600 "$SECRETS_FILE"
 
@@ -87,10 +98,14 @@ for line in open(secrets_path, encoding="utf-8"):
     if not line or line.startswith("#") or "=" not in line:
         continue
     key, _, value = line.partition("=")
-    env[key.strip()] = value.strip()
+    value = value.strip()
+    # 与 bash read_var / compose env_file 同语义:剥成对单/双引号
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    env[key.strip()] = value
 
 for name in ("Z_AI_API_KEY", "OPENVIKING_ROOT_API_KEY"):
-    if not env.get(name):
+    if not env.get(name, "").strip():
         print(f"PREPARE_FAIL: {name} 缺失或为空")
         sys.exit(1)
 
