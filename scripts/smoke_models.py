@@ -7,7 +7,6 @@
 输出纪律:只输出状态与非敏感指标(字符数、得分);不输出密钥、完整模型
 响应或异常文本(只打印异常类型名)。VLM 调用消耗少量 Coding Plan 用量。
 """
-import base64
 import json
 import os
 import sys
@@ -25,8 +24,8 @@ def smoke_vlm_text(vlm, failures):
     try:
         text = vlm.get_completion(prompt="用一个词回答:1 加 1 等于几?")
         ok = isinstance(text, str) and bool(text.strip())
-        hint = "2" in text if ok else False
-        print(f"[vlm-text]   {'OK' if ok else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} answer_has_2={hint}")
+        hint = ("2" in text or "二" in text or "兩" in text or "两" in text) if ok else False
+        print(f"[vlm-text]   {'OK' if ok else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} answer_correct={hint}")
         if not ok:
             failures.append("vlm-text")
     except Exception as exc:
@@ -36,10 +35,12 @@ def smoke_vlm_text(vlm, failures):
 
 def smoke_vlm_image(vlm, failures):
     try:
+        # 注意:v0.5.2 _prepare_image 对非 http(s) 字符串一律按文件路径处理,
+        # data-URL 字符串会 FileNotFoundError;必须传原始 bytes
         with open(f"{FIXTURES}/red.png", "rb") as fh:
-            data_url = "data:image/png;base64," + base64.b64encode(fh.read()).decode()
+            image_bytes = fh.read()
         text = vlm.get_vision_completion(
-            prompt="这张图片的主要颜色是什么?只用一个词回答。", images=[data_url]
+            prompt="这张图片的主要颜色是什么?只用一个词回答。", images=[image_bytes]
         )
         ok = isinstance(text, str) and bool(text.strip())
         mentions_red = ("红" in text or "red" in text.lower()) if ok else False
