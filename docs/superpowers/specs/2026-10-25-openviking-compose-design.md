@@ -3,7 +3,7 @@
 日期：2026-10-25
 状态：设计已确认，实施尚未开始
 目标目录：`/mnt/usr/tools/openviking`
-调研证据：[OpenViking 官方与本机调研](../../research/2026-10-25-openviking-official.md)
+调研证据：[OpenViking 官方与本机调研](../../research/2026-10-25-openviking-official.md)、[GitHub v0.5.2 源码核查](../../research/2026-10-25-openviking-source-verification.md)、[镜像与本机实况核查](../../research/2026-10-25-image-runtime-verification.md)、[Z.AI 官方文档核查](../../research/2026-10-25-zai-docs-verification.md)
 
 ## 1. 目标与成功标准
 
@@ -45,6 +45,8 @@ ghcr.io/volcengine/openviking:v0.5.2@sha256:d1cc56a356b4d4e81019b3612d7dba01484e
 ```
 
 调研时该 digest 同时是 `latest` 的指向，但部署不依赖 `latest`。release notes 中的另一个 “Release target” 哈希不作为源码基线；以实际 tag `v0.5.2` / `7f3ae1a…` 为准。
+
+2026-10-25 已拉取镜像本地复核：manifest digest 一致，OCI label `org.opencontainers.image.revision` 为 `7f3ae1af…`，与 tag 指向互相印证；镜像内置 healthcheck 即 `CMD openviking-entrypoint --healthcheck`，与本方案 Compose 中的 healthcheck 相同。
 
 ### 2.2 非目标
 
@@ -104,7 +106,7 @@ ghcr.io/volcengine/openviking:v0.5.2@sha256:d1cc56a356b4d4e81019b3612d7dba01484e
 8. 不读取 `secrets.env`，不挂载 `state`，不需要 GLM 或 reranker 访问权限。
 9. 上游调用超时固定为 120 秒，业务转发并发上限为 2；不使用无界线程或无界请求队列。
 
-复用同一 OpenViking 镜像中的 Python 标准库，避免新增基础镜像。适配器使用只读根文件系统、非 root numeric UID/GID、`cap_drop: ALL`、`no-new-privileges` 和小型 tmpfs；这些限制必须在实施验收中验证。
+复用同一 OpenViking 镜像中的 Python 标准库（镜像内 `/app/.venv/bin/python`，Python 3.13.17，已在 `PATH` 中，已实测可运行），避免新增基础镜像。镜像内不存在 `/opt/openviking`；`./scripts:/opt/openviking/scripts` 的容器侧挂载点由 Docker 运行时创建，不依赖镜像内容。适配器使用只读根文件系统、非 root numeric UID/GID、`cap_drop: ALL`、`no-new-privileges` 和小型 tmpfs；这些限制必须在实施验收中验证。
 
 ## 4. 目标文件布局
 
@@ -238,7 +240,7 @@ services:
 - 不给适配器添加 `env_file`。
 - 不使用 `latest`。
 - 主服务以当前宿主用户 `meteor` 的 numeric UID/GID `1000:1000` 运行，使 `state`、CLI 配置和备份保持同一属主；`prepare.sh` 必须核对实际 UID/GID，其他用户部署时先显式调整 Compose，不能错配权限。
-- 实施必须验证官方 entrypoint、native engine、healthcheck 和状态写入均能在该非 root 用户下工作；若上游存在不兼容，返回设计评审，不能静默改回 root。
+- 已核事实：镜像默认 USER 为 root，`/app` 与 `HOME=/app` 均为 root 属主（755），只有挂载进来的 `/app/.openviking`（宿主 `state`）归 1000。实施必须验证官方 entrypoint、native engine、healthcheck、状态写入，以及依赖库向 `$HOME`/缓存路径写入的行为（如 litellm 等的缓存）均能在该非 root 用户下工作；若上游存在不兼容，返回设计评审，不能静默改回 root。
 - 不让 Compose 在缺少 `ov.conf` 时把挂载源自动创建成目录；`prepare.sh` 必须先验证文件类型。
 - 1933、18353 在首次启动前必须空闲；18351/18352 必须已由 `model-serving` 提供。
 
@@ -295,13 +297,19 @@ services:
 
 ### 6.1 参数理由
 
-- `dimension: 768` 来自本机真实 embedding 响应；OpenAI provider 不向 llama.cpp 发送 `dimensions` 参数。
+- `dimension: 768` 来自本机真实 embedding 响应；已核实源码：`provider: "openai"` 时 `_should_send_dimensions()` 恒为 False，`dimensions` 参数不会发给 llama.cpp（仅当其他 provider 复用 OpenAI 引擎且配置了 `api_base` 时才发送）。
+- `input: "multimodal"` 必须显式写出：v0.5.2 工厂仅在字段被显式设置时才向 embedder 传递 `input_type`；配置模型的默认值 `"multimodal"` 不会自动生效，漏写即退化为纯文本。
 - `encoding_format: "float"` 与本机已验证响应一致。
 - 本地 `api_key` 只是非秘密占位值，满足 OpenViking 客户端校验，不是凭据。
 - `rerank.api_base` 必须是完整 `/v1/rerank` endpoint。
-- `rerank.max_input_tokens: 4096` 避免默认 0 导致长输入直接超过本机 8K；query/document 按 OpenViking 规则截断。
+- `rerank.max_input_tokens: 4096` 避免默认 0 导致长输入直接超过本机 8K；query/document 按 OpenViking 规则截断（query 占预算 3/4，document 用余量）。源码要求正值 ≥128，4096 合规。
+- `rerank.threshold: 0.1` 即官方默认值，显式写出只为自说明。
+- `rerank.timeout: 60` 为官方默认 30 的两倍，给图文 rerank 留余量。
+- `embedding.max_concurrent: 2` 对齐本机 llama.cpp 每模型 `parallel=2` 的槽位容量；官方默认为 10，会让上游排队而非并行。
+- `embedding.max_input_tokens: 4096` 与官方默认一致，显式写出。
 - 4096 是保守初始值，不是精确 tokenizer 保证。后续调升必须以真实 token 和模板开销测试为依据。
-- `vlm.max_concurrent: 2` 避免默认 32 路造成 Coding Plan 突发压力。
+- `vlm.model` 必须显式指定：`glm` provider 的默认模型是 `glm-4.6v`，不会自动选用 `glm-5.3-flash`。
+- `vlm.max_concurrent: 2` 避免默认 32 路造成 Coding Plan 突发压力（默认 32 已从 v0.5.2 源码核实）。
 - 不配置 `vlm.max_tokens`；它只控制输出，与 1M context 无关。
 - 不配置 `query_planner`，按官方行为复用 VLM。
 - 不配置 `reasoning_effort` 或 `extra_request_body`，先验证最小兼容配置，再依据实际语义抽取质量调整。
@@ -355,8 +363,8 @@ OPENVIKING_ROOT_API_KEY=<prepare.sh 随机生成，不输出>
    {"account_id":"default","admin_user_id":"default"}
    ```
 
-4. 从响应提取 `result.user_key`，原子写入容器 `/app/.openviking/secrets/user_api_key`，宿主路径为 `state/secrets/user_api_key`，权限 600。
-5. 使用 `ov config add custom --name local --url http://127.0.0.1:1933 --activate -o json`，并通过 `--api-key-env` / `--root-api-key-env` 让 CLI 从子进程环境读取密钥；捕获输出，不转发可能含敏感信息的响应。
+4. 从响应提取 `result.user_key`，原子写入容器 `/app/.openviking/secrets/user_api_key`，宿主路径为 `state/secrets/user_api_key`，权限 600。已核实：`api_key` 认证模式下该响应必含 `result.user_key`（仅 `trusted` 网关模式才会省略）；缺失时脚本应报错退出，不得继续。
+5. 使用 `ov config add custom --name local --url http://127.0.0.1:1933 --activate -o json`，并通过 `--api-key-env` / `--root-api-key-env` 让 CLI 从子进程环境读取密钥（两个旗标均已在 v0.5.2 CLI help 中核实）；捕获输出，不转发可能含敏感信息的响应。CLI 另有 `--force` 可覆盖同名配置；本方案不自动使用，重装/换 key 走下文第 7 条的人工流程。
 6. 确保 `state/ovcli.conf` 权限 600，并用 `ov health -o json` 验证认证。
 7. 如果 default account 已存在但本地 User key 缺失或失效，停止并进入人工恢复/轮换流程；不得重复创建账户、伪造恢复成功或打印管理响应。
 
@@ -389,7 +397,7 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 ### 9.1 静态与单元验证
 
 1. `docker compose config --quiet` 成功。
-2. `ov.conf` 在沙箱假密钥环境下完成变量展开、JSON parse 和 OpenViking schema 校验。
+2. `ov.conf` 在沙箱假密钥环境下完成变量展开、JSON parse 和 OpenViking schema 校验；schema 校验用镜像内 CLI 完成（`ov config validate`，或以 `OPENVIKING_CONFIG_FILE` 指向沙盒副本运行 `openviking-server doctor` 只看 Config 项）。
 3. 适配器单元测试覆盖：
    - 纯文本和文本批处理不变；
    - OpenViking 多模态 parts 只增加一层 `content`；
@@ -421,7 +429,7 @@ curl -fsS http://127.0.0.1:1933/ready
 
 完成标准：
 
-- doctor 全部通过；其 embedding probe 返回 768 维。
+- doctor 全部通过；其 embedding probe 发真实请求并返回 768 维。doctor 没有独立的 rerank 检查项，VLM 项只验配置与 key 存在，二者均由下方 `smoke_models.py` 补齐。
 - `smoke_models.py` 直接完成：
   - GLM 文本 Chat Completions；
   - GLM 图像 Chat Completions；
