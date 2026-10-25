@@ -291,6 +291,15 @@ def test_secrets_dir_created_with_tight_mode(sandbox, ovserver):
     assert stat.S_IMODE(secrets_dir.stat().st_mode) == 0o700
 
 
+def test_cli_cfg_without_user_key_errors_without_creating(sandbox, ovserver):
+    """ovcli.conf 存在但 user_api_key 缺失:进入人工恢复,不发起任何创建调用。"""
+    sandbox.cli_cfg.write_text('{"active": "local"}\n')
+    rc = run_bootstrap(sandbox, ovserver)
+    assert rc != 0
+    assert ovserver.accounts_calls == 0 and ovserver.users_calls == 0
+    assert not sandbox.user_key.exists()
+
+
 def test_recovers_after_cli_config_failure(sandbox, ovserver, monkeypatch):
     monkeypatch.setenv("OV_STUB_CONFIG_FAIL", "1")
     rc = run_bootstrap(sandbox, ovserver)
