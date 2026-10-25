@@ -1,0 +1,68 @@
+name: openviking
+
+x-openviking-image: &openviking-image
+  ghcr.io/volcengine/openviking:v0.5.2@sha256:d1cc56a356b4d4e81019b3612d7dba01484ef2391055817d9c48c77adead4dcd
+
+services:
+  embedding-adapter:
+    image: *openviking-image
+    network_mode: host
+    user: "65532:65532"
+    entrypoint: ["python", "-I", "-B", "/opt/openviking/scripts/embedding_adapter.py"]
+    environment:
+      EMBEDDING_ADAPTER_HOST: "127.0.0.1"
+      EMBEDDING_ADAPTER_PORT: "18353"
+      EMBEDDING_UPSTREAM_URL: "http://127.0.0.1:18351/v1/embeddings"
+      EMBEDDING_UPSTREAM_TIMEOUT_SECONDS: "120"
+      EMBEDDING_MAX_BODY_BYTES: "67108864"
+      EMBEDDING_MAX_CONCURRENT: "2"
+    volumes:
+      - ./scripts:/opt/openviking/scripts:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -I
+        - -B
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18353/ready', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
+  openviking:
+    image: *openviking-image
+    network_mode: host
+    user: "1000:1000"
+    env_file:
+      - ./secrets.env
+    environment:
+      OPENVIKING_SERVER_HOST: "127.0.0.1"
+      OPENVIKING_SERVER_PORT: "1933"
+      OPENVIKING_WITH_BOT: "0"
+      OPENVIKING_CONFIG_FILE: "/app/.openviking/ov.conf"
+      OPENVIKING_CLI_CONFIG_FILE: "/app/.openviking/ovcli.conf"
+    volumes:
+      - ./state:/app/.openviking
+      - ./config/ov.conf:/app/.openviking/ov.conf:ro
+      - ./scripts:/opt/openviking/scripts:ro
+      - ./tests/fixtures:/opt/openviking/fixtures:ro
+    depends_on:
+      embedding-adapter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "openviking-entrypoint", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
