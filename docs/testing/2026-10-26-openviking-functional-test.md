@@ -206,3 +206,25 @@ multi 副本、夜空场景依相关度排布 ✅。仪表盘 Token 图表时间
   `export` 未随 Bash 调用保持,命令落入共享默认浏览器会话(还原了无关
   标签页;fill 未生效、click 落点为该页禁用按钮,无副作用),随后改用
   命名会话正确完成全部流程。
+
+### 8.7 追加验证(第三轮):`is_large_image` 阈值与大图处理管线(O1 关闭)
+
+源码定位(`openviking/utils/media_limits.py`):触发条件为
+**文件 >10MB 或 任一边 >4096px**(`DEFAULT_LARGE_IMAGE_MAX_FILE_SIZE_MB=10.0`、
+`DEFAULT_LARGE_IMAGE_THRESHOLD_DIMENSION=4096`,OR 关系)。此前 12MP/254KB
+用例(4000×3000)两条件皆未达,故为 False——O1 解。
+
+用 6000×4000(24MP,2.86MB,`tests/fixtures/xlarge.jpg`,纯边长分支)实测:
+
+| 验证点 | 结果 | 证据 |
+|---|---|---|
+| flag 翻转 | ✅ | 任务 meta `is_large_image: True` |
+| 落库形态 | ✅ | `xlarge_preview.jpg`(68.8KB,≤2048)+ `xlarge_grid.jpg`(178KB)+ `tiles/` 2行×3列 6 片(源码预测一致);**原图按设计不落库**(`image.py`:原文注释 "The original file is intentionally NOT saved") |
+| 原图取回 | ✅ 拒绝 | `ov stat …/xlarge.jpg` → NOT_FOUND(设计使然;**运维注意:>4096px 或 >10MB 的原图不可 `ov get` 往返,可取回的是 preview/tiles**) |
+| 预览取回 | ✅ | `ov get xlarge_preview.jpg` 70424 bytes |
+| 摘要 tile 感知 | ✅ | 摘要明确描述"image tiling/slicing workflow built around a single … landscape illustration" |
+| 检索自洽 | ✅ | 以原图为 `find --image` 查询,Top4 全为自身 preview/tiles(0.947/0.927/0.918/0.915) |
+| 任务时长 | 观察 | 约 3 分钟(preview+grid+6 tiles 多次 VLM 调用),异步提交+轮询姿势必要 |
+
+清理:supp-xlarge 已删、源码归档与容器临时文件已清、夹具 `xlarge.jpg`
+入库沉淀供复测。GLM 消耗:1 个大图摄入任务(含多次切片分析调用)。

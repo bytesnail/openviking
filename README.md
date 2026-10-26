@@ -77,6 +77,9 @@ docker compose exec -T openviking ov ls viking://resources
 
 - `--to` 必须指向不存在的 URI:已存在时是"替换"语义,旧内容会被更新掉
   (多资源导入每资源独立 `--to`,或先 `mkdir` 再用 `--parent`)。
+- 大图(>4096px 任一边或 >10MB)摄入走切片管线:落库的是低清预览 +
+  网格图 + tiles,**原图按设计不保存、不可 `ov get` 取回**;此类任务
+  约 3 分钟,建议异步提交后轮询 `ov task list`(详见测试报告 §8.7)。
 - 图片资源语义任务实测 64–66s,曾超过 CLI 60s 默认超时导致 `--wait` 报
   DEADLINE_EXCEEDED(服务端任务仍会完成)。2026-10-26 已在
   `state/ovcli.conf` 与 `state/ovcli.conf.local` 顶层写入 `"timeout": 300`
