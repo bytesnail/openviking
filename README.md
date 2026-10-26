@@ -80,6 +80,10 @@ docker compose exec -T openviking ov ls viking://resources
 - 大图(>4096px 任一边或 >10MB)摄入走切片管线:落库的是低清预览 +
   网格图 + tiles,**原图按设计不保存、不可 `ov get` 取回**;此类任务
   约 3 分钟,建议异步提交后轮询 `ov task list`(详见测试报告 §8.7)。
+- 长文本语义成本 ≈ 2 万 LLM tokens/千字符(50K 实测 9.7 万 tokens/10
+  分钟;线性),1M 即约 195 万 tokens/3.3 小时;批量或超大文本用
+  `--processing-mode vectors_only`(实测 20M 字符 21 分钟、零 GLM、深层
+  检索正常),仅重点文档用默认语义模式(详见测试报告 §8.8)。
 - 图片资源语义任务实测 64–66s,曾超过 CLI 60s 默认超时导致 `--wait` 报
   DEADLINE_EXCEEDED(服务端任务仍会完成)。2026-10-26 已在
   `state/ovcli.conf` 与 `state/ovcli.conf.local` 顶层写入 `"timeout": 300`
