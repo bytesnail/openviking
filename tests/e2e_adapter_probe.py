@@ -17,6 +17,7 @@
 import base64
 import json
 import math
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -28,7 +29,23 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 results = []
 
 
-def post(url, payload, timeout=60):
+def _configured_model():
+    """从 config/ov.conf 读 embedding 模型名,避免换型后探针钉死旧名
+    (2026-11-01 reranker 漂移的教训);读不到时退回已知名。"""
+    try:
+        conf = Path(__file__).resolve().parents[1] / "config" / "ov.conf"
+        cfg = json.loads(os.path.expandvars(conf.read_text(encoding="utf-8-sig")))
+        return cfg["embedding"]["dense"]["model"]
+    except (OSError, KeyError, ValueError):
+        return "embeddinggemma-2"
+
+
+MODEL = _configured_model()
+
+
+def post(url, payload, timeout=150):
+    # timeout 须覆盖适配器上游超时(120s)+ 适配器自身开销,避免慢但合法的
+    # 多模态请求把探针误杀
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
     )
@@ -38,10 +55,12 @@ def post(url, payload, timeout=60):
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
         return exc.code, body[:200]
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return 0, f"connection-level: {type(exc).__name__}"
 
 
 def embed(url, inp):
-    status, body = post(url + "/v1/embeddings", {"model": "embeddinggemma-2", "input": inp})
+    status, body = post(url + "/v1/embeddings", {"model": MODEL, "input": inp})
     if status != 200:
         raise SystemExit(f"embed failed: {url} -> {status} {body}")
     return body["data"][0]["embedding"]
@@ -75,20 +94,26 @@ def main():
         {"type": "text", "text": "describe this image"},
         {"type": "image_url", "image_url": {"url": data_url(FIXTURES / "red.png")}},
     ]
-    status, body = post(ADAPTER + "/v1/embeddings", {"model": "embeddinggemma-2", "input": red_parts})
+    status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": red_parts})
     vecs = body.get("data", []) if isinstance(body, dict) else []
     check("multimodal-shape", status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768,
           f"http={status} n_vectors={len(vecs)}")
+    # 留存步骤 2 的 red 向量供步骤 3 复用(2b 会覆盖 vecs/status)
+    v_red = vecs[0]["embedding"] if (
+        status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768
+    ) else None
 
     # 2b. 纯图 parts(无 text part)同样包装且可用(2026-10-26 补测)
     img_only = [{"type": "image_url", "image_url": {"url": data_url(FIXTURES / "red.png")}}]
-    status, body = post(ADAPTER + "/v1/embeddings", {"model": "embeddinggemma-2", "input": img_only})
+    status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": img_only})
     vecs = body.get("data", []) if isinstance(body, dict) else []
     check("image-only-parts", status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768,
           f"http={status} n_vectors={len(vecs)}")
 
     # 3. 红蓝语义:red 图向量与查询相似度高于 blue
-    v_red = embed(ADAPTER, red_parts)
+    # (步骤 2 已对同一 red_parts 得到向量,直接复用,不再重复推理)
+    if v_red is None:
+        v_red = embed(ADAPTER, red_parts)
     blue_parts = [
         {"type": "text", "text": "describe this image"},
         {"type": "image_url", "image_url": {"url": data_url(FIXTURES / "blue.png")}},
@@ -99,7 +124,7 @@ def main():
 
     # 4. 负例:不支持 part 类型 → 4xx
     bad = [{"type": "video_url", "video_url": {"url": "x"}}]
-    status, body = post(ADAPTER + "/v1/embeddings", {"model": "embeddinggemma-2", "input": bad})
+    status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": bad})
     check("bad-part-rejected", 400 <= status < 500, f"http={status}")
 
     # 5. 适配器 health/ready

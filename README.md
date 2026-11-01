@@ -15,7 +15,9 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 - 一切服务只监听 `127.0.0.1`(API 1933、适配器 18353),无 `ports` 映射、无反向代理。
 - 认证为 `api_key` 模式:root key 管理账户,User key 访问数据;两者分离。
 - 不启用 VikingBot(无 18790 Gateway)。
-- 真实凭据只在 `secrets.env`(600)与容器环境;`ov.conf` 仅保存 `${VAR}` 引用。
+- 真实凭据只在 `secrets.env`(600)、`state/secrets/user_api_key`、
+  `state/ovcli.conf` 与 `state/ovcli.conf.local`(详见下节"认证凭据位置")
+  与容器环境;`ov.conf` 仅保存 `${VAR}` 引用。
 
 ## 前提
 
@@ -37,15 +39,18 @@ docker compose up -d --wait --wait-timeout 180
 docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap_auth.py
 ```
 
-`prepare.sh` 幂等,可重复执行;`secrets.env` 中 `OPENVIKING_ROOT_API_KEY`
-缺失时自动生成(32 字节 hex),存在但为空时直接失败。
+`prepare.sh` 幂等,可重复执行,但**须在 compose 栈停止时运行**:端口检查
+要求 1933/18353 空闲,栈在运行时会按设计失败(占用者就是本部署)。
+`secrets.env` 中 `OPENVIKING_ROOT_API_KEY` 缺失时自动生成(32 字节 hex),
+存在但为空时直接失败。
 
 ### 认证凭据位置(敏感,勿粘贴到任何对话/issue)
 
 - root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入)。
 - User key:`state/secrets/user_api_key`(600)。
-- CLI 配置:`state/ovcli.conf` 与 `state/ovcli.conf.local`(两者均 600 且
-  内容相同,均含 User key;轮换/清理密钥时须一并处理)。
+- CLI 配置:`state/ovcli.conf`(bootstrap 生成,600,含 User key)与
+  `state/ovcli.conf.local`(人工维护的手工副本,内容应与前者一致;bootstrap
+  **不写**此文件,轮换/清理密钥时须与前者一并手工同步)。
 - `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
   创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
 
@@ -88,12 +93,12 @@ docker compose exec -T openviking ov ls viking://resources
   `--processing-mode vectors_only`(实测 20M 字符 21 分钟、零 GLM、深层
   检索正常),仅重点文档用默认语义模式(详见测试报告 §8.8)。
 - 图片资源语义任务实测 64–110s,曾超过 CLI 60s 默认超时导致 `--wait` 报
-  DEADLINE_EXCEEDED(服务端任务仍会完成)。已在
-  `state/ovcli.conf` 与 `state/ovcli.conf.local` 顶层写入 `"timeout": 300`
-  (无 CLI 旗标,`ov config edit` 不含该项;`ov config show` 确认实际生效)。
-  注意:两文件由 bootstrap 生成,**不含** timeout,从零重建 state 后须按
-  本条重新写入(2026-10-26 与 2026-11-01 重建均如此操作)。若未来任务更慢
-  仍超时,可继续调高该值,或退回不带 `--wait` 提交 + 轮询 `ov task list`。
+  DEADLINE_EXCEEDED(服务端任务仍会完成)。CLI 顶层 `"timeout": 300`
+  (无旗标,`ov config edit` 不含该项;`ov config show` 确认实际生效)
+  现由 `bootstrap_auth.py` 生成 `ovcli.conf` 时自动写入(已设置时不覆盖);
+  2026-10-26 与 2026-11-01 两次重建靠手工补写的历史不再需要。手工副本
+  `ovcli.conf.local` 仍须自行补写/同步。若未来任务更慢仍超时,可继续调高
+  该值,或退回不带 `--wait` 提交 + 轮询 `ov task list`。
   同目录变更任务在途时,紧随的变更可能报 `[CONFLICT] lock acquire timed out`,
   排空后重试即可。
 

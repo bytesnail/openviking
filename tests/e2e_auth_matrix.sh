@@ -14,7 +14,21 @@
 set -u
 cd "$(dirname "$0")/.."
 
-ROOT_KEY=$(grep -oP '(?<=^OPENVIKING_ROOT_API_KEY=)\S+' secrets.env | tr -d '"')
+read_secret() { # 与 scripts/prepare.sh read_var 同语义:取末次出现、剥首尾空白与成对单/双引号
+  local raw
+  raw="$(sed -n "s/^$1=//p" secrets.env | tail -n 1)"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  case "$raw" in
+    \"*\") [ "${#raw}" -ge 2 ] && raw="${raw#\"}" && raw="${raw%\"}" ;;
+    \'*\') [ "${#raw}" -ge 2 ] && raw="${raw#\'}" && raw="${raw%\'}" ;;
+  esac
+  printf '%s' "$raw"
+}
+
+ROOT_KEY=$(read_secret OPENVIKING_ROOT_API_KEY)
+[ -n "$ROOT_KEY" ] || { echo "FAIL-SETUP: secrets.env 缺少 OPENVIKING_ROOT_API_KEY(先执行 scripts/prepare.sh)" >&2; exit 1; }
+[ -s state/secrets/user_api_key ] || { echo "FAIL-SETUP: state/secrets/user_api_key 缺失或为空(先执行 bootstrap_auth.py)" >&2; exit 1; }
 USER_KEY=$(cat state/secrets/user_api_key)
 BASE=${BASE:-http://127.0.0.1:1933}
 code() { curl -s -o /dev/null -w '%{http_code}' -m 15 "$@"; }

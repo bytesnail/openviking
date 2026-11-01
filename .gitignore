@@ -2,5 +2,6 @@
 /secrets.env
 /state/
 /backups/
+/tests/fixtures/longtext/
 __pycache__/
 .pytest_cache/
