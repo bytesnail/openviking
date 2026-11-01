@@ -8,6 +8,7 @@
 安全约束:只监听 loopback;不读取任何密钥;不记录请求正文、图片、向量、
 Authorization 头或响应正文;转发并发上限受限,不排队无界请求。
 """
+import http.client
 import json
 import logging
 import os
@@ -115,6 +116,9 @@ def _health_url(upstream_url):
 
 class AdapterHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # 入站读超时:声明 Content-Length 后停滞的连接不再永久占住线程
+    # (慢速合法大请求不受影响——超时是按每次 read 计,不是按总时长计)
+    timeout = 120
 
     # ---- 响应工具:统一 JSON 输出,错误信息一律通用化,不回显上游正文 ----
 
@@ -148,20 +152,21 @@ class AdapterHandler(BaseHTTPRequestHandler):
                 self._send_json(503, {"status": "unavailable", "upstream": "down"})
             return
         if self.path == "/v1/embeddings":
+            self.close_connection = True  # 未读潜在请求体,关闭连接防止 keep-alive 错位
             self._send_error_json(405, "method_not_allowed", "use POST")
             return
+        self.close_connection = True  # 同上:未知路径不读体,直接关连接
         self._send_error_json(404, "not_found", "unknown path")
 
     def do_POST(self):
         if self.path != "/v1/embeddings":
+            self.close_connection = True  # 不读未知路径的请求体,关闭连接防止 keep-alive 错位
             self._send_error_json(404, "not_found", "unknown path")
             return
         try:
             self._handle_embeddings()
         except RequestError as exc:
             LOG.warning("rejected status=%d code=%s", exc.status, exc.code)
-            if exc.status in (411, 413):
-                self.close_connection = True  # 未读完请求体,防止连接错位
             self._send_error_json(exc.status, exc.code, exc.message)
         except Exception:
             LOG.exception("internal_error")
@@ -170,19 +175,21 @@ class AdapterHandler(BaseHTTPRequestHandler):
     # ---- 核心转发 ----
 
     def _handle_embeddings(self):
-        raw = self._read_body()
-        try:
-            body = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
-            raise RequestError(400, "invalid_json", "request body is not valid JSON")
-
-        out_body, wrapped = transform_body(body)
-        payload = json.dumps(out_body).encode() if wrapped else raw
-
-        # 超出并发上限的请求只做有界等待,等待超时直接拒绝,不排无界队列
+        # 先校验长度并占用并发额度,再读正文:并发上限同时约束"已缓存正文"的
+        # 总内存(而非仅转发数),超限请求不读体直接拒绝,不排无界队列
+        length = self._content_length()
         if not self._acquire_slot():
+            self.close_connection = True  # 正文未读,关闭连接防止 keep-alive 错位
             raise RequestError(503, "overloaded", "adapter concurrency limit reached")
         try:
+            raw = self.rfile.read(length)
+            try:
+                body = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise RequestError(400, "invalid_json", "request body is not valid JSON")
+
+            out_body, wrapped = transform_body(body)
+            payload = json.dumps(out_body).encode() if wrapped else raw
             upstream_raw, upstream_status = self._call_upstream(payload)
         finally:
             self.server.forward_slots.release()
@@ -202,7 +209,7 @@ class AdapterHandler(BaseHTTPRequestHandler):
                 raise RequestError(
                     502, "upstream_error", "multimodal response must contain exactly one vector"
                 )
-            upstream_raw = json.dumps(parsed).encode()
+            # 校验通过后原样转发上游字节,不再解析-重序列化(保真且省一遍开销)
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -213,17 +220,22 @@ class AdapterHandler(BaseHTTPRequestHandler):
     def _acquire_slot(self):
         return self.server.forward_slots.acquire(timeout=self.server.forward_wait_seconds)
 
-    def _read_body(self):
+    def _content_length(self):
+        """只校验 Content-Length 头并返回长度;任何拒绝路径都标记关闭连接
+        (此刻请求体尚未读,留着会在 keep-alive 连接上错位下一个请求)。"""
         length_header = self.headers.get("Content-Length")
         if length_header is None:
+            self.close_connection = True
             raise RequestError(411, "length_required", "Content-Length is required")
         try:
             length = int(length_header)
         except ValueError:
+            self.close_connection = True
             raise RequestError(400, "invalid_request", "invalid Content-Length")
         if length < 0 or length > self.server.max_body_bytes:
+            self.close_connection = True
             raise RequestError(413, "payload_too_large", "request body exceeds limit")
-        return self.rfile.read(length)
+        return length
 
     def _call_upstream(self, payload):
         """POST 到上游;任何失败折叠为 (None, 非 200 状态)。日志只记状态。"""
@@ -241,7 +253,10 @@ class AdapterHandler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as err:
             err.close()
             return None, err.code
-        except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
+        except (urllib.error.URLError, http.client.HTTPException,
+                socket.timeout, TimeoutError, OSError):
+            # HTTPException(如 IncompleteRead/BadStatusLine)是上游传输层失败,
+            # 与连接层失败同样折叠为非 200,按上游失败处理而非适配器内部错误
             return None, 0  # 0 表示连接层失败,统一按上游失败处理
 
     def _upstream_healthy(self):

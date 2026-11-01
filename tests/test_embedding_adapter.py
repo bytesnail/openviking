@@ -370,6 +370,76 @@ def test_unknown_path_404(adapter):
     assert status == 404
 
 
+def test_unknown_path_then_reuse_same_connection(adapter):
+    """404(带请求体)之后复用同一连接:绝不能得到由残留体字节解析出的
+    伪应答(旧 bug:不读体不关连接 → 复用方收到 HTML 400 垃圾页)。
+    合格结果二选一:连接级失败(服务端已关),或客户端自动重连后的
+    正常 200 JSON;HTML 垃圾页一律判负。"""
+    import http.client
+
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", adapter.server_address[1], timeout=10
+    )
+    try:
+        conn.request(
+            "POST", "/v1/other", body=json.dumps({"input": "x"}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp1 = conn.getresponse()
+        assert resp1.status == 404
+        resp1.read()
+
+        outcome = "error"
+        try:
+            conn.request(
+                "POST", "/v1/embeddings", body=json.dumps({"model": "m", "input": "x"}),
+                headers={"Content-Type": "application/json"},
+            )
+            resp2 = conn.getresponse()
+            outcome = (resp2.status, resp2.read())
+        except (http.client.RemoteDisconnected, ConnectionError,
+                http.client.BadStatusLine, OSError):
+            outcome = "connection-closed"
+        if outcome == "connection-closed":
+            pass  # 服务端关闭连接:正确契约,复用必须由客户端重连
+        else:
+            status, raw2 = outcome
+            payload2 = json.loads(raw2)  # 旧 bug 的 HTML 垃圾页在此抛 ValueError
+            assert status == 200 and "data" in payload2
+    finally:
+        conn.close()
+
+
+def test_invalid_content_length_closes_connection(adapter):
+    """非法 Content-Length 的 400 之后连接必须关闭(体未读,不能复用)。"""
+    import http.client
+
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", adapter.server_address[1], timeout=10
+    )
+    try:
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "abc")
+        conn.endheaders()
+        conn.send(b'{"input":"x"}')
+        resp = conn.getresponse()
+        assert resp.status == 400
+        resp.read()
+        # 服务端已关连接:复用必须失败(写入即 EPIPE 或读取得到连接级错误),
+        # 而不是收到伪应答
+        with pytest.raises((http.client.RemoteDisconnected, ConnectionError,
+                            http.client.BadStatusLine, OSError)):
+            conn.putrequest("POST", "/v1/embeddings")
+            conn.putheader("Content-Type", "application/json")
+            conn.putheader("Content-Length", "2")
+            conn.endheaders()
+            conn.send(b"{}")
+            conn.getresponse()
+    finally:
+        conn.close()
+
+
 def test_health_ok_without_upstream():
     server = ea.make_server(
         host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
