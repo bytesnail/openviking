@@ -2,7 +2,9 @@
 
 本机单用户部署:OpenViking v0.5.2(镜像 tag+digest 固定)复用
 `/mnt/usr/tools/model-serving` 的 `embeddinggemma-2`(127.0.0.1:18351)与
-`qwen3-vl-reranker-2b`(127.0.0.1:18352),VLM 走 Z.AI GLM Coding Plan
+`qwen3-reranker-0.6b`(127.0.0.1:18352,纯文本;2026-10-29 起接替多模态
+`qwen3-vl-reranker-2b`;客户端仅发送文本,换型影响与验证见
+`docs/testing/2026-11-01-reranker-model-adaptation.md`),VLM 走 Z.AI GLM Coding Plan
 `glm-5.3-flash`,多模态 embedding 经 loopback 适配器(127.0.0.1:18353)。
 
 设计文档(决策依据、参数理由、失败处理):`docs/superpowers/specs/2026-10-25-openviking-compose-design.md`。

@@ -41,7 +41,7 @@ for p in 1933 18353; do
 done
 for p in 18351 18352; do
   if ! port_listening "$p"; then
-    fail "端口 $p 未监听:model-serving 未提供(embeddinggemma-2=18351 / qwen3-vl-reranker-2b=18352);本方案不修改 model-serving"
+    fail "端口 $p 未监听:model-serving 未提供(embedding=18351 / rerank=18352);本方案不修改 model-serving"
   fi
 done
 
@@ -129,6 +129,39 @@ if not ok:
     print("PREPARE_FAIL: 密钥字段与 secrets.env 值不一致")
     sys.exit(1)
 print("ov.conf 展开+JSON 校验通过")
+PY
+
+# ---------- 模型名漂移预警(仅警告,不阻断) ----------
+# llama-server 不校验请求里的 model 字段(按已加载模型服务),ov.conf 的模型名
+# 与实际加载模型漂移时,smoke/doctor 等功能性检查全部无感——2026-11-01 reranker
+# 换型即靠人工发现。此处对 18351/18352 各取 /v1/models,按大小写不敏感子串比对
+# (服务端报告的是 gguf 路径,含配置名即视为匹配)。端口可达性已由上文检查。
+python3 - "$CONFIG_FILE" <<'PY'
+import json, sys, urllib.request
+
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+except ValueError:
+    sys.exit(0)  # JSON 合法性已由上文校验并另行失败,此处不重复报错
+checks = [
+    ("embedding", "18351", cfg.get("embedding", {}).get("dense", {}).get("model", "")),
+    ("rerank", "18352", cfg.get("rerank", {}).get("model", "")),
+]
+for label, port, model in checks:
+    if not model:
+        continue
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=3) as r:
+            data = json.load(r)
+        items = data.get("data") or data.get("models") or []
+        ids = " ".join(str(m.get("id") or m.get("name") or "") for m in items).lower()
+        if model.lower() in ids:
+            continue
+        detail = ids or "(加载列表为空)"
+    except Exception as exc:
+        detail = f"查询失败({type(exc).__name__}),跳过核对"
+    print(f"PREPARE_WARN: {label} 上游({port})/v1/models 未含 {model!r}({detail});"
+          f"模型名可能漂移,请人工确认", file=sys.stderr)
 PY
 
 # ---------- 目录与状态标记 ----------
