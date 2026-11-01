@@ -15,6 +15,7 @@
 用法:python3 tests/e2e_adapter_probe.py(在仓库根目录)
 """
 import base64
+import http.client
 import json
 import math
 import os
@@ -30,40 +31,70 @@ results = []
 
 
 def _configured_model():
-    """从 config/ov.conf 读 embedding 模型名,避免换型后探针钉死旧名
-    (2026-11-01 reranker 漂移的教训);读不到时退回已知名。"""
+    """从 config/ov.conf 读 embedding 模型名;配置不可信时明确终止。
+
+    llama-server 不校验请求 model 字段,回退旧名会在配置损坏时产生假通过。
+    """
     try:
         conf = Path(__file__).resolve().parents[1] / "config" / "ov.conf"
         cfg = json.loads(os.path.expandvars(conf.read_text(encoding="utf-8-sig")))
-        return cfg["embedding"]["dense"]["model"]
-    except (OSError, KeyError, ValueError):
-        return "embeddinggemma-2"
+        model = cfg["embedding"]["dense"]["model"]
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"SETUP-FAIL: 无法读取 embedding.dense.model({type(exc).__name__})"
+        ) from None
+    if not isinstance(model, str) or not model.strip():
+        raise SystemExit("SETUP-FAIL: embedding.dense.model 必须是非空字符串")
+    return model
 
 
 MODEL = _configured_model()
 
 
-def post(url, payload, timeout=150):
-    # timeout 须覆盖适配器上游超时(120s)+ 适配器自身开销,避免慢但合法的
-    # 多模态请求把探针误杀
+def post(url, payload, timeout=160):
+    # timeout 须覆盖适配器排队(30s)+上游超时(120s)+序列化/网络开销
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read())
+            status = resp.status
+            raw = resp.read()
+        try:
+            return status, json.loads(raw)
+        except ValueError:
+            return status, "invalid-json-response"
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
         return exc.code, body[:200]
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
         return 0, f"connection-level: {type(exc).__name__}"
+
+
+def single_vector(body):
+    if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+        return None
+    if len(body["data"]) != 1 or not isinstance(body["data"][0], dict):
+        return None
+    vector = body["data"][0].get("embedding")
+    if not isinstance(vector, list) or not vector:
+        return None
+    if not all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+        for x in vector
+    ):
+        return None
+    return vector
 
 
 def embed(url, inp):
     status, body = post(url + "/v1/embeddings", {"model": MODEL, "input": inp})
     if status != 200:
         raise SystemExit(f"embed failed: {url} -> {status} {body}")
-    return body["data"][0]["embedding"]
+    vector = single_vector(body)
+    if vector is None:
+        raise SystemExit(f"embed failed: {url} -> invalid embedding response schema")
+    return vector
 
 
 def cosine(a, b):
@@ -96,18 +127,17 @@ def main():
     ]
     status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": red_parts})
     vecs = body.get("data", []) if isinstance(body, dict) else []
-    check("multimodal-shape", status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768,
+    v_red = single_vector(body) if status == 200 else None
+    check("multimodal-shape", v_red is not None and len(v_red) == 768,
           f"http={status} n_vectors={len(vecs)}")
     # 留存步骤 2 的 red 向量供步骤 3 复用(2b 会覆盖 vecs/status)
-    v_red = vecs[0]["embedding"] if (
-        status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768
-    ) else None
 
     # 2b. 纯图 parts(无 text part)同样包装且可用(2026-10-26 补测)
     img_only = [{"type": "image_url", "image_url": {"url": data_url(FIXTURES / "red.png")}}]
     status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": img_only})
     vecs = body.get("data", []) if isinstance(body, dict) else []
-    check("image-only-parts", status == 200 and len(vecs) == 1 and len(vecs[0]["embedding"]) == 768,
+    image_only_vector = single_vector(body) if status == 200 else None
+    check("image-only-parts", image_only_vector is not None and len(image_only_vector) == 768,
           f"http={status} n_vectors={len(vecs)}")
 
     # 3. 红蓝语义:red 图向量与查询相似度高于 blue
@@ -134,6 +164,8 @@ def main():
                 check(f"adapter{path}", resp.status == 200, f"http={resp.status}")
         except urllib.error.HTTPError as exc:
             check(f"adapter{path}", False, f"http={exc.code}")
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
+            check(f"adapter{path}", False, f"http=0 error={type(exc).__name__}")
 
     failed = [r for r in results if not r[1]]
     print(f"SUMMARY: {len(results) - len(failed)}/{len(results)} passed")

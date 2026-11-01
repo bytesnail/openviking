@@ -11,6 +11,7 @@ Authorization 头或响应正文;转发并发上限受限,不排队无界请求�
 import http.client
 import json
 import logging
+import math
 import os
 import socket
 import sys
@@ -131,6 +132,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _send_error_json(self, status, code, message):
+        # 错误路径可能尚未读完请求体;统一关闭,防止 keep-alive 请求错位。
+        self.close_connection = True
         self._send_json(status, {"error": {"message": message, "type": code}})
 
     def log_request(self, code="-", size="-"):
@@ -142,6 +145,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
     # ---- 路由 ----
 
     def do_GET(self):
+        # GET 也可能带体;成功响应前不读体,因此统一禁止连接复用。
+        self.close_connection = True
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
             return
@@ -182,7 +187,12 @@ class AdapterHandler(BaseHTTPRequestHandler):
             self.close_connection = True  # 正文未读,关闭连接防止 keep-alive 错位
             raise RequestError(503, "overloaded", "adapter concurrency limit reached")
         try:
-            raw = self.rfile.read(length)
+            try:
+                raw = self.rfile.read(length)
+            except (socket.timeout, TimeoutError):
+                raise RequestError(408, "request_timeout", "timed out reading request body")
+            if len(raw) != length:
+                raise RequestError(400, "invalid_request", "incomplete request body")
             try:
                 body = json.loads(raw)
             except (ValueError, UnicodeDecodeError):
@@ -204,10 +214,23 @@ class AdapterHandler(BaseHTTPRequestHandler):
             except ValueError:
                 parsed = None
             vectors = parsed.get("data") if isinstance(parsed, dict) else None
-            if not isinstance(vectors, list) or len(vectors) != 1:
-                LOG.warning("multimodal vector count invalid")
+            vector = None
+            if isinstance(vectors, list) and len(vectors) == 1 and isinstance(vectors[0], dict):
+                vector = vectors[0].get("embedding")
+            valid_vector = (
+                isinstance(vector, list)
+                and bool(vector)
+                and all(
+                    isinstance(x, (int, float))
+                    and not isinstance(x, bool)
+                    and math.isfinite(x)
+                    for x in vector
+                )
+            )
+            if not valid_vector:
+                LOG.warning("multimodal vector response invalid")
                 raise RequestError(
-                    502, "upstream_error", "multimodal response must contain exactly one vector"
+                    502, "upstream_error", "multimodal response must contain exactly one valid vector"
                 )
             # 校验通过后原样转发上游字节,不再解析-重序列化(保真且省一遍开销)
 
@@ -223,10 +246,17 @@ class AdapterHandler(BaseHTTPRequestHandler):
     def _content_length(self):
         """只校验 Content-Length 头并返回长度;任何拒绝路径都标记关闭连接
         (此刻请求体尚未读,留着会在 keep-alive 连接上错位下一个请求)。"""
-        length_header = self.headers.get("Content-Length")
-        if length_header is None:
+        if self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            raise RequestError(400, "invalid_request", "Transfer-Encoding is not supported")
+        length_headers = self.headers.get_all("Content-Length") or []
+        if not length_headers:
             self.close_connection = True
             raise RequestError(411, "length_required", "Content-Length is required")
+        if len(length_headers) != 1:
+            self.close_connection = True
+            raise RequestError(400, "invalid_request", "exactly one Content-Length is required")
+        length_header = length_headers[0]
         try:
             length = int(length_header)
         except ValueError:

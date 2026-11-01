@@ -5,9 +5,11 @@ server;ov CLI 用可执行 stub 替身(真实 CLI 在部署验收时联调)。
 覆盖:首次初始化、重跑幂等、账户已存在但丢 key、root/user key 无效、
 服务不可达、输出不含任何密钥。
 """
+import http.client
 import json
 import os
 import stat
+import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,6 +38,7 @@ class FakeOvServer:
         self.accounts_calls = 0
         self.users_calls = 0
         self.drop_user_key = False  # 模拟 trusted 模式缺 user_key 字段
+        self.success_status = 200
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -82,7 +85,7 @@ class FakeOvServer:
                 if not server.drop_user_key:
                     result["user_key"] = USER_KEY
                     server.accepted_user_key = USER_KEY
-                self._json(200, {"status": "ok", "result": result})
+                self._json(server.success_status, {"status": "ok", "result": result})
 
             def do_GET(self):
                 if self.path != "/health":
@@ -147,7 +150,7 @@ if args[:1] == ["health"]:
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             healthy = resp.status == 200
-            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy}}}}))
+            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy, "account_id": "default", "user_id": "default", "role": "admin"}}}}))
             sys.exit(0 if healthy else 1)
     except Exception:
         print(json.dumps({{"ok": False, "result": {{"healthy": False}}}}))
@@ -310,3 +313,94 @@ def test_recovers_after_cli_config_failure(sandbox, ovserver, monkeypatch):
     assert run_bootstrap(sandbox, ovserver) == 0  # 重跑:用已有 user_key 补建配置
     assert sandbox.cli_cfg.exists()
     assert ovserver.accounts_calls == 1  # 不重复创建账户
+
+
+def test_non_200_success_is_not_treated_as_completed(sandbox, ovserver):
+    ovserver.success_status = 202
+    rc = run_bootstrap(sandbox, ovserver)
+    assert rc == ba.RC_UPSTREAM
+    assert not sandbox.user_key.exists()
+
+
+def test_truncated_admin_response_is_controlled_failure(monkeypatch):
+    class TruncatedResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"{}")
+
+    monkeypatch.setattr(
+        ba.urllib.request, "urlopen", lambda *args, **kwargs: TruncatedResponse()
+    )
+    assert ba._post_json("http://127.0.0.1:1", {}, ROOT_KEY) == (0, None)
+
+
+def test_missing_ov_binary_returns_structured_error(sandbox, ovserver, capsys):
+    missing = sandbox.tmp / "bin" / "missing-ov"
+    rc = ba.run(
+        ROOT_KEY, ovserver.url, str(sandbox.cli_cfg), str(sandbox.user_key),
+        ov_bin=str(missing), env=dict(os.environ),
+    )
+    assert rc == ba.RC_CLI_CONFIG
+    assert sandbox.user_key.exists()  # 保留恢复所需 key,但不伪报初始化成功
+    assert_no_key_material(capsys)
+
+
+def test_health_requires_default_identity(monkeypatch, sandbox):
+    def health_with_identity(user_id="default", account_id="default"):
+        return subprocess.CompletedProcess(
+            ["ov", "health"], 0,
+            stdout=json.dumps({
+                "ok": True,
+                "result": {
+                    "healthy": True, "account_id": account_id, "user_id": user_id,
+                },
+            }).encode(),
+        )
+
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(user_id="test"))
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    monkeypatch.setattr(
+        ba, "_run_ov",
+        lambda *args: subprocess.CompletedProcess(
+            ["ov", "health"], 0,
+            stdout=json.dumps({"ok": True, "result": {"healthy": True}}).encode(),
+        ),
+    )
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+
+
+def test_timeout_write_failure_is_reported_and_idempotent_retry_repairs(
+    sandbox, ovserver, monkeypatch
+):
+    assert run_bootstrap(sandbox, ovserver) == 0
+    cfg = json.loads(sandbox.cli_cfg.read_text())
+    del cfg["timeout"]
+    sandbox.cli_cfg.write_text(json.dumps(cfg))
+
+    real_replace = ba.os.replace
+    monkeypatch.setattr(ba.os, "replace", lambda *args: (_ for _ in ()).throw(OSError()))
+    assert run_bootstrap(sandbox, ovserver) == ba.RC_CLI_CONFIG
+    assert "timeout" not in json.loads(sandbox.cli_cfg.read_text())
+
+    monkeypatch.setattr(ba.os, "replace", real_replace)
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
+
+
+def test_stale_fixed_tmp_symlink_is_not_followed(sandbox, ovserver):
+    victim = sandbox.tmp / "victim"
+    victim.write_text("unchanged")
+    (sandbox.state / "ovcli.conf.tmp").symlink_to(victim)
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert victim.read_text() == "unchanged"
+    assert not sandbox.cli_cfg.is_symlink()
+    assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300

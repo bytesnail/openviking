@@ -46,11 +46,12 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 
 ### 认证凭据位置(敏感,勿粘贴到任何对话/issue)
 
-- root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入)。
+- root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入),以及
+  bootstrap 生成的 `state/ovcli.conf` 与其手工副本 `state/ovcli.conf.local`。
 - User key:`state/secrets/user_api_key`(600)。
-- CLI 配置:`state/ovcli.conf`(bootstrap 生成,600,含 User key)与
-  `state/ovcli.conf.local`(人工维护的手工副本,内容应与前者一致;bootstrap
-  **不写**此文件,轮换/清理密钥时须与前者一并手工同步)。
+- CLI 配置:`state/ovcli.conf` 与 `state/ovcli.conf.local`(两者均 600、内容
+  应一致,均含 User key 与 root key);前者由 bootstrap 生成,后者人工维护,
+  bootstrap **不写**此文件,轮换/清理任一密钥时须同步处理两份配置。
 - `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
   创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
 
@@ -69,7 +70,8 @@ curl -fsS http://127.0.0.1:1933/ready
 
 - `doctor` 须全项通过(embedding 探针为真实请求,返回 768 维)。
 - `smoke_models.py` 发起 2 次 GLM 真实调用与 1 次 rerank 真实请求,消耗少量
-  Coding Plan 用量;`ov health -o json` 须含 `"healthy": true`。
+  Coding Plan 用量;`ov health -o json` 须含 `"healthy": true`,且
+  `result.account_id/user_id` 均为 `default`(排除无 key 或错身份的假通过)。
 - 扩展功能面(2026-10-26 两轮全量通过):`python3 tests/e2e_adapter_probe.py`
   (适配器实况 7 项)与 `bash tests/e2e_auth_matrix.sh`(认证边界 8 项)不
   消耗 GLM,可随时重跑;完整矩阵、发现(F1–F4)与复测方法见

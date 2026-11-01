@@ -12,17 +12,22 @@
 #
 # 用法:bash tests/e2e_auth_matrix.sh(在仓库根目录)
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || { echo "FAIL-SETUP: 无法进入仓库根目录" >&2; exit 1; }
 
-read_secret() { # 与 scripts/prepare.sh read_var 同语义:取末次出现、剥首尾空白与成对单/双引号
-  local raw
+read_secret() { # 与 scripts/prepare.sh read_var 同语义:取末次出现、剥引号与行内注释
+  local raw double_quoted single_quoted
   raw="$(sed -n "s/^$1=//p" secrets.env | tail -n 1)"
   raw="${raw#"${raw%%[![:space:]]*}"}"
   raw="${raw%"${raw##*[![:space:]]}"}"
-  case "$raw" in
-    \"*\") [ "${#raw}" -ge 2 ] && raw="${raw#\"}" && raw="${raw%\"}" ;;
-    \'*\') [ "${#raw}" -ge 2 ] && raw="${raw#\'}" && raw="${raw%\'}" ;;
-  esac
+  double_quoted='^("([^"\\]|\\.)*")[[:space:]]*(#.*)?$'
+  single_quoted="^('[^']*')[[:space:]]*(#.*)?$"
+  if [[ "$raw" =~ $double_quoted ]] || [[ "$raw" =~ $single_quoted ]]; then
+    raw="${BASH_REMATCH[1]}"
+    raw="${raw:1:${#raw}-2}"
+  else
+    raw="${raw%%[[:space:]]#*}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+  fi
   printf '%s' "$raw"
 }
 

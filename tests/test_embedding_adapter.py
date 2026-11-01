@@ -41,14 +41,14 @@ class FakeUpstream:
                     upstream.requests.append(
                         (self.command, self.path, dict(self.headers), body)
                     )
-                if upstream.hang_seconds:
-                    time.sleep(upstream.hang_seconds)
                 with upstream._lock:
                     upstream._inflight += 1
                     upstream.max_inflight_seen = max(
                         upstream.max_inflight_seen, upstream._inflight
                     )
                 try:
+                    if upstream.hang_seconds:
+                        time.sleep(upstream.hang_seconds)
                     if self.path == "/health":
                         self._respond(200, {"status": "ok"})
                         return
@@ -286,6 +286,19 @@ def test_multimodal_array_json_502(adapter, upstream):
     assert status == 502
 
 
+@pytest.mark.parametrize("response_body", [
+    {"data": [{}]},
+    {"data": [{"embedding": None}]},
+    {"data": [{"embedding": []}]},
+    {"data": [{"embedding": [0.1, "bad"]}]},
+    {"data": [{"embedding": [float("nan")]}]},
+])
+def test_multimodal_invalid_vector_502(adapter, upstream, response_body):
+    upstream.response_body = response_body
+    status, _ = http_post(adapter.base_url, "/v1/embeddings", mm_body())
+    assert status == 502
+
+
 def test_upstream_http_500_maps_to_generic_502(adapter, upstream):
     upstream.response_status = 500
     status, payload = http_post(adapter.base_url, "/v1/embeddings", mm_body())
@@ -358,6 +371,44 @@ def test_missing_content_length_411(adapter):
     resp = conn.getresponse()
     assert resp.status == 411
     conn.close()
+
+
+def test_duplicate_content_length_rejected(adapter, upstream):
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    try:
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "13")
+        conn.putheader("Content-Length", "100")
+        conn.endheaders()
+        conn.send(b'{"input":"x"}')
+        resp = conn.getresponse()
+        assert resp.status == 400
+        resp.read()
+    finally:
+        conn.close()
+    assert upstream.requests == []
+
+
+def test_transfer_encoding_with_length_rejected(adapter, upstream):
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    try:
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.putheader("Content-Length", "13")
+        conn.endheaders()
+        conn.send(b'{"input":"x"}')
+        resp = conn.getresponse()
+        assert resp.status == 400
+        resp.read()
+    finally:
+        conn.close()
+    assert upstream.requests == []
 
 
 def test_get_embeddings_405(adapter):
@@ -484,8 +535,10 @@ def test_forward_concurrency_capped_at_two():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     results = []
+    start = threading.Barrier(3)
 
     def worker():
+        start.wait()
         results.append(http_post(base, "/v1/embeddings", {"model": "m", "input": "x"}))
 
     try:
@@ -570,3 +623,69 @@ def test_response_vector_not_logged(adapter, upstream):
     finally:
         ea.LOG.removeHandler(handler)
     assert not any("0.1" in m for m in records)  # 向量数值不进日志
+
+
+def test_short_declared_body_is_rejected(adapter, upstream):
+    import http.client
+    import socket
+
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    try:
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "100")
+        conn.endheaders()
+        body = b'{"input":"x"}'
+        conn.send(body)
+        conn.sock.shutdown(socket.SHUT_WR)
+        resp = conn.getresponse()
+        assert resp.status == 400
+        assert json.loads(resp.read())["error"]["type"] == "invalid_request"
+    finally:
+        conn.close()
+    assert upstream.requests == []
+
+
+def test_get_health_with_body_cannot_desync_next_request(adapter):
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    try:
+        conn.putrequest("GET", "/health")
+        conn.putheader("Content-Length", "2")
+        conn.endheaders()
+        conn.send(b"{}")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        resp.read()
+        with pytest.raises((http.client.RemoteDisconnected, ConnectionError,
+                            http.client.BadStatusLine, OSError)):
+            conn.putrequest("GET", "/health")
+            conn.endheaders()
+            conn.getresponse()
+    finally:
+        conn.close()
+
+
+def test_body_read_timeout_is_408_and_closes(adapter, monkeypatch):
+    import http.client
+
+    monkeypatch.setattr(ea.AdapterHandler, "timeout", 0.1)
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    try:
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", "10")
+        conn.endheaders()
+        conn.send(b"{")
+        resp = conn.getresponse()
+        assert resp.status == 408
+        assert json.loads(resp.read())["error"]["type"] == "request_timeout"
+        with pytest.raises((http.client.RemoteDisconnected, ConnectionError,
+                            http.client.BadStatusLine, OSError)):
+            conn.putrequest("POST", "/v1/embeddings")
+            conn.putheader("Content-Length", "0")
+            conn.endheaders()
+            conn.getresponse()
+    finally:
+        conn.close()

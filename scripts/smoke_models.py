@@ -23,10 +23,13 @@ def load_config():
 def smoke_vlm_text(vlm, failures):
     try:
         text = vlm.get_completion(prompt="用一个词回答:1 加 1 等于几?")
-        ok = isinstance(text, str) and bool(text.strip())
-        hint = ("2" in text or "二" in text or "兩" in text or "两" in text) if ok else False
-        print(f"[vlm-text]   {'OK' if ok else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} answer_correct={hint}")
-        if not ok:
+        nonempty = isinstance(text, str) and bool(text.strip())
+        hint = (
+            "2" in text or "二" in text or "兩" in text or "两" in text
+            or "two" in text.lower()
+        ) if nonempty else False
+        print(f"[vlm-text]   {'OK' if hint else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} answer_correct={hint}")
+        if not hint:
             failures.append("vlm-text")
     except Exception as exc:
         print(f"[vlm-text]   FAIL error={type(exc).__name__}")
@@ -42,8 +45,9 @@ def smoke_vlm_image(vlm, failures):
         text = vlm.get_vision_completion(
             prompt="这张图片的主要颜色是什么?只用一个词回答。", images=[image_bytes]
         )
-        ok = isinstance(text, str) and bool(text.strip())
-        mentions_red = ("红" in text or "red" in text.lower()) if ok else False
+        nonempty = isinstance(text, str) and bool(text.strip())
+        mentions_red = ("红" in text or "紅" in text or "red" in text.lower()) if nonempty else False
+        ok = nonempty and mentions_red
         print(
             f"[vlm-image]  {'OK' if ok else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} "
             f"mentions_red={mentions_red}"

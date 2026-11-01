@@ -47,16 +47,22 @@ done
 
 # ---------- secrets.env 解析(只解析,不执行) ----------
 read_var() { # read_var NAME -> 输出值(调用方捕获,不回显);变量不存在时输出空串
-  # 与 docker compose env_file 同语义:去首尾空白后剥成对单/双引号
-  # (实测 compose 对 KEY="v" 注入 v;不剥则校验值≠容器实际注入值)
-  local raw
+  # 与 docker compose env_file 同语义:去首尾空白、剥成对引号、去行内注释
+  # (实测 compose 对 KEY="v" # comment 与 KEY=v # comment 均注入 v)
+  local raw double_quoted single_quoted
   raw="$(grep -E "^${1}=" "$SECRETS_FILE" 2>/dev/null | tail -n 1 | cut -d= -f 2- || true)"
   raw="${raw#"${raw%%[![:space:]]*}"}"
   raw="${raw%"${raw##*[![:space:]]}"}"
-  case "$raw" in
-    \"*\") [ "${#raw}" -ge 2 ] && raw="${raw#\"}" && raw="${raw%\"}" ;;
-    \'*\') [ "${#raw}" -ge 2 ] && raw="${raw#\'}" && raw="${raw%\'}" ;;
-  esac
+  double_quoted='^("([^"\\]|\\.)*")[[:space:]]*(#.*)?$'
+  single_quoted="^('[^']*')[[:space:]]*(#.*)?$"
+  if [[ "$raw" =~ $double_quoted ]] || [[ "$raw" =~ $single_quoted ]]; then
+    raw="${BASH_REMATCH[1]}"
+    raw="${raw:1:${#raw}-2}"
+  else
+    # 非引号值中,空白后的 # 是注释;VALUE#literal 仍保留 #。
+    raw="${raw%%[[:space:]]#*}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+  fi
   case "$raw" in
     *[![:space:]]*) ;;  # 含非空白字符,保留原样(引号内的合法内部空白不动)
     *) raw="" ;;        # 剥引号后纯空白 → 视为空
@@ -93,16 +99,24 @@ import json, os, re, sys
 
 secrets_path, config_path = sys.argv[1], sys.argv[2]
 env = {}
+
+def parse_env_value(value):
+    value = value.strip()
+    quoted = (
+        re.fullmatch(r'("(?:[^"\\]|\\.)*")\s*(?:#.*)?', value)
+        or re.fullmatch(r"('[^']*')\s*(?:#.*)?", value)
+    )
+    if quoted:
+        return quoted.group(1)[1:-1]
+    # Compose:非引号值的空白 + # 开始行内注释,VALUE#literal 不算。
+    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+
 for line in open(secrets_path, encoding="utf-8"):
     line = line.strip()
     if not line or line.startswith("#") or "=" not in line:
         continue
     key, _, value = line.partition("=")
-    value = value.strip()
-    # 与 bash read_var / compose env_file 同语义:剥成对单/双引号
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1]
-    env[key.strip()] = value
+    env[key.strip()] = parse_env_value(value)
 
 for name in ("Z_AI_API_KEY", "OPENVIKING_ROOT_API_KEY"):
     if not env.get(name, "").strip():
@@ -180,8 +194,8 @@ ensure_dir_700 "$BACKUP_DIR"
 if [ -e "$MARKER" ]; then
   marker_status="已存在(继续接管本方案状态)"
 else
-  for entry in "$STATE_DIR"/* "$STATE_DIR"/.[!.]*; do
-    [ -e "$entry" ] || continue
+  for entry in "$STATE_DIR"/* "$STATE_DIR"/.[!.]* "$STATE_DIR"/..?*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
     case "$(basename "$entry")" in
       secrets) ;;  # 本脚本此前创建,允许
       *) fail "state 目录含非本方案创建的数据($(basename "$entry"));请先备份并人工确认,本脚本不清空、不接管" ;;

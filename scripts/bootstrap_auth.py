@@ -11,6 +11,7 @@
 
 输出纪律:任何输出不含密钥值,失败只报步骤与退出码。
 """
+import http.client
 import json
 import os
 import subprocess
@@ -36,7 +37,7 @@ ROOT_KEY_ENV = "OPENVIKING_ROOT_API_KEY"
 def _atomic_write_secret(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".user_api_key.")
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(content)
@@ -60,20 +61,25 @@ def _post_json(url, body, root_key, timeout=30):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
             raw = resp.read() or b"null"
     except urllib.error.HTTPError as err:
         try:
-            payload = json.loads(err.read() or b"null")
+            raw = err.read() or b"null"
+        except (http.client.HTTPException, OSError):
+            return err.code, None
+        try:
+            payload = json.loads(raw)
         except ValueError:
             payload = None
         return err.code, payload
-    except (urllib.error.URLError, OSError):
+    except (urllib.error.URLError, http.client.HTTPException, OSError):
         return 0, None
     try:
         payload = json.loads(raw)
     except ValueError:
         payload = None  # 200 但响应体非 JSON:按缺 result 处理,走 RC_NO_USER_KEY
-    return 200, payload
+    return status, payload
 
 
 def _post_accounts(base_url, root_key, timeout=30):
@@ -116,6 +122,12 @@ def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
     except subprocess.TimeoutExpired:
         print(f"错误:ov {' '.join(args[:2])} 超时(>{timeout}s)被终止", file=sys.stderr)
         return subprocess.CompletedProcess(args, returncode=124)
+    except OSError as exc:
+        print(
+            f"错误:ov {' '.join(args[:2])} 无法启动({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return subprocess.CompletedProcess(args, returncode=127)
 
 
 def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env) -> bool:
@@ -130,12 +142,19 @@ def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
-    # 真实 CLI 输出为 {"ok":true,"result":{"healthy":true,...}};兼容顶层形态
+    # 真实 CLI 输出为 {"ok":true,"result":{"healthy":true,...}};兼容顶层形态。
+    # healthy 只是服务健康,必须同时核对认证身份,避免无 key/错 user 假通过。
     result = payload.get("result")
     healthy = payload.get("healthy")
+    identity = payload
     if isinstance(result, dict):
         healthy = result.get("healthy", healthy)
-    return healthy is True
+        identity = result
+    return (
+        healthy is True
+        and identity.get("account_id") == "default"
+        and identity.get("user_id") == "default"
+    )
 
 
 def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
@@ -167,8 +186,11 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             print("错误:user_api_key 存在但为空,需人工恢复/轮换", file=sys.stderr)
             return RC_MANUAL_RECOVERY
         if cli_cfg_exists:
+            if not _ensure_cli_timeout(cli_config_path):
+                print("错误:无法确保 ovcli.conf 的 timeout=300", file=sys.stderr)
+                return RC_CLI_CONFIG
             if _ov_health_ok(ov_bin, cli_config_path, root_key, stored_key, env):
-                print("已初始化:现有认证有效,幂等退出")
+                print("已初始化:现有认证有效且身份为 default/default,幂等退出")
                 return RC_OK
             print(
                 "错误:本地凭据存在但认证无效,需人工恢复/轮换(不重复创建账户)",
@@ -240,28 +262,35 @@ def _ensure_cli_language(ov_bin, env):
 
 
 def _ensure_cli_timeout(cli_config_path, timeout=300):
-    """在生成的 ovcli.conf 顶层补 "timeout"(README 运维结论:图片语义任务
-    实测 64–110s,CLI 默认 60s 会误报 DEADLINE_EXCEEDED;此前每次从零重建
-    都靠手工补写,现已固化到 bootstrap)。已设置时不覆盖,解析失败则跳过。"""
+    """确保 ovcli.conf 顶层有 "timeout";已设置时不覆盖。
+
+    返回是否已确保。配置含凭据,必须用唯一临时文件原子替换;任何读取、
+    解析或写入失败都显式上报,不能让健康检查掩盖缺失的 timeout。
+    """
     try:
         with open(cli_config_path, encoding="utf-8") as fh:
             cfg = json.load(fh)
-    except (OSError, ValueError):
-        return
-    if not isinstance(cfg, dict) or "timeout" in cfg:
-        return
+    except (OSError, ValueError) as exc:
+        print(
+            f"错误:读取/解析 ovcli.conf 失败({type(exc).__name__}),无法确保 timeout",
+            file=sys.stderr,
+        )
+        return False
+    if not isinstance(cfg, dict):
+        print("错误:ovcli.conf 顶层不是对象,无法确保 timeout", file=sys.stderr)
+        return False
+    if "timeout" in cfg:
+        return True
     cfg["timeout"] = timeout
-    tmp = f"{cli_config_path}.tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, cli_config_path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        _atomic_write_secret(Path(cli_config_path), json.dumps(cfg))
+    except OSError as exc:
+        print(
+            f"错误:原子写入 ovcli.conf 失败({type(exc).__name__}),无法确保 timeout",
+            file=sys.stderr,
+        )
+        return False
+    return True
 
 
 def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
@@ -289,14 +318,23 @@ def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
             file=sys.stderr,
         )
         return RC_CLI_CONFIG
-    if os.path.exists(cli_config_path):
+    try:
+        if not os.path.exists(cli_config_path):
+            raise FileNotFoundError("ov config add did not create CLI config")
         os.chmod(cli_config_path, 0o600)
-        _ensure_cli_timeout(cli_config_path)
+    except OSError as exc:
+        print(
+            f"错误:ovcli.conf 缺失或无法收紧权限({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return RC_CLI_CONFIG
+    if not _ensure_cli_timeout(cli_config_path):
+        return RC_CLI_CONFIG
 
     if not _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env):
-        print("错误:ov health 验证未通过(healthy!=true)", file=sys.stderr)
+        print("错误:ov health 验证未通过(healthy/account/user 不符合预期)", file=sys.stderr)
         return RC_AUTH_VERIFY
-    print("认证初始化完成:ovcli.conf(600)写入,ov health healthy=true")
+    print("认证初始化完成:ovcli.conf(600)写入,default/default healthy=true")
     return RC_OK
 
 
