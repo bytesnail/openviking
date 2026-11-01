@@ -264,6 +264,26 @@ def test_user_key_missing_from_response_errors(sandbox, ovserver):
     assert not sandbox.user_key.exists()
 
 
+def test_user_key_write_failure_enters_manual_recovery(
+    sandbox, ovserver, monkeypatch, capsys
+):
+    """user 已创建但 key 落盘失败:不得抛 traceback,须提示轮换后人工恢复。"""
+    def failing_replace(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ba.os, "replace", failing_replace)
+    rc = run_bootstrap(sandbox, ovserver)
+
+    assert rc == ba.RC_MANUAL_RECOVERY
+    assert not sandbox.user_key.exists()
+    assert ovserver.users_calls == 1  # user 已创建,不得重复创建
+    captured = capsys.readouterr()
+    assert "/api/v1/admin/accounts/default/users/default/key" in captured.err
+    assert "Traceback" not in captured.err
+    assert ROOT_KEY not in captured.out + captured.err
+    assert USER_KEY not in captured.out + captured.err
+
+
 def test_invalid_root_key_errors(sandbox, ovserver, capsys):
     rc = run_bootstrap(sandbox, ovserver, root_key="wrong-root-key")
     assert rc != 0
@@ -396,11 +416,16 @@ def test_timeout_write_failure_is_reported_and_idempotent_retry_repairs(
     assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
 
 
-def test_stale_fixed_tmp_symlink_is_not_followed(sandbox, ovserver):
+def test_atomic_write_replaces_symlink_without_following(sandbox):
+    """目标路径是符号链接时,os.replace 应替换链接本身而不写入其指向的文件。"""
     victim = sandbox.tmp / "victim"
     victim.write_text("unchanged")
-    (sandbox.state / "ovcli.conf.tmp").symlink_to(victim)
-    assert run_bootstrap(sandbox, ovserver) == 0
+    target = sandbox.tmp / "secret"
+    target.symlink_to(victim)
+
+    ba._atomic_write_secret(target, "new-secret\n")
+
     assert victim.read_text() == "unchanged"
-    assert not sandbox.cli_cfg.is_symlink()
-    assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
+    assert not target.is_symlink()
+    assert target.read_text() == "new-secret\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600

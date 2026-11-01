@@ -7,7 +7,7 @@
 
 ## 一句话结论
 
-**日常 agent 接入不要求 ADMIN。** 在 API Key 模式下，官方明确接受绑定 account/user 的 **USER 或 ADMIN key** 做普通数据操作和 MCP；ROOT key 用于账户/部署管理，反而不能用于 tenant 数据面或 `/mcp`。因此，已经持有有效普通 USER key 的 `meteor` 保持 `role=user`，**不会阻碍所核查的官方安装器或工具接入**。需要 ROOT/ADMIN 的是初始注册/删除用户、改角色等管理操作；在 **v0.5.2.1** 上，轮换 `meteor` 的 key 也需要 ROOT/ADMIN。
+**日常 agent 接入不要求 ADMIN。** 在 API Key 模式下，官方明确接受绑定 account/user 的 **USER 或 ADMIN key** 做普通数据操作和 MCP；ROOT key 用于账户/部署管理，反而不能用于 tenant 数据面或 `/mcp`。因此，已经持有有效普通 USER key 的 `meteor` 保持 `role=user`，**不会阻碍所核查的官方安装器或工具接入**。需要 ROOT/ADMIN 的是初始注册/删除用户、改角色等管理操作；在 **v0.5.2.1** 上，轮换 `meteor` 的 key 也需要 ROOT/ADMIN。**注意：v0.5.2.1 的 ROOT/ADMIN 还可通过 `GET .../users`（默认 `include_credentials=true`）取得本账户所有 user 的明文 key，并轮换任何 user 的 key（§2.2/§5.2）；因此 ADMIN/ROOT key 在效果上仍是账户内数据的等价高权限凭据，不能当作“只能管理、不能读数据”的低风险身份。**
 
 证据主干：[官方认证指南的两层 key 模型](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L46-L55)、[tenant 数据访问规则](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L158-L167)、[MCP Authentication](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/06-mcp-integration.md#L28-L35)。
 
@@ -16,7 +16,8 @@
 | 材料 | 本次固定版本 | 官方链接 |
 |---|---|---|
 | 最新稳定 release | **v0.5.2.1**，tag commit `f5e6203033a13469c3d9a937f2ca39492ea69c51`，发布于 2026-10-27；与当前部署版本号相同 | [release](https://github.com/volcengine/OpenViking/releases/tag/v0.5.2.1)、[tag commit](https://github.com/volcengine/OpenViking/commit/f5e6203033a13469c3d9a937f2ca39492ea69c51) |
-| 当前官方 main | `de6a440390f169be83e29b62d26b647eadd86a53`（2026-11-01T16:29:23Z） | [main commit](https://github.com/volcengine/OpenViking/commit/de6a440390f169be83e29b62d26b647eadd86a53) |
+| 本次核查 main（2026-11-01T16:29:23Z） | `de6a440390f169be83e29b62d26b647eadd86a53` | [main commit](https://github.com/volcengine/OpenViking/commit/de6a440390f169be83e29b62d26b647eadd86a53) |
+| 2026-11-02 `git ls-remote` 的 main | `4b92b30656c821712e2cf5f053963dedc66206d9` | [main commit](https://github.com/volcengine/OpenViking/commit/4b92b30656c821712e2cf5f053963dedc66206d9) |
 | 线上统一安装器 | `https://openviking.ai/install` 引导下载的 shared installer，`INSTALLER_VERSION="20261101-6b2bcf29b2"`；对应源码 commit `6b2bcf29b2f4169b519dd96015b50adb3dca08f2` | [bootstrap](https://openviking.ai/install)、[shared installer](https://docs.openviking.ai/dl/memory-plugin-shared/install.sh)、[源码 commit](https://github.com/volcengine/OpenViking/commit/6b2bcf29b2f4169b519dd96015b50adb3dca08f2)、[版本标识与源码对应规则](https://github.com/volcengine/OpenViking/blob/6b2bcf29b2f4169b519dd96015b50adb3dca08f2/examples/memory-plugin-shared/install.sh#L93-L106) |
 
 线上 shared installer 与本次 main 的对应文件逐字比较仅有 `INSTALLER_VERSION` 一行不同；下文安装器行号使用其构建 commit `6b2bcf29…`，不是把 v0.5.2.1 的安装器误当成线上当前安装器。
@@ -35,11 +36,13 @@
 
 服务端实现与文档一致：API Key 插件只给 ROOT 放行 `/api/v1/admin`、部分 system/monitoring 等路径；ROOT 请求其他 tenant 路径会报权限错误，并明确提示使用 user/admin key。[`openviking/server/auth/plugins/api_key.py` L17-L35](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/openviking/server/auth/plugins/api_key.py#L17-L35)、[同文件 L203-L217](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/openviking/server/auth/plugins/api_key.py#L203-L217)。
 
-### 2.2 ADMIN 不等于能读取其他 user 的私人数据
+### 2.2 ADMIN 的直接数据请求不等于能读取其他 user 的私人数据
 
 官方 User 指南把“数据 owner”与“管理角色”分开：USER 做个人数据和获授权的共享资源操作；ADMIN 增加账户成员和共享资源管理，但普通数据请求仍使用 ADMIN 自己的 User 身份，不能靠 identity headers 切换到别人。[User → Users and roles](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/getting-started/19-users.md#L64-L75)。
 
 资源 ACL 是另一层授权，不应与账户角色混为一谈：普通数据操作仍受资源 ACL；ADMIN 对账户共享资源有隐式 `manage`，但资源 `manage` 本身并不赋予账户管理员权限。[Authentication L628](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L628-L630)、[MCP resource permissions](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/06-mcp-integration.md#L214-L229)、[ACL supported URIs](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/concepts/15-acl.md#L7-L19)。
+
+**但“直接数据请求不能切身份”不等于 ADMIN 拿不到别人的数据（2026-11-02 源码 + 本机实测补充）**：在 v0.5.2.1 上，`GET /api/v1/admin/accounts/{id}/users` 默认 `include_credentials=true`，ROOT/ADMIN 的响应包含本账户所有 user 的**明文 `api_key`**；ADMIN 还可 `POST /api/v1/admin/accounts/{id}/users/{uid}/key` 轮换任何 user 的 key 并拿到新 key。用该 key 直接以目标 user 身份发请求即可读取其私有数据。当前 main 已改为 ROOT 取明文、ADMIN 只取自己的 key + 他人掩码前缀；该掩码差异**不能**倒推到 v0.5.2.1。因此 ADMIN/ROOT key 在效果上等价于账户内全部 user 数据的访问能力，必须按 crown-jewel 保护。
 
 ## 3. 官方统一安装器是否要求 ADMIN
 
@@ -106,6 +109,8 @@ v0.5.2.1 tag 中同样只有通用 `--api-key` 参数，并同样探测 `/api/v1
 |---|---|---|
 | USER 列出用户 | **不允许**；`GET .../users` 仅 ROOT/ADMIN | 允许 USER 限本账户查询 |
 | USER 轮换自己的 key | **不允许**；`POST .../users/{uid}/key` 仅 ROOT/ADMIN | 允许 USER 以 personal API-key auth 轮换自己的 key |
+| ADMIN 列用户凭据（默认 `include_credentials=true`） | **ROOT/ADMIN 均得本账户所有 user 明文 key**；`new.py` 的 `list_users_page` 不掩码 | ROOT 明文；ADMIN 只取自己的 key + 他人掩码前缀 |
+| ADMIN 轮换他人 key | 允许（ROOT/ADMIN，限本账户），响应含新 key | 相同 |
 | 日常 tenant 数据与 MCP | USER/ADMIN 均可，ROOT 不可 | 相同 |
 
 v0.5.2.1 证据：[Admin API Reference L642-L649](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/docs/en/guides/04-authentication.md#L642-L649)、[`list_users` role guard L1008-L1014](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/openviking/server/routers/admin.py#L1008-L1014)、[`regenerate_key` role guard L1178-L1184](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/openviking/server/routers/admin.py#L1178-L1184)。当前 main 对照见 §5.1。
@@ -115,10 +120,10 @@ v0.5.2.1 证据：[Admin API Reference L642-L649](https://github.com/volcengine/
 ## 6. 对三个必答问题的直接回答
 
 1. **官方 agent 日常接入是否需要 ADMIN？**  
-   **不需要。** API Key 模式下普通 USER key 是官方明确支持的数据面和 MCP 凭据；ADMIN 只增加管理能力。ROOT key 不是日常 agent 数据 key。
+   **不需要。** API Key 模式下普通 USER key 是官方明确支持的数据面和 MCP 凭据；ADMIN 增加管理能力。ROOT key 不是日常 agent 数据 key。**但 v0.5.2.1 的 ADMIN/ROOT 可列用户取得明文 key 并轮换他人 key（§2.2/§5.2），其 key 仍是账户内数据等价的高权限凭据，不能与普通 USER key 同等存放。**
 
 2. **哪些操作才需要 ROOT/ADMIN？**  
-   ROOT 用于 account/workspace 生命周期及部署/系统级管理；ROOT 或本账户 ADMIN 用于注册/删除用户、变更角色、groups、账户配置及轮换他人 key。**在当前部署 v0.5.2.1 上，轮换 `meteor` 自己的 key 也需要 ROOT/ADMIN**；当前 main 已新增 USER 自轮换和限本账户列用户，不能混入旧版权限判断。完整边界见 §5。
+   ROOT 用于 account/workspace 生命周期及部署/系统级管理；ROOT 或本账户 ADMIN 用于注册/删除用户、变更角色、groups、账户配置及轮换他人 key。**在当前部署 v0.5.2.1 上，轮换 `meteor` 自己的 key 也需要 ROOT/ADMIN**；当前 main 已新增 USER 自轮换和限本账户列用户，不能混入旧版权限判断。**v0.5.2.1 的 ROOT/ADMIN 还能列用户并取得本账户所有 user 明文 key（默认 `include_credentials=true`），因此它们是账户内数据的等价高权限凭据，见 §2.2/§5.2。** 完整边界见 §5。
 
 3. **`meteor` 保持 `role=user` 是否会阻碍官方安装器或工具接入？**  
    **不会。** 这是对官方安装器、CLI、MCP 和上述工具文档/源码的结论；前提是已经由管理面开通 `meteor` 并取得有效 USER key，且目标资源 ACL 允许操作。安装器没有 ADMIN 检查，普通数据与 MCP 明确接受 USER。未找到任何所核查第一方资料要求“个人日常 agent 用户必须 ADMIN”。

@@ -14,10 +14,15 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 
 - 一切服务只监听 `127.0.0.1`(API 1933、适配器 18353),无 `ports` 映射、无反向代理。
 - 认证为 `api_key` 模式:root key 管理账户,User key 访问数据;两者分离。
+  **但 v0.5.2.1 的 default user 是 ADMIN,可用 `GET /api/v1/admin/accounts/default/users`
+  (默认 `include_credentials=true`)取得本账户所有 user 的明文 key,并可轮换
+  他人 key;因此 default/root key 在效果上可读取所有 user 数据,必须按最高
+  敏感级保护。**
 - 不启用 VikingBot(无 18790 Gateway)。
-- 真实凭据只在 `secrets.env`(600)、`state/secrets/user_api_key`、
-  `state/ovcli.conf` 与 `state/ovcli.conf.local`(详见下节"认证凭据位置")
-  与容器环境;`ov.conf` 仅保存 `${VAR}` 引用。
+- 真实凭据在 `secrets.env`(600)、`state/secrets/user_api_key`、
+  `state/ovcli.conf` 与 `state/ovcli.conf.local`、容器环境,以及 OpenViking
+  服务端 key 存储 `state/data/viking/default/_system/users.json`(当前 644,
+  外层 `state` 700;详见下节"认证凭据位置");`ov.conf` 仅保存 `${VAR}` 引用。
 
 ## 前提
 
@@ -48,15 +53,20 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 
 - root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入),以及
   bootstrap 生成的 `state/ovcli.conf` 与其手工副本 `state/ovcli.conf.local`。
-- User key:`state/secrets/user_api_key`(600)。
+- User key:`state/secrets/user_api_key`(600),**以及服务端存储
+  `state/data/viking/default/_system/users.json`(当前 644;该文件保存每个
+  user 的明文 key,随 `state/` 进入备份)**。
 - CLI 配置:`state/ovcli.conf` 与 `state/ovcli.conf.local`(两者均 600、内容
   应一致,均含 User key 与 root key);前者由 bootstrap 生成,后者人工维护,
   bootstrap **不写**此文件,轮换/清理任一密钥时须同步处理两份配置。
+  轮换 user key 后 users.json 由 Admin API 更新,但旧备份仍含旧 key。
 - `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
   创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
 
 Studio(`http://127.0.0.1:1933/studio`)登录用 User key:在本地终端自行
-`cat state/secrets/user_api_key` 读取,不要复制进对话或日志。
+`cat state/secrets/user_api_key` 读取,不要复制进对话或日志。**不要在 agent
+会话或工具调用中执行该 `cat`**(会把明文带进 transcript);agent 需要凭据值时
+只能走变量中转或 `read -s` 式无回显输入。
 
 ## 验收
 

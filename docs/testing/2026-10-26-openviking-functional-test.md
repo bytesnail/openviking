@@ -55,12 +55,14 @@
 | 用例 | 结果 |
 |---|---|
 | 无 key / 错 key → tenant API | ✅ 401 |
-| User key(X-API-Key 与 Bearer)→ tenant API | ✅ 200 |
+| default ADMIN key(X-API-Key 与 Bearer)→ tenant API | ✅ 200 |
 | Root key → tenant API | ✅ 403(与源码论断 24 一致:ROOT 不绑租户) |
 | Root key → `/api/v1/admin/accounts` | ✅ 200 |
-| User key → admin API | ✅ 403 |
+| default ADMIN key → admin API | ✅ 403(该端点是 ROOT-only) |
 | 文件权限 | ✅ `state`/`state/secrets` 700,`user_api_key`/`ovcli.conf`(.local)/`secrets.env` 600 |
 | 容器加固 | ✅ 适配器 readonly rootfs + cap_drop ALL + no-new-privileges + uid 65532;主服务 uid 1000 |
+
+> 2026-11-02 复核:该脚本的 `ADMIN_KEY`(原 `USER_KEY`)来自 `state/secrets/user_api_key`,对应用户 `default` 的 **role=admin**(不是 role=user);上表原来写的 "User key" 实为 ADMIN key。它验证的是 ADMIN key 对 ROOT-only 端点的拒绝,不能证明普通 USER 边界。三身份方案创建 `test`(role=user)后应补测 USER 边界。另:`state/data/viking/default/_system/users.json` 保存 user key(当前 644,外层 `state` 700),是本文凭据清单未列的服务端副本,随 `state/` 进入备份。
 
 ### 2.6 端到端资源生命周期
 

@@ -150,15 +150,36 @@ PY
 # 与实际加载模型漂移时,smoke/doctor 等功能性检查全部无感——2026-11-01 reranker
 # 换型即靠人工发现。此处对 18351/18352 各取 /v1/models,按大小写不敏感子串比对
 # (服务端报告的是 gguf 路径,含配置名即视为匹配)。端口可达性已由上文检查。
-python3 - "$CONFIG_FILE" <<'PY'
-import json, os, sys, urllib.request
+python3 - "$CONFIG_FILE" "$SECRETS_FILE" <<'PY'
+import json, os, re, sys, urllib.request
+
+def parse_env_value(value):
+    value = value.strip()
+    quoted = (
+        re.fullmatch(r'("(?:[^"\\]|\\.)*")\s*(?:#.*)?', value)
+        or re.fullmatch(r"('[^']*')\s*(?:#.*)?", value)
+    )
+    if quoted:
+        return quoted.group(1)[1:-1]
+    # Compose:非引号值的空白 + # 开始行内注释,VALUE#literal 不算。
+    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+
+env = {}
+for line in open(sys.argv[2], encoding="utf-8"):
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, _, value = line.partition("=")
+    env[key.strip()] = parse_env_value(value)
+os.environ.update(env)
 
 try:
-    # 与上文校验 heredoc 同语义:先 expandvars 再解析,避免 ${VAR} 字面值
-    # 被当成模型名参与漂移比对
-    cfg = json.loads(os.path.expandvars(open(sys.argv[1], encoding="utf-8-sig").read()))
-except ValueError:
-    sys.exit(0)  # JSON 合法性已由上文校验并另行失败,此处不重复报错
+    # 与上文校验 heredoc 同语义:先加载 secrets.env 再 expandvars,避免
+    # ${VAR} 字面值被当成模型名参与漂移比对
+    raw = open(sys.argv[1], encoding="utf-8-sig").read()
+    cfg = json.loads(os.path.expandvars(raw))
+except (OSError, ValueError):
+    sys.exit(0)  # 文件/JSON 合法性已由上文校验并另行失败,此处不重复报错
 checks = [
     ("embedding", "18351", cfg.get("embedding", {}).get("dense", {}).get("model", "")),
     ("rerank", "18352", cfg.get("rerank", {}).get("model", "")),
@@ -208,5 +229,5 @@ fi
 
 echo "prepare 完成:"
 echo "  - secrets.env:${root_key_status};权限 600"
-echo "  - state/state/secrets/backups:700,属主 ${EXPECTED_UID_GID};状态标记 ${marker_status}"
+echo "  - 目录 state/、state/secrets/、backups/:700,属主 ${EXPECTED_UID_GID};状态标记 ${marker_status}"
 echo "  - 端口:1933/18353 空闲;18351/18352 由 model-serving 提供"

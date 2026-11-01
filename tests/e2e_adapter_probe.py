@@ -84,6 +84,8 @@ def single_vector(body):
         for x in vector
     ):
         return None
+    if not any(x != 0 for x in vector):
+        return None  # 零向量无法归一化,余弦相似度未定义,视为无效响应
     return vector
 
 

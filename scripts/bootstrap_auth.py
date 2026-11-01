@@ -238,7 +238,18 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
         print("错误:响应缺少 result.user_key,拒绝继续", file=sys.stderr)
         return RC_NO_USER_KEY
 
-    _atomic_write_secret(Path(user_key_path), user_key)
+    try:
+        _atomic_write_secret(Path(user_key_path), user_key)
+    except OSError as exc:
+        # user 已创建且 key 已从响应取得,此时丢失 key 不得重跑创建流程
+        # (会走到 409/人工恢复),必须提示用 Admin API 轮换取新 key。
+        print(
+            f"错误:user key 落盘失败({type(exc).__name__});default 账户/user 已创建,"
+            "禁止重复创建;请用 root key 调 POST "
+            "/api/v1/admin/accounts/default/users/default/key 轮换后人工恢复",
+            file=sys.stderr,
+        )
+        return RC_MANUAL_RECOVERY
     print(f"已写入 user_api_key:{user_key_path}(权限 600)")
 
     return _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env)
