@@ -1,7 +1,7 @@
 name: openviking
 
 x-openviking-image: &openviking-image
-  ghcr.io/volcengine/openviking:v0.5.2@sha256:d1cc56a356b4d4e81019b3612d7dba01484ef2391055817d9c48c77adead4dcd
+  ghcr.io/volcengine/openviking:v0.5.2.1@sha256:7c26f9777c7632fd4b771be77471634bffb6ec8d6338b39f53deb2da1b1d34b3
 
 services:
   embedding-adapter:

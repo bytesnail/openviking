@@ -1,6 +1,7 @@
-# OpenViking v0.5.2 本机 Docker Compose 部署
+# OpenViking v0.5.2.1 本机 Docker Compose 部署
 
-本机单用户部署:OpenViking v0.5.2(镜像 tag+digest 固定)复用
+本机单用户部署:OpenViking v0.5.2.1(镜像 tag+digest 固定;2026-11-01 自
+v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 `/mnt/usr/tools/model-serving` 的 `embeddinggemma-2`(127.0.0.1:18351)与
 `qwen3-reranker-0.6b`(127.0.0.1:18352,纯文本;2026-10-29 起接替多模态
 `qwen3-vl-reranker-2b`;客户端仅发送文本,换型影响与验证见
@@ -23,7 +24,7 @@
 - 当前用户 UID/GID 为 `1000:1000`(与 `compose.yaml` 的 `user` 一致;其他用户部署须先显式改 Compose 与 `scripts/prepare.sh` 中的常量)。
 - 端口 1933、18353 空闲。
 - Docker Engine ≥ 支持 compose `--wait`、镜像
-  `ghcr.io/volcengine/openviking:v0.5.2@sha256:d1cc56a356b4d4e81019b3612d7dba01484ef2391055817d9c48c77adead4dcd`。
+  `ghcr.io/volcengine/openviking:v0.5.2.1@sha256:7c26f9777c7632fd4b771be77471634bffb6ec8d6338b39f53deb2da1b1d34b3`(index digest,amd64;镜像 label revision 与 tag commit `f5e6203033a1` 互证)。
 
 ## 部署(首次)
 
@@ -86,13 +87,15 @@ docker compose exec -T openviking ov ls viking://resources
   分钟;线性),1M 即约 195 万 tokens/3.3 小时;批量或超大文本用
   `--processing-mode vectors_only`(实测 20M 字符 21 分钟、零 GLM、深层
   检索正常),仅重点文档用默认语义模式(详见测试报告 §8.8)。
-- 图片资源语义任务实测 64–66s,曾超过 CLI 60s 默认超时导致 `--wait` 报
-  DEADLINE_EXCEEDED(服务端任务仍会完成)。2026-10-26 已在
+- 图片资源语义任务实测 64–110s,曾超过 CLI 60s 默认超时导致 `--wait` 报
+  DEADLINE_EXCEEDED(服务端任务仍会完成)。已在
   `state/ovcli.conf` 与 `state/ovcli.conf.local` 顶层写入 `"timeout": 300`
-  (无 CLI 旗标,`ov config edit` 不含该项;`ov config show` 确认实际生效,
-  图片 `--wait` 实测通过)。若未来任务更慢仍超时,可继续调高该值,或退回
-  不带 `--wait` 提交 + 轮询 `ov task list`。同目录变更任务在途时,紧随的
-  变更可能报 `[CONFLICT] lock acquire timed out`,排空后重试即可。
+  (无 CLI 旗标,`ov config edit` 不含该项;`ov config show` 确认实际生效)。
+  注意:两文件由 bootstrap 生成,**不含** timeout,从零重建 state 后须按
+  本条重新写入(2026-10-26 与 2026-11-01 重建均如此操作)。若未来任务更慢
+  仍超时,可继续调高该值,或退回不带 `--wait` 提交 + 轮询 `ov task list`。
+  同目录变更任务在途时,紧随的变更可能报 `[CONFLICT] lock acquire timed out`,
+  排空后重试即可。
 
 冒烟资源保留供检查;确认 URI 后可单独删除,不做自动递归清理
 (2026-10-26 功能测试后已按此删除并验证,可用上述命令重建)。
