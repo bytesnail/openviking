@@ -60,7 +60,7 @@ def _post_json(url, body, root_key, timeout=30):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read() or b"null")
+            raw = resp.read() or b"null"
     except urllib.error.HTTPError as err:
         try:
             payload = json.loads(err.read() or b"null")
@@ -69,6 +69,11 @@ def _post_json(url, body, root_key, timeout=30):
         return err.code, payload
     except (urllib.error.URLError, OSError):
         return 0, None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None  # 200 但响应体非 JSON:按缺 result 处理,走 RC_NO_USER_KEY
+    return 200, payload
 
 
 def _post_accounts(base_url, root_key, timeout=30):
@@ -91,19 +96,26 @@ def _register_default_user(base_url, root_key, timeout=30):
 
 
 def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
-    """以密钥经子进程环境的方式调用 ov CLI;返回 CompletedProcess。"""
+    """以密钥经子进程环境的方式调用 ov CLI;返回 CompletedProcess。
+
+    超时不抛异常:折叠为 returncode=124,保持"失败只报步骤与退出码"的契约。
+    """
     child_env = dict(env)
     child_env[ROOT_KEY_ENV] = root_key
     child_env["OPENVIKING_CLI_CONFIG_FILE"] = cli_config_path
     if user_key is not None:
         child_env[USER_KEY_ENV] = user_key
-    return subprocess.run(
-        [ov_bin, *args],
-        env=child_env,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            [ov_bin, *args],
+            env=child_env,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"错误:ov {' '.join(args[:2])} 超时(>{timeout}s)被终止", file=sys.stderr)
+        return subprocess.CompletedProcess(args, returncode=124)
 
 
 def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env) -> bool:
@@ -142,7 +154,18 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
 
     # ---- 幂等/恢复路径:本地已有 user key,不创建账户 ----
     if user_key_file:
-        stored_key = open(user_key_path, encoding="utf-8").read().strip()
+        try:
+            with open(user_key_path, encoding="utf-8") as fh:
+                stored_key = fh.read().strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(
+                f"错误:读取 user_api_key 失败({type(exc).__name__}),需人工恢复/轮换",
+                file=sys.stderr,
+            )
+            return RC_MANUAL_RECOVERY
+        if not stored_key:
+            print("错误:user_api_key 存在但为空,需人工恢复/轮换", file=sys.stderr)
+            return RC_MANUAL_RECOVERY
         if cli_cfg_exists:
             if _ov_health_ok(ov_bin, cli_config_path, root_key, stored_key, env):
                 print("已初始化:现有认证有效,幂等退出")
@@ -158,7 +181,7 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             ov_bin, base_url, cli_config_path, root_key, stored_key, env
         )
 
-    if cli_cfg_exists and not user_key_file:
+    if cli_cfg_exists:  # 走到这里 user_key_file 必为 False(上方分支均已返回)
         print(
             "错误:ovcli.conf 存在但 user_api_key 缺失,进入人工恢复流程",
             file=sys.stderr,
@@ -200,17 +223,45 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
 
 
 def _ensure_cli_language(ov_bin, env):
-    """真实 CLI 首跑要求显示语言;尽力设置,失败不阻断(已有设置时幂等)。"""
+    """真实 CLI 首跑要求显示语言;尽力设置,失败不阻断(已有设置时幂等)。
+
+    env 由调用方保证已含 OPENVIKING_CLI_CONFIG_FILE。
+    """
     try:
         subprocess.run(
             [ov_bin, "language", "zh-CN"],
-            env={**env, "OPENVIKING_CLI_CONFIG_FILE": env.get("OPENVIKING_CLI_CONFIG_FILE", "")},
+            env=env,
             capture_output=True,
             timeout=30,
             check=False,
         )
     except Exception:
         pass
+
+
+def _ensure_cli_timeout(cli_config_path, timeout=300):
+    """在生成的 ovcli.conf 顶层补 "timeout"(README 运维结论:图片语义任务
+    实测 64–110s,CLI 默认 60s 会误报 DEADLINE_EXCEEDED;此前每次从零重建
+    都靠手工补写,现已固化到 bootstrap)。已设置时不覆盖,解析失败则跳过。"""
+    try:
+        with open(cli_config_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(cfg, dict) or "timeout" in cfg:
+        return
+    cfg["timeout"] = timeout
+    tmp = f"{cli_config_path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, cli_config_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
@@ -240,6 +291,7 @@ def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
         return RC_CLI_CONFIG
     if os.path.exists(cli_config_path):
         os.chmod(cli_config_path, 0o600)
+        _ensure_cli_timeout(cli_config_path)
 
     if not _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env):
         print("错误:ov health 验证未通过(healthy!=true)", file=sys.stderr)

@@ -8,10 +8,7 @@ server;ov CLI 用可执行 stub 替身(真实 CLI 在部署验收时联调)。
 import json
 import os
 import stat
-import subprocess
 import threading
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -225,6 +222,9 @@ def test_first_init_via_user_registration(sandbox, ovserver, capsys):
     # CLI 首跑需要语言设置,bootstrap 必须先行设置
     settings = sandbox.cli_cfg.parent / "ovcli.settings.conf"
     assert settings.exists() and "zh-CN" in settings.read_text()
+    # bootstrap 须固化 CLI timeout(README 运维结论,重建后免手工补写)
+    cli_conf = json.loads(sandbox.cli_cfg.read_text())
+    assert cli_conf.get("timeout") == 300
     assert_no_key_material(capsys)
 
 

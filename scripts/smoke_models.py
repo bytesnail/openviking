@@ -56,9 +56,13 @@ def smoke_vlm_image(vlm, failures):
 
 
 def smoke_rerank(rerank_cfg, failures):
-    from openviking.models.rerank.openai_rerank import OpenAIRerankClient
-
-    client = OpenAIRerankClient.from_config(rerank_cfg)
+    try:
+        from openviking.models.rerank.openai_rerank import OpenAIRerankClient
+        client = OpenAIRerankClient.from_config(rerank_cfg)
+    except Exception as exc:
+        print(f"[rerank]     FAIL error={type(exc).__name__}")
+        failures.append("rerank")
+        return
     if client is None:
         print("[rerank]     FAIL error=client_unavailable")
         failures.append("rerank")
@@ -85,9 +89,13 @@ def smoke_rerank(rerank_cfg, failures):
 
 
 def main():
-    from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
-
-    cfg = OpenVikingConfig.from_dict(load_config())
+    # 输出纪律:配置加载/解析失败同样只报异常类型,不吐原始 traceback
+    try:
+        from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+        cfg = OpenVikingConfig.from_dict(load_config())
+    except Exception as exc:
+        print(f"smoke_models: FAIL(config error={type(exc).__name__})")
+        return 1
     failures = []
     print("smoke_models: 开始(会发起 2 次 GLM 真实调用与 1 次 rerank 真实请求)")
     smoke_vlm_text(cfg.vlm, failures)

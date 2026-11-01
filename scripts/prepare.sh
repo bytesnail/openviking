@@ -137,10 +137,12 @@ PY
 # 换型即靠人工发现。此处对 18351/18352 各取 /v1/models,按大小写不敏感子串比对
 # (服务端报告的是 gguf 路径,含配置名即视为匹配)。端口可达性已由上文检查。
 python3 - "$CONFIG_FILE" <<'PY'
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 
 try:
-    cfg = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+    # 与上文校验 heredoc 同语义:先 expandvars 再解析,避免 ${VAR} 字面值
+    # 被当成模型名参与漂移比对
+    cfg = json.loads(os.path.expandvars(open(sys.argv[1], encoding="utf-8-sig").read()))
 except ValueError:
     sys.exit(0)  # JSON 合法性已由上文校验并另行失败,此处不重复报错
 checks = [
@@ -178,17 +180,13 @@ ensure_dir_700 "$BACKUP_DIR"
 if [ -e "$MARKER" ]; then
   marker_status="已存在(继续接管本方案状态)"
 else
-  unknown=0
   for entry in "$STATE_DIR"/* "$STATE_DIR"/.[!.]*; do
     [ -e "$entry" ] || continue
     case "$(basename "$entry")" in
       secrets) ;;  # 本脚本此前创建,允许
-      *) unknown=1 ;;
+      *) fail "state 目录含非本方案创建的数据($(basename "$entry"));请先备份并人工确认,本脚本不清空、不接管" ;;
     esac
   done
-  if [ "$unknown" -ne 0 ]; then
-    fail "state 目录含非本方案创建的数据;请先备份并人工确认,本脚本不清空、不接管"
-  fi
   printf 'openviking-compose-v1\ncreated=%s\n' "$(date -Is)" > "$MARKER"
   chmod 600 "$MARKER"
   marker_status="已创建"
