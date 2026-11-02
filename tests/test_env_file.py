@@ -136,3 +136,39 @@ def test_validate_config_rejects_key_mismatch_and_leftover_vars(tmp_path):
             {"Z_AI_API_KEY": "goodkey123", "OPENVIKING_ROOT_API_KEY": "rootkey1234567890"},
             cfg_path,
         )
+
+
+def test_validate_ignores_host_only_and_stale_environment(tmp_path, monkeypatch):
+    import os
+
+    env = {"Z_AI_API_KEY": "goodkey123", "OPENVIKING_ROOT_API_KEY": "rootkey1234567890"}
+    monkeypatch.setenv("UNKNOWN_VAR", "host-only")
+    monkeypatch.setenv("Z_AI_API_KEY", "stale-host-value")
+    monkeypatch.delenv("OPENVIKING_ROOT_API_KEY", raising=False)
+    cfg_path = write(
+        tmp_path, json.dumps(_config("${UNKNOWN_VAR}", "${OPENVIKING_ROOT_API_KEY}")),
+        name="ov.conf",
+    )
+    with pytest.raises(ef.EnvFileError):
+        ef.validate_config(env, cfg_path)
+
+    cfg_path = write(
+        tmp_path,
+        json.dumps(_config("${Z_AI_API_KEY}", "${OPENVIKING_ROOT_API_KEY}")),
+        name="ov.conf",
+    )
+    assert ef.validate_config(env, cfg_path)["vlm"]["api_key"] == "goodkey123"
+    assert os.environ["Z_AI_API_KEY"] == "stale-host-value"
+    assert "OPENVIKING_ROOT_API_KEY" not in os.environ
+
+
+def test_validate_missing_keys_is_controlled_error(tmp_path):
+    cfg_path = write(tmp_path, json.dumps(_config("zai", "root")), name="ov.conf")
+    with pytest.raises(ef.EnvFileError):
+        ef.validate_config({}, cfg_path)
+
+
+def test_loaded_model_ids_requires_exact_membership():
+    ids = ef.loaded_model_ids({"data": [{"id": "EmbeddingGemma-2-old"}]})
+    assert "embeddinggemma-2-old" in ids
+    assert "embeddinggemma-2" not in ids

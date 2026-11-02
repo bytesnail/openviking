@@ -136,10 +136,10 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/smoke_mod
 端到端最小闭环(消耗 GLM,按需执行;注意 F1/F3):
 
 ```bash
-docker compose exec -T openviking ov add-resource /opt/openviking/fixtures/smoke.md --to viking://resources/<唯一名> --wait
+docker compose exec -T openviking ov add-resource /opt/openviking/fixtures/smoke.md --to viking://resources/deployment-smoke-doc --wait
 docker compose exec -T openviking ov find "紫鸢尾-7 号信标的校准码"
 docker compose exec -T openviking ov find --image /opt/openviking/fixtures/red.png
-docker compose exec -T openviking ov rm viking://resources/<唯一名> --recursive --wait
+docker compose exec -T openviking ov rm viking://resources/deployment-smoke-doc --recursive --wait
 ```
 
 图片资源可直接 `--wait`(CLI timeout 已调至 300s,见 F1);若任务时长
@@ -251,7 +251,9 @@ tokens / 3.3 小时,10M/20M(1950 万/3900 万 tokens)完全不可行** → 大�
 | 10M | 9.96M / 26.4MB | 634s | 5120 | find top1=真末章(第13779章,0.927);grep ✅ |
 | 20M | 19.9M / 52.5MB | 1268s | 10270 | find top1=真末章(第27370章,0.925);grep ✅ |
 
-- 线性度:~63s/MB、~510 embeds/MB,20M 无衰减、无错误、无重排队。
+- 线性度(按 20M 实测 52.5MB 归一化):~24.2s/MB、~196 embeds/MB;
+  若按百万字符归一化则约为 ~63s/M字符、~510 embeds/M字符;20M 无衰减、
+  无错误、无重排队。
 - **2000 万字符深处的事实是全库语义检索第一名**;三篇同模板文档的末章
   按所属文档规模正确排序(20m 0.925 > 1m 0.924 > 10m 0.919,差距小但
   方向正确——模板语汇同源所致)。
@@ -261,7 +263,7 @@ tokens / 3.3 小时,10M/20M(1950 万/3900 万 tokens)完全不可行** → 大�
 
 **新增运维注意(O3/O4)**:
 
-- **O3**:语义模式成本 ≈ 2 万 LLM tokens/千字符;批量/超大文本用
+- **O3**:语义模式成本 ≈ 0.195 万(约 1950)LLM tokens/千字符;批量/超大文本用
   `vectors_only`,仅对需要摘要的重点文档用默认语义模式。
 - **O4**:摄入后 `state/data/temp/upload/` 暂存副本不自动清理(本例
   13MB/5 文件,与夹具字节级吻合,任务完成后确认可手动清除);vectordb
@@ -277,7 +279,9 @@ tokens / 3.3 小时,10M/20M(1950 万/3900 万 tokens)完全不可行** → 大�
 
 方法:同一生成器同种子重造 50K 夹具(49885 字符,与 §8.8 基准同源),
 改 `config/ov.conf` → 重启 → 全语义摄入 → 回滚 → 重启 → 重跑验收;
-实验后配置与仓库逐字节一致(值回 2)。
+实验后配置与仓库逐字节一致(值回 2)。注:此处记录的是当时旧生成器的
+历史尺寸;2026-11-02 生成器修正了 2%/50%/98% 标记位置并改为流式写入,
+后续重建尺寸可能略有变化,不得把新输出当作该次 token 基准的逐字节复现。
 
 | vlm.max_concurrent | 总耗时 | LLM tokens | nodes | 错误/重排队 |
 |---|---|---|---|---|

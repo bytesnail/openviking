@@ -113,7 +113,7 @@ class FakeOvServer:
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
 
     @property
     def url(self):
@@ -292,7 +292,9 @@ def test_saved_profile_gets_timeout(sandbox, ovserver):
     """ov config add --name local 的 saved profile 也要补 timeout。"""
     assert run_bootstrap(sandbox, ovserver) == 0
     saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
-    saved.write_text(json.dumps({"api_key": USER_KEY}))
+    saved.write_text(json.dumps({
+        "api_key": USER_KEY, "root_api_key": ROOT_KEY, "url": ovserver.url,
+    }))
     assert run_bootstrap(sandbox, ovserver) == 0
     assert json.loads(saved.read_text())["timeout"] == 300
 
@@ -323,14 +325,33 @@ def test_timeout_below_minimum_is_raised_and_mode_tightened(sandbox, ovserver):
     assert stat.S_IMODE(sandbox.cli_cfg.stat().st_mode) == 0o600
 
 
-def test_recovery_uses_force_for_saved_profile(sandbox, ovserver, monkeypatch):
-    """active 配置缺失而 saved profile 可能 stale 时,恢复路径须允许 --force。"""
+def test_matching_saved_profile_restores_interrupted_active(sandbox, ovserver):
+    """config add 中断留下坏 active 时,可由完全匹配的 saved 原子恢复。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    saved_cfg = json.loads(sandbox.cli_cfg.read_text())
+    saved.write_text(json.dumps(saved_cfg))
+    sandbox.cli_cfg.write_text('{"partial":')
+    assert run_bootstrap(sandbox, ovserver) == 0
+    restored = json.loads(sandbox.cli_cfg.read_text())
+    assert restored["api_key"] == USER_KEY
+    assert restored["url"] == ovserver.url
+
+
+def test_recovery_does_not_force_overwrite_saved_profile(sandbox, ovserver, monkeypatch):
+    """active 缺失时不得用 --force 覆盖可能更新的 saved profile。"""
     args_file = sandbox.tmp / "config-add-args"
     monkeypatch.setenv("OV_STUB_ARGS_FILE", str(args_file))
     assert run_bootstrap(sandbox, ovserver) == 0
-    sandbox.cli_cfg.unlink()  # active 配置丢失,saved profile/用户 key 仍在
-    assert run_bootstrap(sandbox, ovserver) == 0
-    assert "--force" in args_file.read_text()
+    saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    saved.write_text(json.dumps({
+        "api_key": "newer-rotated-key", "root_api_key": ROOT_KEY, "url": ovserver.url,
+    }))
+    sandbox.cli_cfg.unlink()
+    before = saved.read_bytes()
+    assert run_bootstrap(sandbox, ovserver) != 0
+    assert saved.read_bytes() == before
+    assert "--force" not in args_file.read_text()
 
 
 def test_account_and_user_exist_but_key_missing_errors(sandbox, ovserver, capsys):
@@ -442,7 +463,7 @@ def test_truncated_admin_response_is_controlled_failure(monkeypatch):
             raise http.client.IncompleteRead(b"{}")
 
     monkeypatch.setattr(
-        ba.urllib.request, "urlopen", lambda *args, **kwargs: TruncatedResponse()
+        ba, "_direct_urlopen", lambda *args, **kwargs: TruncatedResponse()
     )
     assert ba._post_json("http://127.0.0.1:1", {}, ROOT_KEY) == (0, None)
 
@@ -478,6 +499,9 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
     # ROOT key 也返回 default/default;role=root 必须判失败。
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="root"))
     assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    # 本部署 default 是运维 ADMIN;意外降级为 USER 不能视为初始化成功。
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="user"))
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(user_id="test"))
     assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
     # CLI 配置里的 api_key 必须与本地 stored user key 一致。
@@ -497,6 +521,36 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
         ),
     )
     assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+
+
+def test_health_rejects_url_and_saved_profile_drift(monkeypatch, sandbox):
+    healthy = subprocess.CompletedProcess(
+        ["ov", "health"], 0,
+        stdout=json.dumps({
+            "ok": True,
+            "result": {
+                "healthy": True, "account_id": "default",
+                "user_id": "default", "role": "admin",
+            },
+        }).encode(),
+    )
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: healthy)
+    expected = "http://127.0.0.1:21933"
+    good = {"api_key": USER_KEY, "root_api_key": ROOT_KEY, "url": expected}
+    sandbox.cli_cfg.write_text(json.dumps(good))
+    assert ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
+    )
+    sandbox.cli_cfg.write_text(json.dumps({**good, "url": "http://127.0.0.1:1933"}))
+    assert not ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
+    )
+    sandbox.cli_cfg.write_text(json.dumps(good))
+    saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    saved.write_text(json.dumps({**good, "api_key": "stale-key"}))
+    assert not ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
+    )
 
 
 def test_health_rejects_root_only_config(monkeypatch, sandbox):
@@ -533,6 +587,12 @@ def test_timeout_write_failure_is_reported_and_idempotent_retry_repairs(
 
     monkeypatch.setattr(ba.os, "replace", real_replace)
     assert run_bootstrap(sandbox, ovserver) == 0
+    assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
+
+
+def test_non_finite_timeout_is_repaired(sandbox):
+    sandbox.cli_cfg.write_text('{"timeout": Infinity}')
+    assert ba._ensure_timeout_file(str(sandbox.cli_cfg))
     assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
 
 

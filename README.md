@@ -8,7 +8,7 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 `docs/testing/2026-11-01-reranker-model-adaptation.md`),VLM 走 Z.AI GLM Coding Plan
 `glm-5.3-flash`,多模态 embedding 经 loopback 适配器(127.0.0.1:18353)。
 
-设计文档(决策依据、参数理由、失败处理):`docs/superpowers/specs/2026-10-25-openviking-compose-design.md`。
+历史设计档案(决策依据、原始参数理由与失败处理；其中镜像、reranker 等示例已被后续实施取代，当前操作值只以本 README、`compose.yaml` 与 `config/ov.conf` 为准):`docs/superpowers/specs/2026-10-25-openviking-compose-design.md`。
 
 ## 边界
 
@@ -52,7 +52,8 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 ### 认证凭据位置(敏感,勿粘贴到任何对话/issue)
 
 - root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入),以及
-  bootstrap 生成的 `state/ovcli.conf` 与其手工副本 `state/ovcli.conf.local`。
+  bootstrap 生成的 active 配置 `state/ovcli.conf` 与 CLI saved profile
+  `state/ovcli.conf.local`。
 - User key:`state/secrets/user_api_key`(600),**以及服务端存储
   `state/data/viking/default/_system/users.json`(当前 644;该文件保存每个
   user 的明文 key,随 `state/` 进入备份)**。
@@ -61,11 +62,13 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
   bootstrap 通过该命令间接写入)。saved profile 路径固定为同目录
   `ovcli.conf.<name>`,与 active 配置文件名无关;创建 test 配置时不要用
   `--name local`(会覆盖 default 的 saved profile),应使用独立 name。两者均
-  600、内容应一致,均含 User key 与
-  root key;轮换/清理任一密钥时须同步处理两份配置。bootstrap 会同时为 active
-  配置与 saved profile 补 `"timeout": 300`(已有则不覆盖);若 active 配置丢失
-  而 user key 仍在,重跑 bootstrap 会用 `--force` 重建 active 与 saved profile。
-  轮换 user key 后 users.json 由 Admin API 更新,但旧备份仍含旧 key。
+  600,URL 与 User/root key 必须一致,timeout 均须为有限且 `>=300` 的数值;
+  轮换/清理任一密钥时须同步处理两份配置。bootstrap 会同时为 active
+  配置与 saved profile 补 `"timeout": 300`(已有则不覆盖),并核对两者的 URL、
+  User/root key 与目标部署一致;active 丢失或中断写坏时,只在 saved profile
+  与目标 URL/key 完全一致时原子恢复 active,不自动 `--force` 覆盖 saved。
+  不一致时进入人工恢复并保留现场。轮换 user key 后 users.json 由 Admin API
+  更新,但旧备份仍含旧 key。
 - `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
   创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
 
@@ -90,15 +93,18 @@ curl -fsS http://127.0.0.1:1933/ready
 - `doctor` 须全项通过(embedding 探针为真实请求,返回 768 维)。
 - `smoke_models.py` 发起 2 次 GLM 真实调用与 1 次 rerank 真实请求,消耗少量
   Coding Plan 用量;`ov health -o json` 须含 `"healthy": true`,且
-  `result.account_id/user_id` 均为 `default`、`result.role` 为 `admin` 或
-  `user`(**`role=root` 必须判失败**:root-only 配置也会返回
-  default/default/healthy,不能作为数据面验收)。
+  `result.account_id/user_id` 均为 `default`、`result.role` 必须为 `admin`
+  (**`role=root` 或降级后的 `role=user` 均判失败**:root-only 配置也会返回
+  default/default/healthy,而 USER default 无法执行所需运维管理)。
 - 扩展功能面(2026-10-26 两轮全量通过):`python3 tests/e2e_adapter_probe.py`
   (适配器实况 8 项,含配置模型名与 /v1/models 加载列表比对)与
   `bash tests/e2e_auth_matrix.sh`(基础认证边界 9 项;
   `state/secrets/test_user_api_key` 存在时自动追加 4 项 USER 边界,否则
-  SKIP)不消耗 GLM,可随时重跑;该矩阵默认覆盖 ROOT/ADMIN,普通 USER 边界需先
-  按方案 §5.1 创建 test 并重跑。完整矩阵、发现(F1–F4)与复测方法见
+  SKIP;完整 USER 验收用 `REQUIRE_USER=1 bash tests/e2e_auth_matrix.sh`,使缺失
+  USER 行直接失败)不消耗 GLM,可随时重跑;矩阵只覆盖状态边界,不替代方案
+  §6.3 的私有读写隔离检查。普通 USER 边界需先按方案 §6.1 创建 test 并重跑。
+  矩阵的 `BASE` 仅允许 loopback HTTP URL,防止把 ROOT/ADMIN key 发往远端;
+  curl 以 `-q` 禁用用户 curlrc。完整矩阵、发现(F1–F4)与复测方法见
   `docs/testing/2026-10-26-openviking-functional-test.md`。
 - 端到端(§9.4):
 
@@ -116,17 +122,17 @@ docker compose exec -T openviking ov ls viking://resources
 - 大图(>4096px 任一边或 >10MB)摄入走切片管线:落库的是低清预览 +
   网格图 + tiles,**原图按设计不保存、不可 `ov get` 取回**;此类任务
   约 3 分钟,建议异步提交后轮询 `ov task list`(详见测试报告 §8.7)。
-- 长文本语义成本 ≈ 2 万 LLM tokens/千字符(50K 实测 9.7 万 tokens/10
+- 长文本语义成本 ≈ 0.195 万(约 1950)LLM tokens/千字符(50K 实测 9.7 万 tokens/10
   分钟;线性),1M 即约 195 万 tokens/3.3 小时;批量或超大文本用
   `--processing-mode vectors_only`(实测 20M 字符 21 分钟、零 GLM、深层
   检索正常),仅重点文档用默认语义模式(详见测试报告 §8.8)。
 - 图片资源语义任务实测 64–110s,曾超过 CLI 60s 默认超时导致 `--wait` 报
   DEADLINE_EXCEEDED(服务端任务仍会完成)。CLI 顶层 `"timeout": 300`
   (无旗标,`ov config edit` 不含该项;`ov config show` 确认实际生效)
-  现由 `bootstrap_auth.py` 生成 `ovcli.conf` 时自动写入(已设置时不覆盖);
-  2026-10-26 与 2026-11-01 两次重建靠手工补写的历史不再需要。手工副本
-  `ovcli.conf.local` 仍须自行补写/同步。若未来任务更慢仍超时,可继续调高
-  该值,或退回不带 `--wait` 提交 + 轮询 `ov task list`。
+  现由 `bootstrap_auth.py` 生成与修复 `ovcli.conf` 时自动写入(已设置有限且
+  `>=300` 的值不覆盖);active 与 saved profile 均由 bootstrap 同步处理,无需手工
+  补写副本。若未来任务更慢仍超时,可继续调高该值,或退回不带 `--wait`
+  提交 + 轮询 `ov task list`。
   同目录变更任务在途时,紧随的变更可能报 `[CONFLICT] lock acquire timed out`,
   排空后重试即可。
 
@@ -142,8 +148,10 @@ docker compose down               # 停止(保留宿主 state,不清数据)
 docker compose up -d --wait --wait-timeout 180   # 再次启动
 ```
 
-- 配置变更:编辑宿主 `config/ov.conf` → `docker compose restart openviking`
-  → 重跑 doctor 与 smoke;不支持热加载。
+- 配置变更:编辑宿主 `config/ov.conf` → `docker compose restart openviking`;
+  不支持热加载。例行验证按变更面选择:storage/auth/server 等非模型项先跑
+  doctor/health 与相关认证检查;仅修改某模型段时跑对应探针;升级、回滚、
+  跨组件变更与完整验收仍须重跑 doctor + 全量 smoke,避免无关编辑反复消耗 GLM。
 - 查看日志:`docker compose logs --tail 50 openviking`。排查前先确认输出不
   含密钥;自定义脚本(适配器/bootstrap/smoke)已按"零密钥输出"编写。
 - 不运行容器内 `env`/`printenv`,不输出完整 `docker inspect`。
@@ -153,14 +161,20 @@ docker compose up -d --wait --wait-timeout 180   # 再次启动
 ```bash
 docker compose stop
 TS=$(date +%Y%m%d-%H%M%S)
-tar -czf "backups/openviking-${TS}.tar.gz" state config scripts compose.yaml secrets.env
+tar -czf "backups/openviking-${TS}.tar.gz" state config scripts tests compose.yaml secrets.env
 chmod 600 "backups/openviking-${TS}.tar.gz"
 docker compose up -d --wait --wait-timeout 180
 ```
 
-备份含密钥:不打印内容、不上传、不入库。恢复演练必须在独立临时目录、
-独立 Compose project name、并在配置副本中显式更换 1933/18353 端口后进行,
-不得覆盖或连接在用状态。
+备份含密钥:不打印内容、不上传、不入库;包含 `tests/` 是为了恢复后能使用
+同一套 fixtures、smoke 与 E2E 验收。恢复演练**不得与生产栈并行**:先执行
+`docker compose stop` 并保持生产停止,确认 1933/18353 未被其他进程占用;
+再在新空临时目录解包,使用独立 Compose project name,沿用备份中的 loopback
+端口与 CLI URL 完成验收。这样 restored `ovcli.conf`、health/curl 与固定 URI
+写入都不可能打到在用生产。验收后先 `docker compose down` 停止恢复栈,确认
+临时端口已释放,再回原目录启动生产;全过程不得覆盖原 `state/`。若确需并行
+恢复,必须另行显式改写 Compose、ov.conf、active/saved CLI URL 及全部探针端点,
+不能只改两个监听端口。
 
 ## 升级与回滚
 

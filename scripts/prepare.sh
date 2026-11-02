@@ -4,8 +4,8 @@
 # 纪律:
 # - 绝不 source secrets.env,绝不回显任何变量值;
 # - root key 缺失则生成,存在但为空则失败,重复执行幂等;
-# - state 含未知数据时停止,不清空、不接管;
-# - 端口 1933/18353 必须空闲,18351/18352 必须已由 model-serving 提供。
+# - state 含未知数据时停止,不清空、不接管,且拒绝前不写 key/目录;
+# - 端口 1933/18353 必须空闲,18351/18352 必须仅由 loopback 模型服务提供。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,18 +34,54 @@ current_uid_gid="$(id -u):$(id -g)"
 [ "$current_uid_gid" = "$EXPECTED_UID_GID" ] \
   || fail "当前用户 $current_uid_gid 与 Compose user $EXPECTED_UID_GID 不一致;其他用户部署须先显式调整 compose.yaml 与本脚本常量"
 
-# ---------- 端口 ----------
+# ---------- 端口与网络边界 ----------
 port_listening() { ss -H -tln "sport = :$1" 2>/dev/null | grep -q .; }
+loopback_only_listener() {
+  local port=$1 local_addr
+  port_listening "$port" || return 1
+  while read -r _ _ _ local_addr _; do
+    case "$local_addr" in
+      "127.0.0.1:$port"|"[::1]:$port"|"::1:$port") ;;
+      *) return 1 ;;
+    esac
+  done < <(ss -H -tln "sport = :$port" 2>/dev/null)
+}
 for p in 1933 18353; do
   if port_listening "$p"; then
     fail "端口 $p 已被占用(应为 OpenViking 部署保留);不杀既有进程,请先排查"
   fi
 done
 for p in 18351 18352; do
-  if ! port_listening "$p"; then
-    fail "端口 $p 未监听:model-serving 未提供(embedding=18351 / rerank=18352);本方案不修改 model-serving"
+  if ! loopback_only_listener "$p"; then
+    fail "端口 $p 未仅监听 loopback:需要 127.0.0.1 或 ::1 的 embedding/rerank 服务;本方案不修改 model-serving"
   fi
 done
+
+# ---------- 在任何写入前验证 state 标记与未知内容 ----------
+marker_status="待创建"
+if [ -e "$MARKER" ] || [ -L "$MARKER" ]; then
+  [ -f "$MARKER" ] && [ ! -L "$MARKER" ] \
+    || fail "state 标记不是常规文件或含符号链接;请先备份并人工确认"
+  grep -Fqx 'openviking-compose-v1' "$MARKER" \
+    || fail "state 标记内容无效;请先备份并人工确认,本脚本不接管"
+  marker_status="已存在并验证(继续接管本方案状态)"
+else
+  [ ! -e "$STATE_DIR" ] || [ -d "$STATE_DIR" ] \
+    || fail "state 路径存在但不是目录"
+  if [ -d "$STATE_DIR" ]; then
+    for entry in "$STATE_DIR"/* "$STATE_DIR"/.[!.]* "$STATE_DIR"/..?*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      case "$(basename "$entry")" in
+        secrets)
+          # 仅允许上次失败后留下的空目录;任何已有内容都属于未知状态。
+          [ -d "$entry" ] && [ -z "$(find "$entry" -mindepth 1 -print -quit)" ] \
+            || fail "state/secrets 含非本方案验证的数据;请先备份并人工确认"
+          ;;
+        *) fail "state 目录含非本方案创建的数据($(basename "$entry"));请先备份并人工确认,本脚本不清空、不接管" ;;
+      esac
+    done
+  fi
+fi
 
 # ---------- secrets.env 解析(只解析,不执行) ----------
 # 统一由 scripts/env_file.py 按 Compose env_file 常用语义解析(缩进、export、
@@ -86,16 +122,7 @@ ensure_dir_700 "$STATE_DIR"
 ensure_dir_700 "$SECRETS_DIR"
 ensure_dir_700 "$BACKUP_DIR"
 
-if [ -e "$MARKER" ]; then
-  marker_status="已存在(继续接管本方案状态)"
-else
-  for entry in "$STATE_DIR"/* "$STATE_DIR"/.[!.]* "$STATE_DIR"/..?*; do
-    [ -e "$entry" ] || [ -L "$entry" ] || continue
-    case "$(basename "$entry")" in
-      secrets) ;;  # 本脚本此前创建,允许
-      *) fail "state 目录含非本方案创建的数据($(basename "$entry"));请先备份并人工确认,本脚本不清空、不接管" ;;
-    esac
-  done
+if [ "$marker_status" = "待创建" ]; then
   printf 'openviking-compose-v1\ncreated=%s\n' "$(date -Is)" > "$MARKER"
   chmod 600 "$MARKER"
   marker_status="已创建"
@@ -104,4 +131,4 @@ fi
 echo "prepare 完成:"
 echo "  - secrets.env:${root_key_status};权限 600"
 echo "  - 目录 state/、state/secrets/、backups/:700,属主 ${EXPECTED_UID_GID};状态标记 ${marker_status}"
-echo "  - 端口:1933/18353 空闲;18351/18352 由 model-serving 提供"
+echo "  - 端口:1933/18353 空闲;18351/18352 仅由 loopback 模型服务提供"

@@ -87,19 +87,24 @@ https://openviking.ai/install/v1/<harness>.json
 curl -fsSL https://openviking.ai/install
 ```
 
-未给 `-o`/`--output` 或 shell 重定向时，正文到 stdout；在终端通常就是显示文本。以下形式才把 stdout 作为 bash 的输入并执行：
+未给 `-o`/`--output` 或 shell 重定向时，正文到 stdout；在终端通常就是显示文本。以下形式把 stdout 作为 bash 的输入并执行。**这里仅以非执行 `text` 块记录官方
+源码形式，不要复制运行**：交互 Bash 默认没有 `pipefail` 时，curl 失败可能被
+空输入的 bash 以 0 掩盖，部分下载也可能执行截断脚本；实际执行一律用 §6 的
+“新空目录下载成功后再运行”形式。
 
-```bash
+```text
 curl -fsSL https://openviking.ai/install | bash
 ```
 
 官方给出的非交互完整形式是：[bootstrap 固定源码 L17-L21](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/examples/memory-plugin-shared/bootstrap.sh#L17-L21)、[shared installer L20-L28](https://github.com/volcengine/OpenViking/blob/6b2bcf29b2f4169b519dd96015b50adb3dca08f2/examples/memory-plugin-shared/install.sh#L20-L28)
 
-```bash
+```text
 curl -fsSL https://openviking.ai/install | bash -s -- --yes --url <server-url> --api-key <key>
 ```
 
-其中 `bash -s --` 后面的 token 才是交给脚本的参数，例如 `... | bash -s -- --harness claude --yes`；不要把安装器参数直接写成 bash 自身选项。bootstrap 最终把参数原样转交 shared installer，并在前面补 `--dist tos`。[参数解析 L287-L308](https://github.com/volcengine/OpenViking/blob/6b2bcf29b2f4169b519dd96015b50adb3dca08f2/examples/memory-plugin-shared/install.sh#L287-L308)
+其中管道形式的 `bash -s --` 后 token 才是交给脚本的参数；改为 `bash
+"$install_dir/bootstrap.sh" ARGS...` 时直接传参数，不再需要 `-s --`。不要把
+安装器参数直接写成 bash 自身选项。bootstrap 最终把参数原样转交 shared installer，并在前面补 `--dist tos`。[参数解析 L287-L308](https://github.com/volcengine/OpenViking/blob/6b2bcf29b2f4169b519dd96015b50adb3dca08f2/examples/memory-plugin-shared/install.sh#L287-L308)
 
 ## 3. 参数、默认值、交互与预检
 
@@ -237,7 +242,9 @@ Cursor/TRAE/ZCode 的 JSON helper 对不可解析配置会报错而不是覆盖�
 官方直接卸载命令形式：[头部 L88-L91](https://github.com/volcengine/OpenViking/blob/6b2bcf29b2f4169b519dd96015b50adb3dca08f2/examples/memory-plugin-shared/install.sh#L88-L91)
 
 ```bash
-curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness <list>
+install_dir=$(mktemp -d)
+curl -fsSL https://openviking.ai/install -o "$install_dir/bootstrap.sh" &&
+  bash "$install_dir/bootstrap.sh" --uninstall --yes --harness '<list>'
 ```
 
 实际边界：
@@ -276,13 +283,17 @@ less "$review_dir/bootstrap.sh"
 ### 6.2 交互安装
 
 ```bash
-curl -fsSL https://openviking.ai/install | bash
+install_dir=$(mktemp -d)
+curl -fsSL https://openviking.ai/install -o "$install_dir/bootstrap.sh" &&
+  bash "$install_dir/bootstrap.sh"
 ```
 
 在 TTY 中可选择语言、agents、local/cloud/custom URL；key 无回显输入，最后确认计划。限定 agent 但仍保留交互和隐藏 key 输入：
 
 ```bash
-curl -fsSL https://openviking.ai/install | bash -s -- --harness claude
+install_dir=$(mktemp -d)
+curl -fsSL https://openviking.ai/install -o "$install_dir/bootstrap.sh" &&
+  bash "$install_dir/bootstrap.sh" --harness claude
 ```
 
 ### 6.3 非交互指定 URL/account/user 和 agents
@@ -290,13 +301,15 @@ curl -fsSL https://openviking.ai/install | bash -s -- --harness claude
 官方参数形式：
 
 ```bash
-curl -fsSL https://openviking.ai/install | bash -s -- \
-  --yes --lang zh \
-  --harness claude,codex,cli \
-  --url 'https://openviking.example.com' \
-  --account '<account-id>' \
-  --user '<user-id>' \
-  --api-key '<user-or-admin-key>'
+install_dir=$(mktemp -d)
+curl -fsSL https://openviking.ai/install -o "$install_dir/bootstrap.sh" &&
+  bash "$install_dir/bootstrap.sh" \
+    --yes --lang zh \
+    --harness claude,codex,cli \
+    --url 'https://openviking.example.com' \
+    --account '<account-id>' \
+    --user '<user-id>' \
+    --api-key '<user-or-admin-key>'
 ```
 
 选择特定 agent 只需改 LIST，例如 `--harness cursor`；显式列表不含 `cli` 时不会自动安装 CLI。本地无鉴权模式可显式 `--api-key ''`，但不要把它用于实际需要认证的远程服务。

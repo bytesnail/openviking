@@ -26,10 +26,23 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ADAPTER = "http://127.0.0.1:18353"
-UPSTREAM = "http://127.0.0.1:18351"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+from embedding_adapter import single_vector  # noqa: E402
+from env_file import (  # noqa: E402
+    EnvFileError,
+    loaded_model_ids,
+    parse_env_file,
+    validate_config,
+)
+
+ADAPTER = os.environ.get("OPENVIKING_ADAPTER_URL", "http://127.0.0.1:18353").rstrip("/")
+UPSTREAM = os.environ.get(
+    "OPENVIKING_EMBEDDING_UPSTREAM_URL", "http://127.0.0.1:18351"
+).rstrip("/")
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 results = []
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _configured_model():
@@ -38,10 +51,11 @@ def _configured_model():
     llama-server 不校验请求 model 字段,回退旧名会在配置损坏时产生假通过。
     """
     try:
-        conf = Path(__file__).resolve().parents[1] / "config" / "ov.conf"
-        cfg = json.loads(os.path.expandvars(conf.read_text(encoding="utf-8-sig")))
+        root = Path(__file__).resolve().parents[1]
+        env = parse_env_file(root / "secrets.env")
+        cfg = validate_config(env, root / "config" / "ov.conf")
         model = cfg["embedding"]["dense"]["model"]
-    except (OSError, KeyError, TypeError, ValueError) as exc:
+    except (EnvFileError, KeyError, TypeError, ValueError) as exc:
         raise SystemExit(
             f"SETUP-FAIL: 无法读取 embedding.dense.model({type(exc).__name__})"
         ) from None
@@ -59,7 +73,7 @@ def post(url, payload, timeout=160):
         url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _DIRECT_OPENER.open(req, timeout=timeout) as resp:
             status = resp.status
             raw = resp.read()
         try:
@@ -67,34 +81,16 @@ def post(url, payload, timeout=160):
         except ValueError:
             return status, "invalid-json-response"
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
-        return exc.code, body[:200]
+        exc.close()  # 不读取/输出上游错误正文,避免反射敏感内容进日志
+        return exc.code, "http-error"
     except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as exc:
         return 0, f"connection-level: {type(exc).__name__}"
-
-
-def single_vector(body):
-    if not isinstance(body, dict) or not isinstance(body.get("data"), list):
-        return None
-    if len(body["data"]) != 1 or not isinstance(body["data"][0], dict):
-        return None
-    vector = body["data"][0].get("embedding")
-    if not isinstance(vector, list) or not vector:
-        return None
-    if not all(
-        isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-        for x in vector
-    ):
-        return None
-    if not any(x != 0 for x in vector):
-        return None  # 零向量无法归一化,余弦相似度未定义,视为无效响应
-    return vector
 
 
 def embed(url, inp):
     status, body = post(url + "/v1/embeddings", {"model": MODEL, "input": inp})
     if status != 200:
-        raise SystemExit(f"embed failed: {url} -> {status} {body}")
+        raise SystemExit(f"embed failed -> http={status}")
     vector = single_vector(body)
     if vector is None:
         raise SystemExit(f"embed failed: {url} -> invalid embedding response schema")
@@ -119,18 +115,13 @@ def data_url(path):
 def check_loaded_model():
     """配置的模型名必须出现在上游 /v1/models;请求里的 model 字段不足以校验。"""
     try:
-        with urllib.request.urlopen(UPSTREAM + "/v1/models", timeout=10) as resp:
+        with _DIRECT_OPENER.open(UPSTREAM + "/v1/models", timeout=10) as resp:
             data = json.load(resp)
-        items = data.get("data") or data.get("models") or []
-        ids = " ".join(
-            str(item.get("id") or item.get("name") or "")
-            for item in items
-            if isinstance(item, dict)
-        ).lower()
+        ids = loaded_model_ids(data)
         check(
             "model-loaded",
             MODEL.lower() in ids,
-            f"configured={MODEL} loaded={ids or '(empty)'}",
+            f"configured={MODEL} loaded={' '.join(sorted(ids)) or '(empty)'}",
         )
     except Exception as exc:
         check("model-loaded", False, f"error={type(exc).__name__}")
@@ -186,7 +177,7 @@ def main():
     # 5. 适配器 health/ready
     for path in ("/health", "/ready"):
         try:
-            with urllib.request.urlopen(ADAPTER + path, timeout=5) as resp:
+            with _DIRECT_OPENER.open(ADAPTER + path, timeout=5) as resp:
                 check(f"adapter{path}", resp.status == 200, f"http={resp.status}")
         except urllib.error.HTTPError as exc:
             check(f"adapter{path}", False, f"http={exc.code}")

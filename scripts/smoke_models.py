@@ -7,16 +7,22 @@
 输出纪律:只输出状态与非敏感指标(字符数、得分);不输出密钥、完整模型
 响应或异常文本(只打印异常类型名)。VLM 调用消耗少量 Coding Plan 用量。
 """
-import json
+import concurrent.futures
+import math
 import os
 import re
 import sys
+from pathlib import Path
 
 FIXTURES = "/opt/openviking/fixtures"
 
-_NEGATION = re.compile(r"\b(?:not|no|never|cannot|can't)\b|不是|并非|不知道|无法")
+_NEGATION = re.compile(
+    r"\b(?:not|no|never|cannot|can't|isn't|aren't|wasn't|weren't)\b|不是|并非|不知道|无法"
+)
+_IMAGE_NEGATION = re.compile(_NEGATION.pattern + r"|不红|不紅|非红|非紅")
 _MULTI_DIGIT = re.compile(r"\d{2,}")
 _STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
+_ENGLISH_TWO = re.compile(r"(?<![a-z-])two(?![a-z-])")
 _RED_WORD = re.compile(r"\bred\b")
 
 
@@ -35,8 +41,12 @@ def _text_answer_ok(text):
         return True
     if _NEGATION.search(normalized) or _MULTI_DIGIT.search(normalized):
         return False
-    # 允许 "答案是2" / "1+1=2" 等,但 2 不能是多位数的一部分。
-    return _STANDALONE_TWO.search(normalized) is not None
+    # 允许 "答案是2/二/two" 与 "1+1=2" 等自然回答,但排除多位数和否定句。
+    return (
+        _STANDALONE_TWO.search(normalized) is not None
+        or _ENGLISH_TWO.search(normalized) is not None
+        or any(token in normalized for token in ("二", "兩", "两"))
+    )
 
 
 def _image_answer_ok(text):
@@ -47,7 +57,7 @@ def _image_answer_ok(text):
     if normalized in {"红", "紅", "红色", "紅色", "red"}:
         return True
     if (
-        _NEGATION.search(normalized)
+        _IMAGE_NEGATION.search(normalized)
         or "blue" in normalized
         or "蓝" in normalized
         or "藍" in normalized
@@ -56,10 +66,24 @@ def _image_answer_ok(text):
     return _RED_WORD.search(normalized) is not None or "红" in normalized or "紅" in normalized
 
 
+def _valid_rerank_scores(scores):
+    return (
+        isinstance(scores, (list, tuple))
+        and len(scores) == 2
+        and all(
+            isinstance(score, (int, float))
+            and not isinstance(score, bool)
+            and math.isfinite(score)
+            for score in scores
+        )
+    )
+
+
 def load_config():
-    path = os.environ.get("OPENVIKING_CONFIG_FILE", "/app/.openviking/ov.conf")
-    raw = os.path.expandvars(open(path, encoding="utf-8-sig").read())
-    return json.loads(raw)
+    path = Path(os.environ.get("OPENVIKING_CONFIG_FILE", "/app/.openviking/ov.conf"))
+    # 与 CLI 共用官方解析/展开逻辑;延迟导入保留宿主纯函数单测可收集性。
+    from openviking_cli.utils.config.config_loader import load_json_config
+    return load_json_config(path)
 
 
 def smoke_vlm_text(vlm, failures):
@@ -117,8 +141,8 @@ def smoke_rerank(rerank_cfg, failures):
             "红色方块的图片",
             ["一张纯红色方块的图片", "今天的午餐菜单是意大利面"],
         )
-        if not scores or len(scores) != 2:
-            print(f"[rerank]     FAIL scores={scores!r}")
+        if not _valid_rerank_scores(scores):
+            print("[rerank]     FAIL reason=invalid_scores")
             failures.append("rerank")
             return
         ordered = scores[0] > scores[1]
@@ -143,9 +167,27 @@ def main():
         return 1
     failures = []
     print("smoke_models: 开始(会发起 2 次 GLM 真实调用与 1 次 rerank 真实请求)")
-    smoke_vlm_text(cfg.vlm, failures)
-    smoke_vlm_image(cfg.vlm, failures)
-    smoke_rerank(cfg.rerank, failures)
+    # VLM client 的 lazy init 非线程安全,先在主线程完成;三个探针互不依赖,
+    # 有界并发只缩短墙钟,不增加请求数/token。各自使用独立失败列表保序汇总。
+    try:
+        cfg.vlm.get_vlm_instance()
+    except Exception:
+        pass  # 让各探针沿用原有错误分类与输出纪律
+
+    def run_probe(probe, arg):
+        local_failures = []
+        probe(arg, local_failures)
+        return local_failures
+
+    probes = [
+        (smoke_vlm_text, cfg.vlm),
+        (smoke_vlm_image, cfg.vlm),
+        (smoke_rerank, cfg.rerank),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(run_probe, probe, arg) for probe, arg in probes]
+        for future in futures:
+            failures.extend(future.result())
     if failures:
         print(f"smoke_models: FAIL({', '.join(failures)})")
         return 1

@@ -17,8 +17,13 @@
    hermes-agent 等)接入本部署;
 2. 数据隔离:工具间不要求互相隔离;**个人偏好/个人信息须跨工具共享**;
    项目经验按项目组织;
-3. **本项目部署自身的测试验证/功能实验与真实使用数据完全分离**,测试残留
-   不得影响任何真实身份的数据,不得误覆盖他 user(含 default)的数据;
+3. **原始诉求是测试验证/功能实验与真实使用数据完全分离**,测试残留不得影响
+   任何真实身份的数据,不得误覆盖他 user(含 default)的数据。经本次复核,
+   同账户三身份格局只能实现**协作式 user 私有区隔离**,不能满足这一绝对目标:
+   共享区写入、同 UID 凭据可达性及账户/服务器级残留仍在(§5.4/§5.5)。
+   本方案只验收前者,不得宣称完成绝对的"完全分离";若该原始诉求不可放宽,
+   必须另案采用独立测试账户(至少)、独立服务实例及仅含 test key 的独立 OS
+   用户/容器,而不是靠路径约定模拟边界。
 4. 遵循官方机制,不自造轮子。
 
 ## 2. 官方机制取证结论(v0.5.2.1 镜像内源码 + docs.openviking.ai,2026-11-01)
@@ -54,10 +59,14 @@
 | hermes-agent | 官方 catalog 插件 | `examples/hermes-plugin` |
 | 任意 MCP 客户端 | 服务器内置 `/mcp`(streamable HTTP;**当前部署 v0.5.2.1 实测 24 工具**,含 find/search/read/write/remember/forget/add_skill/list_users/list_groups/get_acl/set_acl/privacy_* 等) | `openviking/server/mcp_endpoint.py` |
 
-- 统一安装器:`curl -fsSL https://openviking.ai/install | bash`;凭据写宿主
-  `~/.openviking/ovcli.conf`(JSON:服务器地址 + user api_key),官方插件均从该
-  文件取连接信息;可用 `OPENVIKING_*` 环境变量按进程覆盖。当前线上安装器的
-  下载链路、完整参数、支持的 harness、配置合并/备份及重跑/卸载边界见
+- 统一安装器:先在新空目录 `install_dir=$(mktemp -d)` 中用
+  `curl -fsSL https://openviking.ai/install -o "$install_dir/bootstrap.sh"`
+  下载,成功后再以 `bash "$install_dir/bootstrap.sh" ARGS...` 执行;
+  **不直接 `curl | bash`**(避免下载失败被 bash 的 0 状态掩盖或执行截断脚本)。
+  凭据写宿主 `~/.openviking/ovcli.conf`(JSON:服务器地址 + user api_key),
+  官方插件均从该文件取连接信息;可用 `OPENVIKING_*` 环境变量按进程覆盖。
+  当前线上安装器的下载链路、完整参数、支持的 harness、配置合并/备份及
+  重跑/卸载边界见
   [OpenViking 官方统一安装器静态审查](../../research/2026-11-02-openviking-official-installer.md)。
   统一安装器的 `--harness` 不含 Hermes、OpenClaw、Agent Plugins 1.0;这些工具
   须按各自官方接入方式安装,不能假设同一条安装命令覆盖全部官方集成。
@@ -141,7 +150,7 @@ data needs to remain separate**."——即 user 按"数据是否需要彼此分�
 | root key | `secrets.env` + default 的 `state/ovcli.conf(.local)`(现有) | 600 | 仅账户管理;数据面/`/mcp` 拒收;bootstrap 会将 root key 一并写入 default CLI 配置;**可用 Admin API 列举/轮换 user key,故仍等效于账户内数据的间接访问** |
 | default user key | `state/secrets/user_api_key` + `state/ovcli.conf(.local)`(现有) | 600 | 部署运维身份(**role=admin**;v0.5.2.1 可列举本账户 user 明文 key/轮换他人 key,见 §2.4);CLI 配置同时含 root key |
 | meteor user key | 宿主 `~/.openviking/ovcli.conf`(未来,官方安装器) | 600 | 正式身份;宿主侧文件;**服务端 users.json 另存明文副本(见下)** |
-| test user key | `state/secrets/test_user_api_key` + 选用 CLI 配置时的 `state/ovcli.test.conf` 及其 CLI saved profile `state/ovcli.conf.<name>`(均新建) | 600 | 测试身份;各处如同时存在须同步轮换;**服务端 users.json 另存明文副本(见下)** |
+| test user key | `state/secrets/test_user_api_key`(独立文件) | 600 | 本项目测试验证、功能实验;默认 direct-curl 使用,不创建持久 test CLI active/saved profile;**服务端 users.json 另存明文副本(见下)** |
 
 - **服务端 key 存储(2026-11-02 只读核对存储形态,未记录/回显值)**:OpenViking
   把每个 user 的 API key 明文写入 `state/data/viking/default/_system/users.json`
@@ -154,33 +163,29 @@ data needs to remain separate**."——即 user 按"数据是否需要彼此分�
 凭据纪律(沿用本项目既有要求):永不回显明文、不进 git、命令内变量中转;
 `users.json` 与 `state/secrets/*`、CLI 配置一样禁止 cat/Read/粘贴;轮换时同步
 处理 default 的 `ovcli.conf(.local)`(后者是 `ov config add --name local` 写入的
-CLI saved profile,不是手工副本)、test 的 key 文件/可选 `ovcli.test.conf` 及其
-`state/ovcli.conf.<name>` saved profile;并注意 users.json 副本会随 `state/`
-进入备份。
+CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维护持久
+`ovcli.test.conf` / `ovcli.conf.test` 副本,避免轮换漂移。专项 CLI 测试如确需
+持久配置,必须另行批准并复用 §6.2 的参数化配置/健康检查 helper 同步管理;
+并注意 users.json 副本会随 `state/` 进入备份。
 
 ## 5. 测试纪律(方案执行后生效)
 
-1. 凡会写数据或验证用户数据面的功能测试一律以 `test` 身份执行;测试脚本/CLI
-   配置切换方式执行时定一种(独立 `state/ovcli.test.conf`(600)经
-   `OPENVIKING_CLI_CONFIG_FILE` 切换,或脚本内 curl 直连带 test key)。
+1. 凡会写数据或验证用户数据面的功能测试一律以 `test` 身份执行;项目脚本
+   **统一使用 `state/secrets/test_user_api_key` + direct curl**,密钥必须经变量
+   中转与 curl stdin 配置(`-K -`)传入,不得进 argv;curl 首参为 `-q` 禁用
+   用户 curlrc,默认丢弃响应体,只输出状态/非敏感指标。不得另写裸
+   `curl -H "X-API-Key: $KEY"`;新测试应抽取并复用认证矩阵的 `code_auth` 机制。
    部署 doctor/smoke 与认证矩阵中明确需要 default/root 的部署验收、认证边界
-   检查是例外,但不得写真实使用数据。
-   若新建 `state/ovcli.test.conf`,只放 test user key,**不得**复制 default
-   配置中的 `root_api_key`(用 `ov config add` 时不要传 `--root-api-key-env`);
-   该文件给测试进程 root 能力会破坏测试身份边界。注意 `ov config add --name
-   <name>` 的 saved profile **与 active 配置文件名无关**,固定写到同目录的
-   `state/ovcli.conf.<name>`(不是 `ovcli.test.conf.<name>`);该副本同样必须
-   只含 test key,并与 active 配置同步轮换。**不要用 `--name local` 创建 test
-   配置**:它会与 default 的 `state/ovcli.conf.local` 冲突,`--force` 还会覆盖
-   default 的 ADMIN+root saved profile;test 应使用独立 name(如 `test`,
-   saved profile 为 `state/ovcli.conf.test`)。test CLI 配置同样须补
-   `"timeout": 300`(或改用脚本内 curl),否则图片资源 `--wait` 会按 CLI 默认
-   60s 超时。
+   检查是例外,但不得写真实使用数据。test 默认不创建持久 CLI active/saved
+   profile,避免 key 文件之外再多两份需同步轮换的凭据;身份健康检查只用
+   §6.2 helper 生成的临时 600 配置,验收后删除。专项 CLI 测试确需持久配置时
+   另行批准,并参数化复用 bootstrap 的配置、saved-profile 同步与 timeout helper,
+   不得手工维护一套平行流程。
    现有 `tests/e2e_auth_matrix.sh` 的 `ADMIN_KEY` 实际是 default 的 **ADMIN**
-   key(见 §3),不是 role=user;脚本已明确标注其只验证 ADMIN/ROOT 边界,且
-   密钥经 curl stdin 配置传入、不进 argv;当
-   `state/secrets/test_user_api_key` 存在时脚本自动追加 USER 边界行,否则
-   SKIP。创建 test 后应重跑该脚本,确认 USER 行由 SKIP 变为 PASS。
+   key(见 §3),不是 role=user;当 `state/secrets/test_user_api_key` 存在时脚本
+   自动追加 USER 边界行,否则 SKIP。创建 test 后以
+   `REQUIRE_USER=1 bash tests/e2e_auth_matrix.sh` 重跑,缺失 USER 行必须失败;
+   该矩阵只验证状态边界,不替代 §6.3 的双向私有读写隔离验收。
 2. 写入目标优先 test 私有区(`viking://user/test/resources/...`;执行时先实测
    `ov add-resource` 对该路径的支持);**仅验证共享语义时才写**
    `viking://resources`,且专用 URI + 验收后即删(沿用 2026-10-26 惯例)。
@@ -189,7 +194,9 @@ CLI saved profile,不是手工副本)、test 的 key 文件/可选 `ovcli.test.c
 3. 不写记忆;若未来专门测试记忆管线,只写 test 私有区。
 4. 已知不受身份隔离保护的残留(接受):账户共享区内容(含 `viking://agent`
    命名空间)、GLM token 消耗(Coding Plan 用量)、向量库存储、任务队列均为
-   账户/服务器级。default/root key 权限不在此清单,另见 §2.4。
+   账户/服务器级。default/root key 权限不在此清单,另见 §2.4。**接受这些残留
+   即表示 §1.3 的绝对"完全分离"目标未由本方案关闭**,不得再以私有区验收通过
+   宣称共享区或真实身份不受任何影响。
 
 ### 5.5 隔离边界(执行前必读)
 
@@ -197,12 +204,12 @@ CLI saved profile,不是手工副本)、test 的 key 文件/可选 `ovcli.test.c
   权限边界。agent/测试目前都以宿主 UID 1000 运行,能读取
   `state/secrets/user_api_key`、`state/data/viking/default/_system/users.json`
   与 default 的 CLI 配置,并可切换到 default/ADMIN/ROOT 身份。
-- 任何会写数据的测试必须在执行前断言身份:用显式
-  `OPENVIKING_CLI_CONFIG_FILE` 指向 test 配置;容器内必须用
-  `docker compose exec -e OPENVIKING_CLI_CONFIG_FILE=/app/.openviking/ovcli.test.conf`
-  覆盖 compose 固定的 `/app/.openviking/ovcli.conf`,并核对
-  `ov health -o json` 的 `user_id=test`、`account_id=default`、`role=user`;
-  不得依赖宿主环境变量或容器默认配置。
+- 任何会写数据的测试必须在执行前断言身份:§6.2 的参数化 helper 从 test key
+  文件生成仅含 test key 的临时 600 CLI 配置,显式设置
+  `OPENVIKING_CLI_CONFIG_FILE`,并在验证后删除;容器内完整命令为
+  `docker compose exec -T -e OPENVIKING_CLI_CONFIG_FILE=/app/.openviking/ovcli.test.conf openviking ov health -o json`。
+  必须核对输出的 `user_id=test`、`account_id=default`、`role=user`;不得依赖
+  宿主环境变量、容器默认配置或不完整的 `docker compose exec -e ...` 片段。
 - 若需要抵御测试脚本误用或同 UID 进程读取,须把测试运行器放入独立 OS 用户
   或容器,仅挂载 test key,不挂载 default key/users.json;本方案当前未实施
   该 OS 级隔离,相关验收不得宣称"对任何身份零影响"。
@@ -211,15 +218,20 @@ CLI saved profile,不是手工副本)、test 的 key 文件/可选 `ovcli.test.c
 
 1. root key 调 `POST /api/v1/admin/accounts/default/users` 创建 `test`
    (role=user);响应 `user_key` 原子写入 `state/secrets/test_user_api_key`(600)。
-   本步不创建 `meteor`,只为缩小首个审批的影响面;**注意:若 §4 的 key hashing
-   未启用/未确认,创建任何 user 时服务端都会把其 key 明文写入
-   `state/data/.../_system/users.json`(见 §4),因此"不落入 repo/备份"不能靠
-   推迟创建实现**,只能靠 key hashing/外部账户或接受该副本。
-2. 为 test 建立第 5.1 条选定的 CLI 使用方式;`ov health -o json` 分别以 default 与
-   test 身份验证,除 `healthy=true` 外必须断言 `result.account_id=default`、
-   `result.user_id` 分别为 `default`/`test`,且 `result.role` 为 `admin`/`user`
-   (**`role=root` 判失败**:root-only 配置也会返回 default/default)(
-   meteor 在宿主侧接入时同样核对身份)。
+   实现时参数化复用 `bootstrap_auth.py` 的 `_post_json`、user 注册、
+   `_atomic_write_secret` 与"创建成功但落盘失败则轮换、绝不重建"恢复逻辑,
+   不另写一套 curl/原子写平行实现。本步不创建 `meteor`,只为缩小首个审批的
+   影响面;**注意:若 §4 的 key hashing 未启用/未确认,创建任何 user 时服务端
+   都会把其 key 明文写入 `state/data/.../_system/users.json`(见 §4),因此
+   "不落入 repo/备份"不能靠推迟创建实现**,只能靠 key hashing/外部账户或接受
+   该副本。
+2. 参数化复用 `bootstrap_auth._ov_health_ok` 的 JSON envelope、root-fallback 与
+   key/URL 一致性检查(预期 account/user/role 及 root key 是否必需必须作为参数,
+   不能原样硬调 default/admin helper);test 健康检查用临时 600 配置且完成后删除。
+   `ov health -o json` 分别以 default 与 test 身份验证,除 `healthy=true` 外必须
+   断言 `result.account_id=default`、`result.user_id` 分别为 `default`/`test`,
+   且 `result.role` 为 `admin`/`user`(**`role=root` 判失败**:root-only 配置
+   也会返回 default/default)(meteor 在宿主侧接入时同样核对身份)。
 3. 双向验证:test 写私有区后,**default 以其自身 key 的常规数据面**不可见;
    test 也不可读取 default 既有私有资源。注意 default 是 ADMIN,按 §2.4 仍可
    通过列举/轮换 test key 间接取得 test 数据;本断言只验证普通数据面,不构成
@@ -231,15 +243,30 @@ CLI saved profile,不是手工副本)、test 的 key 文件/可选 `ovcli.test.c
    执行时先运行 `ov ls viking://resources` 与 `ov ls viking://agent` 记录
    基线(当前 resources 含既有 `deployment-smoke*` 与根元数据,agent 含系统
    骨架;若已按 README 清理,以当次输出为准),验收后比对两者,不得假定
-   基线为空。
+   基线为空。**双向验证结束后必须删除 default 与 test 的专用私有夹具并核对
+   删除结果**,不得只在共享区做清理而把测试残留留在 default 私有区。
 4. README 增补三身份表、key 位置与测试纪律;引用本方案文档。
 5. (独立后续,另行批准)root key 创建 `meteor`(role=user),双向验证其与 test
-   均不可读取对方私有区;宿主侧按官方接入方式安装各 agent 工具(统一安装器
-   仅覆盖其支持的 harness,Hermes 等走各自官方流程),meteor key 通过交互无回显
-   输入或既有 600 配置提供,写入宿主 `~/.openviking/ovcli.conf`(600),不在
-   repo `state/secrets/` 另存副本。**但若 §4 的 hashing 未启用/未确认,服务端
-   users.json 仍会保存该 key 的明文副本(§4),因此"只写入宿主"不成立;备份/
-   迁移 `state/` 即包含它。**
+   均不可读取对方私有区,并清理双方专用夹具。宿主安装前先以不输出值的 JSON
+   字段检查确认 `~/.openviking/ovcli.conf` **不含 `root_api_key`**;若旧配置含有,
+   必须先经批准迁移到全新 `OPENVIKING_HOME` 或安全移除该字段,因为官方安装器
+   会保留未指定字段,不能靠传入 meteor `api_key` 清除 root 能力。meteor key
+   通过交互无回显输入或既有 600 配置提供,写入宿主 `~/.openviking/ovcli.conf`
+   (600),不在 repo `state/secrets/` 另存副本;安装后再次确认 agent 配置只有
+   meteor user key,没有 default/root key。
+   统一安装器支持的 harness 用**一次逗号分隔 `--harness` 调用**批量安装
+   (如 `claude,opencode,pi,dsh`,按需显式加入 `cli`),避免逐工具重复下载、
+   服务探测、配置写入和时间戳备份;Hermes/OpenClaw/Agent Plugins 1.0 等不在
+   列表中的工具仍走各自官方流程。记录实际 CLI/plugin 版本、artifact hash 与
+   auto-update 状态,形成与 v0.5.2.1 的兼容基线;`@latest`/host 自动更新后必须
+   重新验收,不得把 server digest 固定误当成客户端也固定,也不得未经批准修改
+   用户全局 auto-update 配置。
+   每个 harness 验收必须包含真实 MCP handshake/tools call 及代表性 read/find/
+   write/delete 数据面闭环;自动召回/捕获在 test 身份或独立测试账户的专用
+   peer/私有 URI 中验证并清理,不用 meteor 个人偏好做实验。安装器 "Server check
+   passed"、插件出现在列表及 `ov health` 身份正确均只是诊断,不能替代这些能力
+   验收。**若 §4 的 hashing 未启用/未确认,服务端 users.json 仍会保存 meteor
+   key 的明文副本(§4),因此"只写入宿主"不成立;备份/迁移 `state/` 即包含它。**
 
 任一 user 创建成功但 key 本地落盘失败时,不得重复创建 user;用 root key 调
 `POST /api/v1/admin/accounts/default/users/<uid>/key` 轮换,再将返回的新 key
@@ -248,11 +275,17 @@ CLI saved profile,不是手工副本)、test 的 key 文件/可选 `ovcli.test.c
 ## 7. 开放点(批准前可调整)
 
 - user 命名(`meteor` / `test` 为当前拟定);
+- §1.3 的绝对"完全分离"是否仍是硬性要求:若是,本同账户方案不满足,须另案
+  设计独立账户/实例与独立 OS 凭据边界,不能以本方案验收替代;
 - 部署设计 §9.4 与 README 的端到端验收命令是否改写到 test 私有区(依赖 §5.2 的
   `ov add-resource` 私有路径实测与 §6.3 的双向验证)。
 
 ## 8. 方案修正记录(避免回退)
 
+- 2026-11-02 全项目复核:明确同账户/同 UID 方案不满足绝对"完全分离";test
+  默认只保留 key 文件并使用安全 direct curl,健康检查用临时配置;补齐完整
+  identity 命令、私有夹具清理、真实 MCP/数据面验收、批量 harness、客户端
+  版本兼容基线,以及宿主旧 `root_api_key` 不得随安装器合并保留的前置门禁。
 - 2026-11-02 评审补充:明确同 UID 协作式隔离边界;default/root key 权限不属
   §5.4 已接受残留;§6.3 的 default 可见性断言仅限普通数据面;共享面扩大到
   整个 `viking://agent` 命名空间并纳入残留基线;`ovcli.conf.local` 是 CLI

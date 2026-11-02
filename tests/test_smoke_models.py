@@ -27,7 +27,7 @@ def test_text_probe_rejects_nonempty_wrong_answer(answer):
     assert failures == ["vlm-text"]
 
 
-@pytest.mark.parametrize("answer", ["2", "二", "two", "2。", "答案是2", "1+1=2"])
+@pytest.mark.parametrize("answer", ["2", "二", "two", "2。", "答案是2", "答案是二", "the answer is two", "1+1=2"])
 def test_text_probe_accepts_expected_answer(answer):
     failures = []
     sm.smoke_vlm_text(DummyVLM(text=answer), failures)
@@ -35,7 +35,7 @@ def test_text_probe_accepts_expected_answer(answer):
 
 
 @pytest.mark.parametrize("answer", [
-    "blue", "The image is not red; it is blue.", "hundred", "不是红色",
+    "blue", "The image is not red; it is blue.", "The image isn't red", "不红", "hundred", "不是红色",
 ])
 def test_image_probe_rejects_nonempty_wrong_color(monkeypatch, answer):
     monkeypatch.setattr(
@@ -54,3 +54,15 @@ def test_image_probe_accepts_red(monkeypatch, answer):
     failures = []
     sm.smoke_vlm_image(DummyVLM(image=answer), failures)
     assert failures == []
+
+
+@pytest.mark.parametrize("scores", [
+    [True, False], [float("inf"), 0.0], [float("nan"), 0.0],
+    [0.8], [0.8, 0.2, 0.1], ["0.8", 0.2], None,
+])
+def test_rerank_rejects_malformed_scores(scores):
+    assert not sm._valid_rerank_scores(scores)
+
+
+def test_rerank_accepts_finite_numeric_scores():
+    assert sm._valid_rerank_scores([0.8, 0.2])

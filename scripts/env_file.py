@@ -14,10 +14,12 @@
 所有错误只输出步骤/异常类型,绝不回显密钥值。
 """
 import json
-import os
 import re
 import sys
 import urllib.request
+
+
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class EnvFileError(Exception):
@@ -86,15 +88,33 @@ def precheck_env(env):
     return "KEEP"
 
 
+def _expand_config_vars(raw, env):
+    """只用 Compose env_file 提供的值展开,不读取或修改宿主 os.environ。"""
+    pattern = re.compile(
+        r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+    )
+
+    def replace(match):
+        name = match.group(1) or match.group(2)
+        return env.get(name, match.group(0))
+
+    return pattern.sub(replace, raw)
+
+
 def validate_config(env, config_path):
     """展开并校验 ov.conf;返回 cfg;失败抛 EnvFileError。"""
-    os.environ.update(env)
     try:
         raw = open(config_path, encoding="utf-8-sig").read()
     except (OSError, UnicodeDecodeError) as exc:
         raise EnvFileError(f"读取 ov.conf 失败({type(exc).__name__})") from None
-    expanded = os.path.expandvars(raw)
-    leftover = sorted(set(re.findall(r"\$\{([^}]+)\}", expanded)))
+    expanded = _expand_config_vars(raw, env)
+    leftover = sorted(set(
+        name or short
+        for name, short in re.findall(
+            r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))",
+            expanded,
+        )
+    ))
     if leftover:
         raise EnvFileError(f"配置含未展开的变量引用: {', '.join(leftover)}")
     try:
@@ -107,12 +127,27 @@ def validate_config(env, config_path):
     server = cfg.get("server")
     if not isinstance(vlm, dict) or not isinstance(server, dict):
         raise EnvFileError("ov.conf 缺少 vlm/server 对象")
-    if (
-        vlm.get("api_key") != env["Z_AI_API_KEY"]
-        or server.get("root_api_key") != env["OPENVIKING_ROOT_API_KEY"]
-    ):
+    zai_key = env.get("Z_AI_API_KEY")
+    root_key = env.get("OPENVIKING_ROOT_API_KEY")
+    if not zai_key or not root_key:
+        raise EnvFileError("secrets.env 缺少 Z_AI_API_KEY 或 OPENVIKING_ROOT_API_KEY")
+    if vlm.get("api_key") != zai_key or server.get("root_api_key") != root_key:
         raise EnvFileError("密钥字段与 secrets.env 值不一致")
     return cfg
+
+
+def loaded_model_ids(data):
+    """从 /v1/models 提取规范化精确 ID,供 prepare 与 e2e 共用。"""
+    if not isinstance(data, dict):
+        return set()
+    items = data.get("data") or data.get("models") or []
+    if not isinstance(items, list):
+        return set()
+    return {
+        str(item.get("id") or item.get("name") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict) and (item.get("id") or item.get("name"))
+    }
 
 
 def check_model_drift(cfg):
@@ -128,19 +163,14 @@ def check_model_drift(cfg):
         if not isinstance(model, str) or not model:
             continue
         try:
-            with urllib.request.urlopen(
+            with _DIRECT_OPENER.open(
                 f"http://127.0.0.1:{port}/v1/models", timeout=3
             ) as response:
                 data = json.load(response)
-            items = data.get("data") or data.get("models") or []
-            ids = " ".join(
-                str(item.get("id") or item.get("name") or "")
-                for item in items
-                if isinstance(item, dict)
-            ).lower()
+            ids = loaded_model_ids(data)
             if model.lower() in ids:
                 continue
-            detail = ids or "(加载列表为空)"
+            detail = " ".join(sorted(ids)) or "(加载列表为空)"
         except Exception as exc:
             detail = f"查询失败({type(exc).__name__}),跳过核对"
         print(

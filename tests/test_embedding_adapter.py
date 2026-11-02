@@ -61,7 +61,10 @@ class FakeUpstream:
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(raw)))
                     self.end_headers()
-                    self.wfile.write(raw)
+                    try:
+                        self.wfile.write(raw)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass  # 适配器超时/断开后,假上游不再向已关闭 socket 写响应
                 finally:
                     with upstream._lock:
                         upstream._inflight -= 1
@@ -82,7 +85,7 @@ class FakeUpstream:
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
 
     @property
@@ -111,7 +114,7 @@ def adapter(upstream):
         max_body_bytes=4096,
         max_concurrent=2,
     )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     server.base_url = f"http://127.0.0.1:{server.server_address[1]}"
     yield server
@@ -300,10 +303,24 @@ def test_multimodal_invalid_vector_502(adapter, upstream, response_body):
     assert status == 502
 
 
+def test_prewrapped_multimodal_invalid_vector_502(adapter, upstream):
+    upstream.response_body = {"data": []}
+    body = {"model": "m", "input": [{"content": [dict(TEXT_PART), dict(IMAGE_PART)]}]}
+    status, _ = http_post(adapter.base_url, "/v1/embeddings", body)
+    assert status == 502
+
+
 def test_upstream_http_500_maps_to_generic_502(adapter, upstream):
     upstream.response_status = 500
     status, payload = http_post(adapter.base_url, "/v1/embeddings", mm_body())
     assert status == 502
+    assert "secret-upstream-detail" not in json.dumps(payload)
+
+
+def test_upstream_permanent_400_preserves_client_error(adapter, upstream):
+    upstream.response_status = 400
+    status, payload = http_post(adapter.base_url, "/v1/embeddings", mm_body())
+    assert status == 400
     assert "secret-upstream-detail" not in json.dumps(payload)
 
 
@@ -314,7 +331,7 @@ def test_upstream_timeout_maps_502():
         host="127.0.0.1", port=0, upstream_url=fake.url,
         upstream_timeout_seconds=0.5, max_body_bytes=4096, max_concurrent=2,
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         status, _ = http_post(base, "/v1/embeddings", mm_body())
@@ -329,13 +346,31 @@ def test_upstream_connection_error_maps_502():
         host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
         upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=2,
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         status, _ = http_post(base, "/v1/embeddings", {"model": "m", "input": "x"})
         assert status == 502
     finally:
         server.shutdown(); server.server_close()
+
+
+def test_upstream_response_over_cap_maps_502():
+    fake = FakeUpstream()
+    server = ea.make_server(
+        host="127.0.0.1", port=0, upstream_url=fake.url,
+        upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=1,
+        max_response_body_bytes=128,
+    )
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    ).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        status, _ = http_post(base, "/v1/embeddings", mm_body())
+        assert status == 502
+    finally:
+        server.shutdown(); server.server_close(); fake.close()
 
 
 def test_oversized_body_413(adapter):
@@ -497,7 +532,7 @@ def test_health_ok_without_upstream():
         host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
         upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=2,
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         status, body = http_get(base, "/health")
@@ -516,12 +551,41 @@ def test_ready_503_when_upstream_down():
         host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
         upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=2,
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
         status, _ = http_get(base, "/ready")
         assert status == 503
     finally:
+        server.shutdown(); server.server_close()
+
+
+def test_connection_handler_threads_are_bounded():
+    import socket
+
+    server = ea.make_server(
+        host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
+        upstream_timeout_seconds=1, max_body_bytes=4096, max_concurrent=1,
+        max_connections=2,
+    )
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    ).start()
+    baseline = threading.active_count()
+    clients = []
+    try:
+        for _ in range(4):
+            client = socket.create_connection(("127.0.0.1", server.server_address[1]))
+            # 不发送任何字节,handler 阻塞在 request-line read;关闭时不会产生
+            # 半请求解析/响应 BrokenPipe 噪音。
+            clients.append(client)
+        time.sleep(0.15)
+        # accept 主线程在 connection_slots 上等待,第三/第四连接只留在内核
+        # backlog,不能继续派生 handler 线程。
+        assert threading.active_count() - baseline <= 2
+    finally:
+        for client in clients:
+            client.close()
         server.shutdown(); server.server_close()
 
 
@@ -533,7 +597,7 @@ def test_forward_concurrency_capped_at_two():
         upstream_timeout_seconds=10, max_body_bytes=4096, max_concurrent=2,
         forward_wait_seconds=5,
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     results = []
     start = threading.Barrier(3)
@@ -562,7 +626,7 @@ def test_overload_beyond_wait_rejected():
         upstream_timeout_seconds=10, max_body_bytes=4096, max_concurrent=1,
         forward_wait_seconds=0.2,
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
     results = []
 
@@ -608,6 +672,15 @@ def test_logs_and_upstream_contain_no_body_or_credentials(adapter, upstream):
     assert not any("TOPSECRET" in m for m in records)  # 但不含正文/凭据
     sent_headers = upstream.requests[-1][2]
     assert "Authorization" not in sent_headers  # 不向本地上游转发凭据头
+
+
+def test_upstream_log_origin_strips_userinfo_path_and_query():
+    logged = ea._upstream_log_origin(
+        "http://dummy-user:dummy-password@127.0.0.1:18351/private-path?token=dummy-token"
+    )
+    assert logged == "http://127.0.0.1:18351"
+    for sensitive in ("dummy-user", "dummy-password", "private-path", "dummy-token"):
+        assert sensitive not in logged
 
 
 def test_response_vector_not_logged(adapter, upstream):
@@ -688,5 +761,64 @@ def test_body_read_timeout_is_408_and_closes(adapter, monkeypatch):
             conn.putheader("Content-Length", "0")
             conn.endheaders()
             conn.getresponse()
+    finally:
+        conn.close()
+
+
+def test_slow_drip_body_cannot_exceed_total_deadline(adapter, monkeypatch):
+    import http.client
+
+    monkeypatch.setattr(ea.AdapterHandler, "timeout", 0.15)
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    conn.putrequest("POST", "/v1/embeddings")
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Content-Length", "10")
+    conn.endheaders()
+
+    def drip():
+        try:
+            for _ in range(10):
+                conn.send(b"x")
+                time.sleep(0.03)
+        except OSError:
+            pass
+
+    sender = threading.Thread(target=drip, daemon=True)
+    sender.start()
+    started = time.monotonic()
+    try:
+        resp = conn.getresponse()
+        assert resp.status == 408
+        assert time.monotonic() - started < 1
+        resp.read()
+    finally:
+        conn.close()
+        sender.join(timeout=1)
+
+
+def test_keepalive_restores_header_timeout_after_body_read(adapter, upstream, monkeypatch):
+    import http.client
+
+    monkeypatch.setattr(ea.AdapterHandler, "timeout", 0.3)
+    body = json.dumps({"model": "m", "input": "x"}).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
+    try:
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        # 首轮占去大部分 deadline,使剩余的 socket timeout 小于下一轮等待。
+        for byte in body:
+            conn.send(bytes([byte]))
+            time.sleep(0.2 / len(body))
+        resp = conn.getresponse()
+        assert resp.status == 200
+        resp.read()
+
+        time.sleep(0.2)  # > 首轮剩余 timeout,但 < 恢复后的 0.3s
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        assert resp.status == 200
+        resp.read()
     finally:
         conn.close()

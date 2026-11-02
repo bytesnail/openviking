@@ -2,13 +2,16 @@
 """生成长文本测试夹具(写入 tests/fixtures/longtext/,不入 git,测后删除)。
 
 每个尺寸生成一篇结构化中文长文:多章节、段落内容有变化(避免退化成
-重复文本),并在头部 ~2%、中部 ~50%、尾部 ~98% 三个位置植入唯一可检索
-标记(形如 LT{size}-HEAD/MID/TAIL-{hex}),用于验证超长文档的深层检索。
+重复文本),并在实际字符流头部 ~2%、中部 ~50%、尾部 ~98% 各植入一个唯一
+可检索标记(形如 LT{size}-HEAD/MID/TAIL-{hex}),用于验证超长文档深层检索。
 
-用法:python3 tests/gen_longtext_fixture.py [尺寸字符数 ...](默认 50000 1000000 10000000 20000000)
+用法:python3 tests/gen_longtext_fixture.py [--force] [尺寸字符数 ...]
+默认尺寸 50000 1000000 10000000 20000000;已有文件默认跳过,--force 才重建。
 """
+import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 OUT_DIR = Path(__file__).resolve().parent / "fixtures" / "longtext"
@@ -34,41 +37,70 @@ def marker(size: int, pos: str) -> str:
     return f"独特事实:{tag} 号信标于 2026 年在长文本测试场完成校准,校准码 {tag}-MX。"
 
 
-def gen(size: int) -> Path:
-    rng = random.Random(20261026 + size)
-    chars = 0
-    lines = [f"# 长文本测试文档 {size} 字符", "", marker(size, "HEAD"), ""]
-    i = 0
-    while chars < size:
-        lines.append(f"## 第{i}章 {rng.choice(TOPICS)}的{rng.choice(ADJS)}行为")
-        lines.append("")
-        chap = []
-        for _ in range(rng.randint(3, 6)):
-            chap.append(para(rng, i))
-            chap.append("")
-        block = "\n".join(chap)
-        # 在接近中部时植入中部标记
-        if chars < size * 0.5 <= chars + len(block) + 40:
-            mid = [marker(size, "MID"), ""]
-            block_mid = "\n".join(mid) + block
-            lines.extend(block_mid.split("\n"))
-        else:
-            lines.extend(chap)
-        chars += len(block) + 40
-        i += 1
-    lines.extend([marker(size, "TAIL"), ""])
-    text = "\n".join(lines)
-    # 尾部标记未必恰在 98%,补齐长度后置于末端
-    if len(text) < size:
-        text += "\n" + "补充段落。" * ((size - len(text)) // 6) + "\n" + marker(size, "TAIL2") + "\n"
+def gen(size: int, force: bool = False) -> Path:
+    if size < 1000:
+        raise ValueError("尺寸至少为 1000 字符,才能布置三个深层检索标记")
     out = OUT_DIR / f"longtext-{size//1000}k.md"
+    if out.exists() and not force:
+        print(f"{out.name}: 已存在,跳过(用 --force 重建)")
+        return out
+
+    rng = random.Random(20261026 + size)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text, encoding="utf-8")
-    print(f"{out.name}: {len(text)} chars, {out.stat().st_size} bytes, 章节 {i}")
+    fd, tmp_name = tempfile.mkstemp(dir=str(out.parent), prefix=f".{out.name}.")
+    targets = [("HEAD", 0.02), ("MID", 0.50), ("TAIL", 0.98)]
+    marker_index = 0
+    chars = 0
+    chapters = 0
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            def write_block(block: str) -> None:
+                nonlocal chars, marker_index
+                start = 0
+                while marker_index < len(targets):
+                    pos, fraction = targets[marker_index]
+                    target = int(size * fraction)
+                    remaining = len(block) - start
+                    if not (chars <= target <= chars + remaining):
+                        break
+                    offset = start + target - chars
+                    segment = block[start:offset]
+                    fh.write(segment)
+                    chars += len(segment)
+                    inserted = "\n" + marker(size, pos) + "\n"
+                    fh.write(inserted)
+                    chars += len(inserted)
+                    start = offset
+                    marker_index += 1
+                segment = block[start:]
+                fh.write(segment)
+                chars += len(segment)
+
+            write_block(f"# 长文本测试文档 {size} 字符\n\n")
+            while chars < size:
+                lines = [f"## 第{chapters}章 {rng.choice(TOPICS)}的{rng.choice(ADJS)}行为", ""]
+                for _ in range(rng.randint(3, 6)):
+                    lines.append(para(rng, chapters))
+                    lines.append("")
+                write_block("\n".join(lines) + "\n")
+                chapters += 1
+        if marker_index != len(targets):
+            raise RuntimeError("内部错误:三个检索标记未全部写入")
+        os.replace(tmp_name, out)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    print(f"{out.name}: {chars} chars, {out.stat().st_size} bytes, 章节 {chapters}")
     return out
 
 
 if __name__ == "__main__":
-    sizes = [int(x) for x in sys.argv[1:]] or [50000, 1_000_000, 10_000_000, 20_000_000]
-    for s in sizes:
-        gen(s)
+    args = sys.argv[1:]
+    force = "--force" in args
+    sizes = [int(x) for x in args if x != "--force"] or [50000, 1_000_000, 10_000_000, 20_000_000]
+    for size in sizes:
+        gen(size, force=force)

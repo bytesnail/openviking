@@ -6,8 +6,10 @@
 # role=admin(不是 role=user)。矩阵默认验证 ROOT 与 ADMIN 边界;当
 # state/secrets/test_user_api_key 存在时自动追加 USER 边界行(否则 SKIP)。
 # 密钥只经变量中转并以 curl stdin 配置(-K -)传入,不进入 curl argv(进程
-# 列表不可见);输出仅 HTTP 状态码,不打印/不回显凭据明文,不打印响应体
-# (管理面响应可能含敏感字段)。
+# 列表不可见);curl -q 必须为首个参数,禁止用户 curlrc 的 trace/verbose 泄密;
+# 输出仅 HTTP 状态码,不打印/不回显凭据明文,不打印响应体
+# (管理面响应可能含敏感字段)。本矩阵只验证状态边界,不替代方案 §6.3 的
+# 双向私有读写隔离验收;REQUIRE_USER=1 可把缺失 USER 行变为失败。
 #
 # 预期(源码 openviking/server/auth,docs/en/guides/04-authentication.md):
 #   tenant 数据 API(/api/v1/fs/*)须 User/Admin key;ROOT key 被拒;
@@ -31,12 +33,17 @@ ROOT_KEY=$(python3 -I -B "$ENV_TOOL" get secrets.env OPENVIKING_ROOT_API_KEY) \
 [ -s state/secrets/user_api_key ] || { echo "FAIL-SETUP: state/secrets/user_api_key 缺失或为空(先执行 bootstrap_auth.py)" >&2; exit 1; }
 ADMIN_KEY=$(cat state/secrets/user_api_key)  # default 用户的 key,role=admin
 BASE=${BASE:-http://127.0.0.1:1933}
-code() { curl -s -o /dev/null -w '%{http_code}' -m 15 "$@"; }
+# 本地 ROOT/ADMIN key 只能发往 loopback;BASE 用于恢复/替代端口,不能指向远端。
+if [[ ! "$BASE" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
+  echo "FAIL-SETUP: BASE 仅允许无路径的 http loopback URL" >&2
+  exit 1
+fi
+code() { curl -q -s -o /dev/null -w '%{http_code}' -m 15 "$@"; }
 code_auth() { # code_auth <header 行> <curl 参数...>;header 经 stdin 传入,不进 argv
   local header=$1
   shift
   printf 'header = "%s"\n' "$header" \
-    | curl -s -o /dev/null -w '%{http_code}' -m 15 -K - "$@"
+    | curl -q -s -o /dev/null -w '%{http_code}' -m 15 -K - "$@"
 }
 fails=0
 
@@ -58,7 +65,7 @@ expect "root-key -> fs/ls"       "$(code_auth "X-API-Key: $ROOT_KEY" "$BASE/api/
 expect "root-key -> admin/accts" "$(code_auth "X-API-Key: $ROOT_KEY" "$BASE/api/v1/admin/accounts")"                      200
 expect "admin-key -> admin/accts" "$(code_auth "X-API-Key: $ADMIN_KEY" "$BASE/api/v1/admin/accounts")"                    "401|403"
 # 管理面响应可能含明文 key;code_auth 已 -o /dev/null,不打印响应体。
-expect "admin-key -> admin/users" "$(code_auth "X-API-Key: $ADMIN_KEY" "$BASE/api/v1/admin/accounts/default/users")"       200
+expect "admin-key -> admin/users" "$(code_auth "X-API-Key: $ADMIN_KEY" "$BASE/api/v1/admin/accounts/default/users?include_credentials=false")"       200
 expect "no-key  -> /studio"      "$(code "$BASE/studio")"                                                              200
 
 USER_KEY_FILE=${USER_KEY_FILE:-state/secrets/test_user_api_key}
@@ -68,11 +75,16 @@ if [ -s "$USER_KEY_FILE" ]; then
   expect "user(Bearer) fs"       "$(code_auth "Authorization: Bearer $USER_KEY" "$BASE/api/v1/fs/ls?uri=viking://resources")" 200
   expect "user -> admin/accts"   "$(code_auth "X-API-Key: $USER_KEY" "$BASE/api/v1/admin/accounts")"                     "401|403"
   # v0.5.2.1:USER 不可列 user;升级到允许 USER 列 user 的版本后按版本调整。
-  expect "user -> admin/users"   "$(code_auth "X-API-Key: $USER_KEY" "$BASE/api/v1/admin/accounts/default/users")"       "401|403"
+  expect "user -> admin/users"   "$(code_auth "X-API-Key: $USER_KEY" "$BASE/api/v1/admin/accounts/default/users?include_credentials=false")"       "401|403"
   unset USER_KEY
 else
-  echo "SKIP  USER boundary rows: $USER_KEY_FILE absent (create test per plan §5.1)"
+  if [ "${REQUIRE_USER:-0}" = "1" ]; then
+    echo "FAIL  USER boundary rows required but $USER_KEY_FILE absent (create per plan §6.1)"
+    fails=$((fails+1))
+  else
+    echo "SKIP  USER boundary rows: $USER_KEY_FILE absent (create per plan §6.1; REQUIRE_USER=1 makes this fatal)"
+  fi
 fi
 
 unset ROOT_KEY ADMIN_KEY USER_KEY_FILE
-if [ "$fails" -eq 0 ]; then echo "SUMMARY: all passed"; exit 0; else echo "SUMMARY: $fails failed"; exit 1; fi
+if [ "$fails" -eq 0 ]; then echo "SUMMARY: all executed checks passed"; exit 0; else echo "SUMMARY: $fails failed"; exit 1; fi

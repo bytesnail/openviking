@@ -16,6 +16,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,13 +24,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = logging.getLogger("embedding_adapter")
 LOG.setLevel(logging.INFO)  # 访问日志为 INFO;确保未配置 root handler 时仍可达
+# 模型请求与 readiness 均只访问本机,禁止继承宿主代理发送文本/图片。
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18353
 DEFAULT_UPSTREAM = "http://127.0.0.1:18351/v1/embeddings"
 DEFAULT_TIMEOUT = 120
 DEFAULT_MAX_BODY = 67108864  # 64 MiB
+DEFAULT_MAX_RESPONSE_BODY = 67108864  # 上游 200 响应同样必须有界
 DEFAULT_MAX_CONCURRENT = 2
+DEFAULT_MAX_CONNECTIONS = 16
 DEFAULT_FORWARD_WAIT = 30
 READY_PROBE_TIMEOUT = 3
 
@@ -65,6 +70,42 @@ def _is_wrapped(part):
     return isinstance(part, dict) and isinstance(part.get("content"), list)
 
 
+def _is_wrapped_input(inp):
+    return isinstance(inp, list) and bool(inp) and all(_is_wrapped(x) for x in inp)
+
+
+def single_vector(body):
+    """返回恰好一个有限、非零向量；其他响应一律返回 None。"""
+    if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+        return None
+    if len(body["data"]) != 1 or not isinstance(body["data"][0], dict):
+        return None
+    vector = body["data"][0].get("embedding")
+    if not isinstance(vector, list) or not vector:
+        return None
+    if not all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+        for x in vector
+    ):
+        return None
+    if not any(x != 0 for x in vector):
+        return None  # 全零向量无法归一化,余弦相似度未定义
+    return vector
+
+
+def _upstream_log_origin(url):
+    """日志只保留上游 origin,绝不输出 userinfo、路径或查询参数。"""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        netloc = host + (f":{parts.port}" if parts.port is not None else "")
+        return urllib.parse.urlunsplit((parts.scheme, netloc, "", "", ""))
+    except ValueError:
+        return "invalid-upstream-url"
+
+
 def transform_body(body):
     """按 §3.2 分类并转换请求体;返回 (新请求体, 是否为多模态包装)。
 
@@ -84,7 +125,7 @@ def transform_body(body):
 
     if all(isinstance(x, str) for x in inp):
         return body, False
-    if all(_is_wrapped(x) for x in inp):
+    if _is_wrapped_input(inp):
         return body, False
     if all(_is_text_part(x) or _is_image_part(x) for x in inp):
         return {**body, "input": [{"content": inp}]}, True
@@ -100,14 +141,34 @@ class AdapterServer(ThreadingHTTPServer):
     request_queue_size = 16
 
     def __init__(self, address, upstream_url, upstream_timeout_seconds,
-                 max_body_bytes, max_concurrent, forward_wait_seconds):
+                 max_body_bytes, max_concurrent, forward_wait_seconds,
+                 max_response_body_bytes=DEFAULT_MAX_RESPONSE_BODY,
+                 max_connections=DEFAULT_MAX_CONNECTIONS):
         super().__init__(address, AdapterHandler)
         self.upstream_url = upstream_url
         self.upstream_health_url = _health_url(upstream_url)
         self.upstream_timeout_seconds = upstream_timeout_seconds
         self.max_body_bytes = max_body_bytes
+        self.max_response_body_bytes = max_response_body_bytes
         self.forward_slots = threading.BoundedSemaphore(max_concurrent)
         self.forward_wait_seconds = forward_wait_seconds
+        # ThreadingHTTPServer 默认每连接一个线程;在 accept 主循环中先取连接
+        # 额度,才能把慢 header 连接也纳入硬上限。listen backlog 不是线程上限。
+        self.connection_slots = threading.BoundedSemaphore(max_connections)
+
+    def process_request(self, request, client_address):
+        self.connection_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_slots.release()
 
 
 def _health_url(upstream_url):
@@ -120,8 +181,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
     # headers 与 body 分两次写;不关 Nagle 会在 loopback keep-alive 上触发
     # delayed-ACK,每个响应多约 40ms(实测;socketserver 会设 TCP_NODELAY)。
     disable_nagle_algorithm = True
-    # 入站读超时:声明 Content-Length 后停滞的连接不再永久占住线程
-    # (慢速合法大请求不受影响——超时是按每次 read 计,不是按总时长计)
+    # 入站 socket read 与整体正文 deadline 共用此秒数;每次 read 前按剩余
+    # 时间重设 timeout,慢速合法请求也不能靠逐字节慢滴永久占用额度。
     timeout = 120
 
     # ---- 响应工具:统一 JSON 输出,错误信息一律通用化,不回显上游正文 ----
@@ -140,12 +201,24 @@ class AdapterHandler(BaseHTTPRequestHandler):
         self._send_json(status, {"error": {"message": message, "type": code}})
 
     def log_request(self, code="-", size="-"):
-        LOG.info("%s %s -> %s", self.command, self.path, code)  # 只记方法/路径/状态
+        # 空连接/坏请求行可能在 command/path 赋值前触发日志。
+        LOG.info(
+            "%s %s -> %s",
+            getattr(self, "command", "-"), getattr(self, "path", "-"), code,
+        )
 
     def log_message(self, fmt, *args):
         pass  # 框架其他日志静音,避免默认格式把请求行/地址混入
 
     # ---- 路由 ----
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            # 超时/错误响应后客户端可立即断开;残留字节或后续写响应不应让
+            # socketserver 打 traceback,也不影响其他连接。
+            self.close_connection = True
 
     def do_GET(self):
         # GET 也可能带体;成功响应前不读体,因此统一禁止连接复用。
@@ -190,49 +263,33 @@ class AdapterHandler(BaseHTTPRequestHandler):
             self.close_connection = True  # 正文未读,关闭连接防止 keep-alive 错位
             raise RequestError(503, "overloaded", "adapter concurrency limit reached")
         try:
-            try:
-                raw = self.rfile.read(length)
-            except (socket.timeout, TimeoutError):
-                raise RequestError(408, "request_timeout", "timed out reading request body")
-            if len(raw) != length:
-                raise RequestError(400, "invalid_request", "incomplete request body")
+            raw = self._read_request_body(length)
             try:
                 body = json.loads(raw)
             except (ValueError, UnicodeDecodeError):
                 raise RequestError(400, "invalid_json", "request body is not valid JSON")
 
             out_body, wrapped = transform_body(body)
+            multimodal = wrapped or _is_wrapped_input(body["input"])
             payload = json.dumps(out_body).encode() if wrapped else raw
+            # 上游推理期间只保留实际发送的字节,避免原始字节、JSON 对象图和
+            # 重序列化结果在整个网络调用中同时存活。
+            del raw, body, out_body
             upstream_raw, upstream_status = self._call_upstream(payload)
         finally:
             self.server.forward_slots.release()
 
         if upstream_status != 200:
             LOG.warning("upstream failure status=%d", upstream_status)
-            raise RequestError(502, "upstream_error", "embedding upstream failed")
+            status = upstream_status if 400 <= upstream_status < 500 else 502
+            raise RequestError(status, "upstream_error", "embedding upstream failed")
 
-        if wrapped:
+        if multimodal:
             try:
                 parsed = json.loads(upstream_raw)
             except ValueError:
                 parsed = None
-            vectors = parsed.get("data") if isinstance(parsed, dict) else None
-            vector = None
-            if isinstance(vectors, list) and len(vectors) == 1 and isinstance(vectors[0], dict):
-                vector = vectors[0].get("embedding")
-            valid_vector = (
-                isinstance(vector, list)
-                and bool(vector)
-                and all(
-                    isinstance(x, (int, float))
-                    and not isinstance(x, bool)
-                    and math.isfinite(x)
-                    for x in vector
-                )
-                # 全零向量无法归一化(余弦未定义),与 e2e 探针的判据一致。
-                and any(x != 0 for x in vector)
-            )
-            if not valid_vector:
+            if single_vector(parsed) is None:
                 LOG.warning("multimodal vector response invalid")
                 raise RequestError(
                     502, "upstream_error", "multimodal response must contain exactly one valid vector"
@@ -244,6 +301,42 @@ class AdapterHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(upstream_raw)))
         self.end_headers()
         self.wfile.write(upstream_raw)
+
+    def _read_request_body(self, length):
+        """在总 deadline 内读完声明长度,防止逐字节慢滴永久占用转发额度。"""
+        raw = bytearray(length)
+        view = memoryview(raw)
+        offset = 0
+        deadline = time.monotonic() + self.timeout
+        try:
+            while offset < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RequestError(
+                        408, "request_timeout", "timed out reading request body"
+                    )
+                self.connection.settimeout(remaining)
+                try:
+                    # BufferedReader.readinto 可能为填满整个 slice 连续做多次
+                    # raw read;read1 至多触发一次 raw read,才能在每批字节
+                    # 到达后重新计算整体 deadline。
+                    chunk = self.rfile.read1(min(1024 * 1024, length - offset))
+                except (socket.timeout, TimeoutError):
+                    raise RequestError(
+                        408, "request_timeout", "timed out reading request body"
+                    )
+                if not chunk:
+                    break
+                view[offset:offset + len(chunk)] = chunk
+                offset += len(chunk)
+        finally:
+            view.release()
+            # read1 前按剩余 deadline 缩短了 socket timeout;完整读取后必须
+            # 恢复,否则 keep-alive 下一请求会继承接近 0 的 header 超时。
+            self.connection.settimeout(self.timeout)
+        if offset != length:
+            raise RequestError(400, "invalid_request", "incomplete request body")
+        return raw
 
     def _acquire_slot(self):
         return self.server.forward_slots.acquire(timeout=self.server.forward_wait_seconds)
@@ -281,10 +374,15 @@ class AdapterHandler(BaseHTTPRequestHandler):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(
+            with _DIRECT_OPENER.open(
                 req, timeout=self.server.upstream_timeout_seconds
             ) as resp:
-                return resp.read(), resp.status
+                raw = resp.read(self.server.max_response_body_bytes + 1)
+                if len(raw) > self.server.max_response_body_bytes:
+                    raise RequestError(
+                        502, "upstream_error", "embedding upstream response exceeds limit"
+                    )
+                return raw, resp.status
         except urllib.error.HTTPError as err:
             err.close()
             return None, err.code
@@ -296,7 +394,7 @@ class AdapterHandler(BaseHTTPRequestHandler):
 
     def _upstream_healthy(self):
         try:
-            with urllib.request.urlopen(
+            with _DIRECT_OPENER.open(
                 self.server.upstream_health_url, timeout=READY_PROBE_TIMEOUT
             ) as resp:
                 return 200 <= resp.status < 300
@@ -308,10 +406,13 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, upstream_url=DEFAULT_UPSTR
                 upstream_timeout_seconds=DEFAULT_TIMEOUT,
                 max_body_bytes=DEFAULT_MAX_BODY,
                 max_concurrent=DEFAULT_MAX_CONCURRENT,
-                forward_wait_seconds=DEFAULT_FORWARD_WAIT):
+                forward_wait_seconds=DEFAULT_FORWARD_WAIT,
+                max_response_body_bytes=DEFAULT_MAX_RESPONSE_BODY,
+                max_connections=DEFAULT_MAX_CONNECTIONS):
     return AdapterServer(
         (host, port), upstream_url, upstream_timeout_seconds,
         max_body_bytes, max_concurrent, forward_wait_seconds,
+        max_response_body_bytes, max_connections,
     )
 
 
@@ -330,10 +431,17 @@ def main():
         ),
         max_body_bytes=int(os.environ.get("EMBEDDING_MAX_BODY_BYTES", DEFAULT_MAX_BODY)),
         max_concurrent=int(os.environ.get("EMBEDDING_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT)),
+        max_response_body_bytes=int(os.environ.get(
+            "EMBEDDING_MAX_RESPONSE_BODY_BYTES", DEFAULT_MAX_RESPONSE_BODY
+        )),
+        max_connections=int(os.environ.get(
+            "EMBEDDING_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS
+        )),
     )
     LOG.info(
         "listening host=%s port=%d upstream=%s",
-        server.server_address[0], server.server_address[1], server.upstream_url,
+        server.server_address[0], server.server_address[1],
+        _upstream_log_origin(server.upstream_url),
     )
     try:
         server.serve_forever()
