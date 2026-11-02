@@ -50,6 +50,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
+# 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
+# scripts/embedding_adapter.py 各有一份(python -I 隔离运行,无法共享 import);
+# 对此处的任何加固必须同步另外两份,tests/test_env_file.py 有行为一致性断言。
 
 
 def _direct_urlopen(request, timeout):
@@ -191,9 +194,9 @@ def _load_cli_config(path):
     return cfg if isinstance(cfg, dict) else None
 
 
-def _cli_config_matches(path, base_url, root_key, user_key):
-    cfg = _load_cli_config(path)
-    if cfg is None:
+def _cfg_matches(cfg, base_url, root_key, user_key):
+    """对已解析的配置 dict 做一致性判定;None/非 dict 一律不匹配。"""
+    if not isinstance(cfg, dict):
         return False
     configured_url = cfg.get("url") or DEFAULT_BASE_URL
     return (
@@ -204,47 +207,56 @@ def _cli_config_matches(path, base_url, root_key, user_key):
     )
 
 
+def _cli_config_matches(path, base_url, root_key, user_key):
+    return _cfg_matches(_load_cli_config(path), base_url, root_key, user_key)
+
+
 def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env,
-                  base_url=DEFAULT_BASE_URL) -> bool:
+                  base_url=DEFAULT_BASE_URL) -> str:
+    """三态判定:"ok" / "invalid"(凭据或配置不符)/ "timeout"(ov 超时)。
+
+    超时(_run_ov 折叠为 returncode 124)不等于凭据无效,调用方必须区别
+    处理,不得把有效密钥推向人工轮换(2026-11-03 检视)。
+    """
     proc = _run_ov(
         ov_bin, ["health", "-o", "json"], cli_config_path, root_key, user_key, env
     )
+    if proc.returncode == 124:
+        return "timeout"
     if proc.returncode != 0:
-        return False
+        return "invalid"
     try:
         payload = json.loads(proc.stdout.decode() or "null")
     except ValueError:
-        return False
+        return "invalid"
     if not isinstance(payload, dict):
-        return False
-    # 真实 CLI 输出为 {"ok":true,"result":{"healthy":true,...}};兼容顶层形态。
+        return "invalid"
+    # 真实 CLI 输出恒为 {"ok":true,"result":{...}};顶层形态无生产者、无测试
+    # 覆盖,按 fail-closed 只认文档化信封,不做猜测兼容(2026-11-03 检视)。
     # healthy 只是服务健康,必须同时核对认证身份,避免无 key/错 user 假通过。
     result = payload.get("result")
-    healthy = payload.get("healthy")
-    identity = payload
-    if isinstance(result, dict):
-        healthy = result.get("healthy", healthy)
-        identity = result
+    if not isinstance(result, dict):
+        return "invalid"
     # 仅核对 account/user 不够:ROOT key 也会返回 account_id/user_id=default。
     # 必须排除 role=root,并确认 CLI 配置里存的就是本地 user key(而不是
     # CLI 在 api_key 缺失时回退到 root_api_key)。
     if not (
-        healthy is True
-        and identity.get("account_id") == "default"
-        and identity.get("user_id") == "default"
-        and identity.get("role") == "admin"
+        result.get("healthy") is True
+        and result.get("account_id") == "default"
+        and result.get("user_id") == "default"
+        and result.get("role") == "admin"
     ):
-        return False
+        return "invalid"
     if not _cli_config_matches(cli_config_path, base_url, root_key, user_key):
-        return False
+        return "invalid"
     saved_path = _saved_profile_path(cli_config_path)
     # active 健康不能证明 saved profile 没漂移;否则 config switch local 会
     # 静默恢复旧服务器、旧 key 或错误身份。
     if os.path.exists(saved_path) and not _cli_config_matches(
         saved_path, base_url, root_key, user_key
     ):
-        return False
-    return True
+        return "invalid"
+    return "ok"
 
 
 def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
@@ -279,15 +291,11 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
         # saved 与本地 key、root 及目标 URL 全部一致时才原子恢复 active;
         # 不一致的 saved 可能是唯一新凭据,绝不能覆盖或拿来强建 active。
         saved_path = _saved_profile_path(cli_config_path)
-        if _cli_config_matches(saved_path, base_url, root_key, stored_key) \
+        # 单次读取即得判决与内容:重复解析会让"读取/解析失败"分支在稳定
+        # 文件上不可达(2026-11-03 检视)。
+        saved_cfg = _load_cli_config(saved_path)
+        if _cfg_matches(saved_cfg, base_url, root_key, stored_key) \
                 and not _cli_config_matches(cli_config_path, base_url, root_key, stored_key):
-            saved_cfg = _load_cli_config(saved_path)
-            if saved_cfg is None:
-                print(
-                    "错误:从 saved profile 恢复 ovcli.conf 失败(读取/解析失败)",
-                    file=sys.stderr,
-                )
-                return RC_MANUAL_RECOVERY
             try:
                 _atomic_write_secret(Path(cli_config_path), json.dumps(saved_cfg))
                 cli_cfg_exists = True
@@ -302,14 +310,21 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             # 部分恢复可能只缺 ovcli.settings.conf;CLI 的显示语言门禁会让
             # `ov health` 在发请求前退出。必须先尽力重建语言设置,否则会把
             # 有效凭据误报为"认证无效"。
-            _ensure_cli_language(
+            _warn_if_language_setup_failed(_ensure_cli_language(
                 ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
-            )
+            ))
             # 先做身份/漂移核查,再做任何写回(含 timeout 修补):漂移的
             # saved profile 必须原样保留现场,不得先追加字段后报错。
-            if not _ov_health_ok(
+            health = _ov_health_ok(
                 ov_bin, cli_config_path, root_key, stored_key, env, base_url=base_url
-            ):
+            )
+            if health == "timeout":
+                print(
+                    "错误:ov health 超时被终止;凭据未受质疑,待负载恢复后重跑即可",
+                    file=sys.stderr,
+                )
+                return RC_UPSTREAM
+            if health != "ok":
                 if not _server_reachable(base_url):
                     print(
                         "错误:服务暂不可达(连接失败),非凭据问题;"
@@ -398,20 +413,32 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
 
 
 def _ensure_cli_language(ov_bin, env):
-    """真实 CLI 首跑要求显示语言;尽力设置,失败不阻断(已有设置时幂等)。
+    """真实 CLI 首跑要求显示语言;尽力设置,返回 CompletedProcess(或 None)。
 
-    env 由调用方保证已含 OPENVIKING_CLI_CONFIG_FILE。
+    env 由调用方保证已含 OPENVIKING_CLI_CONFIG_FILE。已有设置时幂等。
     """
     try:
-        subprocess.run(
+        return subprocess.run(
             [ov_bin, "language", "zh-CN"],
             env=env,
             capture_output=True,
             timeout=30,
             check=False,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"警告:ov language 设置未能执行({type(exc).__name__})", file=sys.stderr)
+        return None
+
+
+def _warn_if_language_setup_failed(proc):
+    """语言设置失败不阻断,但必须留下诊断线索:否则 HOME 不可写等环境问题
+    会在后续健康检查处被误读为凭据无效(2026-11-03 检视)。"""
+    if proc is not None and proc.returncode != 0:
+        print(
+            f"警告:ov language 设置失败(exit={proc.returncode});"
+            "若 CLI 语言门禁未通过,健康检查可能误报凭据无效",
+            file=sys.stderr,
+        )
 
 
 def _ensure_timeout_file(path, timeout=300):
@@ -421,17 +448,11 @@ def _ensure_timeout_file(path, timeout=300):
     上报,不能让健康检查掩盖缺失的 timeout。
     """
     name = os.path.basename(path)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            cfg = json.load(fh)
-    except (OSError, ValueError) as exc:
-        print(
-            f"错误:读取/解析 {name} 失败({type(exc).__name__}),无法确保 timeout",
-            file=sys.stderr,
-        )
-        return False
-    if not isinstance(cfg, dict):
-        print(f"错误:{name} 顶层不是对象,无法确保 timeout", file=sys.stderr)
+    # 与 _load_cli_config 同一解析实现,防止两处读取语义各自漂移
+    # (2026-11-03 检视;原先此处另写了一份守卫式 json.load)。
+    cfg = _load_cli_config(path)
+    if cfg is None:
+        print(f"错误:读取/解析 {name} 失败,无法确保 timeout", file=sys.stderr)
         return False
     current = cfg.get("timeout")
     try:
@@ -483,7 +504,9 @@ def _ensure_cli_timeout(cli_config_path, timeout=300):
 
 
 def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
-    _ensure_cli_language(ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path})
+    _warn_if_language_setup_failed(_ensure_cli_language(
+        ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
+    ))
     args = [
         "config", "add", "custom",
         "--name", CLI_PROFILE_NAME,
@@ -521,9 +544,16 @@ def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
     if not _ensure_cli_timeout(cli_config_path):
         return RC_CLI_CONFIG
 
-    if not _ov_health_ok(
+    health = _ov_health_ok(
         ov_bin, cli_config_path, root_key, user_key, env, base_url=base_url
-    ):
+    )
+    if health == "timeout":
+        print(
+            "错误:ov health 验证超时;user key 与配置已写入,待服务恢复后重跑幂等验证",
+            file=sys.stderr,
+        )
+        return RC_UPSTREAM
+    if health != "ok":
         print("错误:ov health 验证未通过(healthy/account/user 不符合预期)", file=sys.stderr)
         return RC_AUTH_VERIFY
     print("认证初始化完成:ovcli.conf(600)写入,default/default healthy=true")

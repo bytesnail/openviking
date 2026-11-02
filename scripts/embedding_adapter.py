@@ -41,6 +41,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
+# 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
+# scripts/bootstrap_auth.py 各有一份(python -I 隔离运行,无法共享 import);
+# 对此处的任何加固必须同步另外两份,tests/test_env_file.py 有行为一致性断言。
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18353
@@ -98,6 +101,9 @@ def single_vector(body):
     vector = body["data"][0].get("embedding")
     if not isinstance(vector, list) or not vector:
         return None
+    # 同型"有限数值"判定在 scripts/smoke_models.py(_valid_rerank_scores)与
+    # scripts/bootstrap_auth.py(_ensure_timeout_file)各有一份(-I 隔离运行);
+    # 修改溢出/布尔排除等语义须三处同步。
     try:
         finite = all(
             isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
@@ -127,8 +133,12 @@ def _upstream_log_origin(url):
 
 
 def transform_body(body):
-    """按 §3.2 分类并转换请求体;返回 (新请求体, 是否为多模态包装)。
+    """按 §3.2 分类并转换请求体;返回 (新请求体, 是否需校验单向量契约)。
 
+    需校验单向量:裸 parts 多模态与单项已包装输入(上游必须恰好返回一个
+    向量);纯文本与文本批处理不需要。passthrough 路径原样返回 body 本体,
+    调用方按对象身份区分"未改写"与"已包装",不再二次推导分类
+    (2026-11-03 检视)。
     拒绝(RequestError):非对象、缺 input、input 非字符串/列表、空列表、
     混合形态、含不支持 part 类型或字段非法、多项 wrapped 批量输入。
     不猜测转换。
@@ -157,7 +167,7 @@ def transform_body(body):
                 "unsupported_input",
                 "wrapped input must contain exactly one item",
             )
-        return body, False
+        return body, True
     if all(_is_text_part(x) or _is_image_part(x) for x in inp):
         return {**body, "input": [{"content": inp}]}, True
     raise RequestError(
@@ -215,6 +225,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
     # 入站 socket read 与整体正文 deadline 共用此秒数;每次 read 前按剩余
     # 时间重设 timeout,慢速合法请求也不能靠逐字节慢滴永久占用额度。
     timeout = 120
+    # 已读入的声明正文字节数(finish 时有界排水用;见 _drain_unread_body)。
+    _body_bytes_read = 0
 
     # ---- 响应工具:统一 JSON 输出,错误信息一律通用化,不回显上游正文 ----
 
@@ -237,10 +249,13 @@ class AdapterHandler(BaseHTTPRequestHandler):
                         close=True)
 
     def log_request(self, code="-", size="-"):
-        # 空连接/坏请求行可能在 command/path 赋值前触发日志。
+        # 空连接/坏请求行可能在 command/path 赋值前触发日志。查询串属于请求
+        # 内容(可能携带凭据),日志只保留去查询串的路径(2026-11-03 检视)。
         LOG.info(
             "%s %s -> %s",
-            getattr(self, "command", "-"), getattr(self, "path", "-"), code,
+            getattr(self, "command", "-"),
+            getattr(self, "path", "-").split("?", 1)[0],
+            code,
         )
 
     def log_message(self, fmt, *args):
@@ -251,9 +266,11 @@ class AdapterHandler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (BrokenPipeError, ConnectionResetError):
-            # 超时/错误响应后客户端可立即断开;残留字节或后续写响应不应让
-            # socketserver 打 traceback,也不影响其他连接。
+        except (TimeoutError, BrokenPipeError, ConnectionResetError,
+                ConnectionAbortedError):
+            # 超时/错误响应后客户端可立即断开;残留字节或后续写响应(含对已
+            # 关闭 socket 的写超时)不应让 socketserver 打 traceback,也不
+            # 影响其他连接。
             self.close_connection = True
 
     def do_GET(self):
@@ -287,6 +304,13 @@ class AdapterHandler(BaseHTTPRequestHandler):
             LOG.warning("rejected status=%d code=%s", exc.status, exc.code)
             self._send_error_json(exc.status, exc.code, exc.message)
         except Exception:
+            # 响应已开始写出后绝不能再写第二个状态行(客户端会收到 200 头 +
+            # 截断正文 + 内嵌 500 块的损坏流);只能记录并关闭连接
+            # (2026-11-03 检视)。
+            if getattr(self, "_response_started", False):
+                LOG.exception("internal_error_after_response_started")
+                self.close_connection = True
+                return
             LOG.exception("internal_error")
             self._send_error_json(500, "internal_error", "adapter internal error")
 
@@ -306,9 +330,10 @@ class AdapterHandler(BaseHTTPRequestHandler):
             except (ValueError, UnicodeDecodeError):
                 raise RequestError(400, "invalid_json", "request body is not valid JSON")
 
-            out_body, wrapped = transform_body(body)
-            multimodal = wrapped or _is_wrapped_input(body["input"])
-            payload = json.dumps(out_body).encode() if wrapped else raw
+            out_body, needs_single_vector = transform_body(body)
+            # passthrough 路径原样返回 body 本体:按对象身份选择转发字节,
+            # 免二次序列化;输入分类只此一处,调用点不再重新推导。
+            payload = raw if out_body is body else json.dumps(out_body).encode()
             # 上游推理期间只保留实际发送的字节,避免原始字节、JSON 对象图和
             # 重序列化结果在整个网络调用中同时存活。
             del raw, body, out_body
@@ -321,7 +346,7 @@ class AdapterHandler(BaseHTTPRequestHandler):
             status = upstream_status if 400 <= upstream_status < 500 else 502
             raise RequestError(status, "upstream_error", "embedding upstream failed")
 
-        if multimodal:
+        if needs_single_vector:
             try:
                 parsed = json.loads(upstream_raw)
             except ValueError:
@@ -333,6 +358,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
                 )
             # 校验通过后原样转发上游字节,不再解析-重序列化(保真且省一遍开销)
 
+        # 标记响应已开始:此后任何异常都不得再写第二份状态行(见 do_POST)。
+        self._response_started = True
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(upstream_raw)))
@@ -368,12 +395,47 @@ class AdapterHandler(BaseHTTPRequestHandler):
                 offset += len(chunk)
         finally:
             view.release()
+            self._body_bytes_read = offset
             # read1 前按剩余 deadline 缩短了 socket timeout;完整读取后必须
             # 恢复,否则 keep-alive 下一请求会继承接近 0 的 header 超时。
             self.connection.settimeout(self.timeout)
         if offset != length:
             raise RequestError(400, "invalid_request", "incomplete request body")
         return raw
+
+    def finish(self):
+        # 拒绝路径未读请求体就关闭:接收缓冲留有未读字节时,内核会以 RST
+        # 代替 FIN 关闭,已写出的错误响应可能被客户端整包丢弃(上层只见
+        # "连接被重置"而非 413/503)。有界排水排掉常见小残留;超大流式
+        # 正文仍有 RST 残余,属可接受边界(2026-11-03 检视)。
+        if self.close_connection:
+            self._drain_unread_body()
+        super().finish()
+
+    def _drain_unread_body(self):
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return
+        try:
+            length_headers = headers.get_all("Content-Length") or []
+            if len(length_headers) != 1:
+                return
+            header = length_headers[0]
+            if not (header.isascii() and header.isdigit()):
+                return
+            remaining = max(0, int(header) - self._body_bytes_read)
+            if not remaining:
+                return
+            cap = min(remaining, 262144)  # 至多 256 KiB / ~1s:不为恶意大正文买单
+            deadline = time.monotonic() + 1.0
+            self.connection.settimeout(1.0)
+            while cap > 0 and time.monotonic() < deadline:
+                chunk = self.connection.recv(min(65536, cap))
+                if not chunk:
+                    break
+                cap -= len(chunk)
+        except OSError:
+            pass
 
     def _acquire_slot(self):
         return self.server.forward_slots.acquire(timeout=self.server.forward_wait_seconds)
@@ -392,11 +454,12 @@ class AdapterHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise RequestError(400, "invalid_request", "exactly one Content-Length is required")
         length_header = length_headers[0]
-        try:
-            length = int(length_header)
-        except ValueError:
+        # RFC 9110 只允许纯 ASCII 数字;int() 还会接受 "+5"/" 5"/Unicode
+        # 十进制数字/下划线分组,必须收紧到与严格头语法一致(2026-11-03 检视)。
+        if not (length_header.isascii() and length_header.isdigit()):
             self.close_connection = True
             raise RequestError(400, "invalid_request", "invalid Content-Length")
+        length = int(length_header)
         if length < 0 or length > self.server.max_body_bytes:
             self.close_connection = True
             raise RequestError(413, "payload_too_large", "request body exceeds limit")

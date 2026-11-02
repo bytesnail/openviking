@@ -28,6 +28,14 @@
 
 ## 2. 官方机制取证结论(v0.5.2.1 镜像内源码 + docs.openviking.ai,2026-11-01)
 
+> 取证说明(2026-11-03 检视补充):§2.1/§2.2 中标注"实测"的行为(/mcp
+> 工具清单与"24 工具"计数、root key 数据面 401/403、`_is_accessible()` 的
+> ROOT 放行路径、插件 hooks/skills 构成、市场与包名)来自 2026-11-01 容器内
+> 会话实测,当时未单独落盘报告;已落盘的复核文档为
+> docs/research/2026-10-25-* 与 2026-11-* 两批(后者覆盖 §2.4 与统一安装器)。
+> 引用"24 工具"等具体数字时须以当次 `/mcp` tools/list 实测为准,服务端
+> 升级后不得沿用旧值。
+
 ### 2.1 命名空间与隔离模型
 
 - 三级身份:account(完全隔离)→ user(同账户普通 user 互不可见)→ peer(请求级视图过滤)。
@@ -174,7 +182,10 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
    **统一使用 `state/secrets/test_user_api_key` + direct curl**,密钥必须经变量
    中转与 curl stdin 配置(`-K -`)传入,不得进 argv;curl 首参为 `-q` 禁用
    用户 curlrc,默认丢弃响应体,只输出状态/非敏感指标。不得另写裸
-   `curl -H "X-API-Key: $KEY"`;新测试应抽取并复用认证矩阵的 `code_auth` 机制。
+   `curl -H "X-API-Key: $KEY"`;新测试应复用认证矩阵的 `code_auth` 模式(密钥经
+   stdin `-K -` 传入 curl)。抽取目标必须是**不含任何密钥加载逻辑的可 source
+   库**(如 `tests/curl_auth.sh`),不得 source 可执行矩阵脚本本身——那会执行
+   整个矩阵并把 ROOT/ADMIN key 载入新测试的环境(2026-11-03 检视补充)。
    部署 doctor/smoke 与认证矩阵中明确需要 default/root 的部署验收、认证边界
    检查是例外,但不得写真实使用数据。test 默认不创建持久 CLI active/saved
    profile,避免 key 文件之外再多两份需同步轮换的凭据;身份健康检查只用
@@ -210,14 +221,20 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
   `docker compose exec -T -e OPENVIKING_CLI_CONFIG_FILE=/app/.openviking/ovcli.test.conf openviking ov health -o json`。
   必须核对输出的 `user_id=test`、`account_id=default`、`role=user`;不得依赖
   宿主环境变量、容器默认配置或不完整的 `docker compose exec -e ...` 片段。
-- 临时配置的落盘位置(2026-11-02 检视补充):上例把配置放进
+- 临时配置的落盘位置(2026-11-02 检视补充;2026-11-03 修正):上例把配置放进
   `/app/.openviking/`(宿主 `state/`)虽可工作,但崩溃/中断会把明文 test key
   残留进 `state/`,并随其后每次 tar 备份长期扩散——恰好重新引入 §4 以
   "test 不再维护持久 CLI 副本"消除的多副本漂移。helper 应优先经
   `docker compose exec -T openviking sh -c 'cat > /tmp/ovcli.test.conf && chmod 600 ...'`
-  从 stdin 把配置写进容器 tmpfs(不进 `state/`、不进备份);退而求其次才用
-  `state/` 内临时文件,且必须:验收后立即删除并核对、崩溃后重跑前先清理
-  残留、轮换 test key 时同步清理此类副本。
+  从 stdin 把配置写进容器 `/tmp`(不进 `state/`、不进备份)。**注意:当前
+  compose 的 openviking service 未配置 tmpfs(仅 embedding-adapter 有),
+  其 `/tmp` 是容器 overlay 可写层——`docker compose restart` 后仍在,容器
+  重建才消失(2026-11-03 检视核实 compose.yaml);"内存级随容器消失"不
+  成立**,若需真正的 tmpfs 须在执行时一并给该 service 增加 tmpfs 挂载
+  (属执行期变更)。无论哪种位置都必须:验收后立即删除并核对、崩溃后重跑
+  前先清理残留、轮换 test key 时同步清理此类副本;`/tmp` 方案还须注意其
+  残留窗口横跨 restart。退而求其次才用 `state/` 内临时文件(同样受上述
+  清理纪律约束,且会随备份扩散)。
 - 若需要抵御测试脚本误用或同 UID 进程读取,须把测试运行器放入独立 OS 用户
   或容器,仅挂载 test key,不挂载 default key/users.json;本方案当前未实施
   该 OS 级隔离,相关验收不得宣称"对任何身份零影响"。
@@ -239,14 +256,32 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
    该副本。
 2. 参数化复用 `bootstrap_auth._ov_health_ok` 的 JSON envelope、root-fallback 与
    key/URL 一致性检查(预期 account/user/role 及 root key 是否必需必须作为参数,
-   不能原样硬调 default/admin helper)。除身份断言外,还须参数化 helper 内两处
-   与 default 部署绑定的硬编码(2026-11-02 检视补充):其一,`_saved_profile_path`
-   固定拼同目录 `ovcli.conf.local`——test 临时配置与 default 配置同目录,原样
-   复用会把 default 的 saved profile 当作 test 的漂移检查对象而恒判失败,其自身
-   真正的漂移反而漏检;其二,`_cli_config_matches` 强制要求配置含与目标一致的
+   不能原样硬调 default/admin helper)。除身份断言外,还须参数化 helper 内多处
+   与 default 部署绑定的硬编码(2026-11-02 检视补充,2026-11-03 补全):
+   其一,`_saved_profile_path` 固定拼同目录 `ovcli.conf.local`——当临时配置与
+   default 配置同目录(如 `/app/.openviking/`)时,原样复用会把 default 的
+   saved profile 当作 test 的漂移检查对象而恒判失败,test 自身真正的漂移反而
+   漏检;而按 §5.5 优先位置放 `/tmp` 时,该路径下不存在任何 saved profile,
+   此检查对 test 临时配置无对象可查,属预期跳过(default 自身的 saved 检查
+   仍由 bootstrap 幂等路径负责)——参数化 helper 必须显式接收"saved profile
+   检查对象"参数,不得隐式拼路径,也不得为"可检查"而反向把临时配置改放
+   `state/`;
+   其二,`_cli_config_matches` 强制要求配置含与目标一致的
    `root_api_key`——§5.5 的临时配置只含 test key,且 §2.4 明令 root key 不得
    放进测试夹具,故该比较必须按身份设为可选,不能为实现"通过检查"而在临时
-   配置写入 root key。test 健康检查用临时 600 配置且完成后删除。
+   配置写入 root key;
+   其三,`_configure_cli`/`CLI_PROFILE_NAME` 固定 `local`——若按 §5.1 的
+   "专项 CLI 测试确需持久配置"复用 config add,profile 名必须可传独立值,
+   否则 `ov config add --name local` 会覆盖 default 的 saved profile
+   `state/ovcli.conf.local`(README 既有警告;2026-11-03 补全);
+   其四,`_cli_config_matches` 对缺 `url` 的配置静默代入
+   `DEFAULT_BASE_URL`——临时配置必须显式含 `url`,该默认代入不得带入
+   参数化 helper(2026-11-03 补全);
+   另注意 CLI 显示语言门禁读取的是
+   `$HOME/.openviking/ovcli.settings.conf`(与 `OPENVIKING_CLI_CONFIG_FILE`
+   路径无关;default bootstrap 已建立该文件,2026-10-26 测试报告 F4 核实)——
+   若 helper 在全新 HOME 下运行须先重建语言设置,否则 `ov health` 会在发请求
+   前退出,被误读为身份不符。test 健康检查用临时 600 配置且完成后删除。
    `ov health -o json` 分别以 default 与 test 身份验证,除 `healthy=true` 外必须
    断言 `result.account_id=default`、`result.user_id` 分别为 `default`/`test`,
    且 `result.role` 为 `admin`/`user`(**`role=root` 判失败**:root-only 配置
@@ -264,7 +299,12 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
    骨架;若已按 README 清理,以当次输出为准),验收后比对两者,不得假定
    基线为空。**双向验证结束后必须删除 default 与 test 的专用私有夹具并核对
    删除结果**,不得只在共享区做清理而把测试残留留在 default 私有区。
-4. README 增补三身份表、key 位置与测试纪律;引用本方案文档。
+4. README 增补三身份表、key 位置与测试纪律;引用本方案文档。同步改写
+   README 既有行中与本文冲突的指引:"认证凭据位置"一节"创建 test 配置时
+   不要用 `--name local`……应使用独立 name"的持久 test profile 用法
+   (本文 §4/§5.1 已改为默认临时 600 配置 + 验收后删除),验收时以本文
+   为准(2026-11-03 检视:批准前两文并存相反默认,按 README 行事会绕过
+   本文的多副本治理)。
 5. (独立后续,另行批准)root key 创建 `meteor`(role=user),双向验证其与 test
    均不可读取对方私有区,并清理双方专用夹具。宿主安装前先以不输出值的 JSON
    字段检查确认 `~/.openviking/ovcli.conf` **不含 `root_api_key`**;若旧配置含有,
@@ -301,10 +341,19 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
 
 ## 8. 方案修正记录(避免回退)
 
+- 2026-11-03 全项目检视修正(仅文档,不执行):§5.5 修正"容器 tmpfs"事实
+  (openviking service 未配 tmpfs,`/tmp` 为可写层,restart 后残留);§6.2
+  硬编码清单补全(CLI_PROFILE_NAME、DEFAULT_BASE_URL 静默代入、语言门禁
+  位置)并明确 /tmp 位置下 saved-profile 检查的预期跳过语义;§5.1 明确
+  `code_auth` 的抽取目标与禁 source 矩阵脚本;§2 增补未落盘实测的取证
+  说明;§6.4 列出 README 冲突行清单。同批脚本侧修复
+  (`_ov_health_ok` 移除无依据顶层信封回退、改三态返回并把 ov 超时判为
+  RC_UPSTREAM、`_cli_config_matches` 拆纯谓词消除双重解析)见当次提交。
 - 2026-11-02 检视修正(仅文档与实现预核,不执行):§6.2 补齐 `_ov_health_ok`
   helper 两处与 default 绑定的硬编码(saved profile 固定名 `ovcli.conf.local`、
   `root_api_key` 强制比较)的参数化要求;§5.5 增加临时 test 配置不得残留
-  `state/`(优先容器 tmpfs,防崩溃残留随备份扩散)的机制要求;§6.1 明确
+  `state/`(优先容器 /tmp,防崩溃残留随备份扩散;2026-11-03 修正其存储
+  性质表述)的机制要求;§6.1 明确
   参数化需当场修改 `bootstrap_auth.py` 且属批准范围内的实现工作。
 - 2026-11-02 全项目复核:明确同账户/同 UID 方案不满足绝对"完全分离";test
   默认只保留 key 文件并使用安全 direct curl,健康检查用临时配置;补齐完整

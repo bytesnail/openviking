@@ -24,6 +24,13 @@ _IMAGE_NEGATION = re.compile(_NEGATION.pattern + r"|不红|不紅|非红|非紅|
 _MULTI_DIGIT = re.compile(r"\d{2,}")
 _STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
 _ENGLISH_TWO = re.compile(r"(?<![a-z-])two(?![a-z-])")
+# 中文"二/兩/两"必须独立出现:前后紧邻其他中文数字(或点)说明是别的数
+# (十二/二十/二零二五/二点五),不得因子串含"二"误判为正确答案
+# (2026-11-03 检视;_MULTI_DIGIT 只匹配 ASCII \d,管不住中文数字)。
+_CN_NUMERAL_CONTEXT = "零〇○一二兩两三四五六七八九十百千万亿点0-9"
+_STANDALONE_CN_TWO = re.compile(
+    f"(?<![{_CN_NUMERAL_CONTEXT}])[二兩两](?![{_CN_NUMERAL_CONTEXT}])"
+)
 _RED_WORD = re.compile(r"\bred\b")
 
 
@@ -46,7 +53,7 @@ def _text_answer_ok(text):
     return (
         _STANDALONE_TWO.search(normalized) is not None
         or _ENGLISH_TWO.search(normalized) is not None
-        or any(token in normalized for token in ("二", "兩", "两"))
+        or _STANDALONE_CN_TWO.search(normalized) is not None
     )
 
 
@@ -70,6 +77,9 @@ def _image_answer_ok(text):
 def _valid_rerank_scores(scores):
     if not (isinstance(scores, (list, tuple)) and len(scores) == 2):
         return False
+    # 同型"有限数值"判定在 scripts/embedding_adapter.py(single_vector)与
+    # scripts/bootstrap_auth.py(_ensure_timeout_file)各有一份(-I 隔离运行);
+    # 修改溢出/布尔排除等语义须三处同步。
     try:
         return all(
             isinstance(score, (int, float))
@@ -170,12 +180,15 @@ def main():
         return 1
     failures = []
     print("smoke_models: 开始(会发起 2 次 GLM 真实调用与 1 次 rerank 真实请求)")
-    # VLM client 的 lazy init 非线程安全,先在主线程完成;三个探针互不依赖,
-    # 有界并发只缩短墙钟,不增加请求数/token。各自使用独立失败列表保序汇总。
+    # VLM client 的 lazy init 非线程安全,先在主线程完成;预热失败时改为
+    # 串行执行全部探针,避免两个 VLM 探针并发撞上未初始化的共享 client——
+    # 静默吞掉预热失败只会把这道防线变成竞态本身(2026-11-03 检视)。
+    # 各探针沿用原有错误分类与输出纪律;串行只发生在预热失败的退化路径。
     try:
         cfg.vlm.get_vlm_instance()
+        vlm_ready = True
     except Exception:
-        pass  # 让各探针沿用原有错误分类与输出纪律
+        vlm_ready = False
 
     def run_probe(probe, arg):
         local_failures = []
@@ -187,10 +200,14 @@ def main():
         (smoke_vlm_image, cfg.vlm),
         (smoke_rerank, cfg.rerank),
     ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        futures = [executor.submit(run_probe, probe, arg) for probe, arg in probes]
-        for future in futures:
-            failures.extend(future.result())
+    if vlm_ready:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(run_probe, probe, arg) for probe, arg in probes]
+            for future in futures:
+                failures.extend(future.result())
+    else:
+        for probe, arg in probes:
+            failures.extend(run_probe(probe, arg))
     if failures:
         print(f"smoke_models: FAIL({', '.join(failures)})")
         return 1

@@ -35,11 +35,21 @@ def test_text_probe_rejects_chinese_negation_forms(answer):
     assert failures == ["vlm-text"]
 
 
-@pytest.mark.parametrize("answer", ["2", "二", "two", "2。", "答案是2", "答案是二", "the answer is two", "1+1=2"])
+@pytest.mark.parametrize("answer", ["2", "二", "two", "2。", "答案是2", "答案是二", "the answer is two", "1+1=2", "兩"])
 def test_text_probe_accepts_expected_answer(answer):
     failures = []
     sm.smoke_vlm_text(DummyVLM(text=answer), failures)
     assert failures == []
+
+
+@pytest.mark.parametrize("answer", ["十二", "二十", "二零二五", "二点五", "三百二十"])
+def test_text_probe_rejects_wrong_chinese_numerals(answer):
+    """含"二/兩/两"的其他数字(12/20/2025/2.5/320)不得因子串含"二"被
+    误判通过;_MULTI_DIGIT 只匹配 ASCII \\d,管不住中文数字
+    (2026-11-03 检视:旧版子串兜底对"十二"打印 OK)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == ["vlm-text"]
 
 
 @pytest.mark.parametrize("answer", [
@@ -87,3 +97,49 @@ def test_rerank_rejects_malformed_scores(scores):
 
 def test_rerank_accepts_finite_numeric_scores():
     assert sm._valid_rerank_scores([0.8, 0.2])
+
+
+# ---------- smoke_rerank 语义判定路径(以 sys.modules 注入假 rerank client) ----------
+
+
+def run_rerank_probe(monkeypatch, scores):
+    """注入假 openviking rerank client(宿主无 site-packages,延迟导入在
+    函数内),返回 failures 列表;覆盖 ordered/unordered/invalid 三分支
+    (2026-11-03 检视:该路径原先零测试覆盖)。"""
+    import sys
+    import types
+
+    class FakeClient:
+        @classmethod
+        def from_config(cls, cfg):
+            client = cls()
+            client.rerank_batch = lambda query, docs: scores
+            return client
+
+    fake_module = types.ModuleType("openviking.models.rerank.openai_rerank")
+    fake_module.OpenAIRerankClient = FakeClient
+    for name in ("openviking", "openviking.models", "openviking.models.rerank"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(
+        sys.modules, "openviking.models.rerank.openai_rerank", fake_module
+    )
+    failures = []
+    sm.smoke_rerank({"model": "m"}, failures)
+    return failures
+
+
+def test_rerank_probe_passes_when_relevant_scores_higher(monkeypatch, capsys):
+    assert run_rerank_probe(monkeypatch, [0.9, 0.2]) == []
+    assert "[rerank]     OK" in capsys.readouterr().out
+
+
+def test_rerank_probe_fails_when_irrelevant_scores_higher(monkeypatch, capsys):
+    """相关文档得分反而更低:必须 FAIL 并计入 failures,不得为倒置的
+    rerank 打印 OK。"""
+    assert run_rerank_probe(monkeypatch, [0.2, 0.9]) == ["rerank"]
+    assert "[rerank]     FAIL" in capsys.readouterr().out
+
+
+def test_rerank_probe_reports_invalid_scores(monkeypatch, capsys):
+    assert run_rerank_probe(monkeypatch, ["0.9", 0.2]) == ["rerank"]
+    assert "invalid_scores" in capsys.readouterr().out

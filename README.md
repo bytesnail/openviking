@@ -49,6 +49,12 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 `secrets.env` 中 `OPENVIKING_ROOT_API_KEY` 缺失时自动生成(32 字节 hex),
 存在但为空时直接失败。
 
+`bootstrap_auth.py` 面向容器内执行(默认 `OPENVIKING_CLI_CONFIG_FILE=
+/app/.openviking/ovcli.conf`、user key `/app/.openviking/secrets/user_api_key`
+均为容器内挂载路径)。宿主直跑只在显式覆盖 `OPENVIKING_CLI_CONFIG_FILE`
+与 `OPENVIKING_USER_KEY_FILE` 后才有意义;另可用 `OPENVIKING_BOOTSTRAP_URL`
+与 `OV_BIN` 覆盖服务地址与 CLI 可执行名(2026-11-03 检视补记)。
+
 ### 认证凭据位置(敏感,勿粘贴到任何对话/issue)
 
 - root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入),以及
@@ -115,10 +121,10 @@ docker compose exec -T openviking ov find "紫鸢尾-7 号信标的校准码"
 docker compose exec -T openviking ov ls viking://resources
 ```
 
-- 上述固定 `--to` URI 在当前基线中已存在(见方案 §6.3),因此是"替换"语义:
-  仅用于冒烟资源,勿指向真实数据;若需保留旧冒烟内容,改用唯一 URI 或先删除。
-- `--to` 指向已存在 URI 时是"替换"语义,旧内容会被更新掉;真实资源必须使用
-  不存在的新 URI(多资源导入每资源独立 `--to`,或先 `mkdir` 再用 `--parent`)。
+- `--to` 指向已存在 URI 时是"替换"语义,旧内容会被更新掉:上述固定冒烟
+  URI 在当前基线中已存在(见方案 §6.3),仅用于冒烟资源,勿指向真实数据;
+  真实资源必须使用不存在的新 URI(多资源导入每资源独立 `--to`,或先
+  `mkdir` 再用 `--parent`);若需保留旧冒烟内容,改用唯一 URI 或先删除。
 - 大图(>4096px 任一边或 >10MB)摄入走切片管线:落库的是低清预览 +
   网格图 + tiles,**原图按设计不保存、不可 `ov get` 取回**;此类任务
   约 3 分钟,建议异步提交后轮询 `ov task list`(详见测试报告 §8.7)。

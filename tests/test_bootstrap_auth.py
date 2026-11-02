@@ -10,12 +10,11 @@ import json
 import os
 import stat
 import subprocess
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
+import _http_fakes
 import bootstrap_auth as ba
 
 REPO = Path(__file__).resolve().parents[1]
@@ -23,10 +22,10 @@ ROOT_KEY = "ROOTKEY-test-0000000000000000000000000000"
 USER_KEY = "USERKEY-test-1111111111111111111111111111"
 
 
-# ---------- 假 OpenViking server ----------
+# ---------- 假 OpenViking server(骨架见 tests/_http_fakes.py) ----------
 
 
-class FakeOvServer:
+class FakeOvServer(_http_fakes.FakeServer):
     """实现 bootstrap_auth 依赖的接口:POST /api/v1/admin/accounts、
     POST /api/v1/admin/accounts/default/users(v0.5.2 首启自动建空壳账户后的
     正规注册路径)、GET /health(带 User key 认证)。"""
@@ -41,7 +40,7 @@ class FakeOvServer:
         self.success_status = 200
         server = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(_http_fakes.FakeBaseHandler):
             def _auth_root(self):
                 if self.headers.get("Authorization") == f"Bearer {ROOT_KEY}":
                     return True
@@ -100,34 +99,15 @@ class FakeOvServer:
                     return
                 self._json(200, {"status": "ok", "healthy": True})
 
-            def _json(self, status, obj):
-                raw = json.dumps(obj).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
-            def log_message(self, *args):
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-
-    @property
-    def url(self):
-        return f"http://127.0.0.1:{self.server.server_address[1]}"
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
+        super().__init__(Handler)
 
 
 # ---------- ov CLI stub:读 env 密钥、写沙盒 ovcli.conf、做真实认证探测 ----------
 
 OV_STUB = f'''#!/usr/bin/env python3
 import json, os, sys, urllib.request, urllib.error
+# 探测与生产同纪律:禁代理直连 loopback,防止测试环境 http_proxy 劫持
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({{}}))
 cfg_path = os.environ["OPENVIKING_CLI_CONFIG_FILE"]
 args = sys.argv[1:]
 if args[:1] == ["language"]:
@@ -158,6 +138,13 @@ if args[:3] == ["config", "add", "custom"]:
             conf["root_api_key"] = root_key
     with open(cfg_path, "w") as fh:
         json.dump(conf, fh)
+    # 模拟真实 CLI:config add --name <name> 额外写同目录 saved profile
+    # ovcli.conf.<name>。2026-11-03 检视前 stub 从不写它,bootstrap 的
+    # saved-profile 契约(固定名、config add 副作用写入)只被手工文件验证。
+    name = args[args.index("--name") + 1] if "--name" in args else "local"
+    saved_path = os.path.join(os.path.dirname(cfg_path), "ovcli.conf." + name)
+    with open(saved_path, "w") as fh:
+        json.dump(conf, fh)
     print(json.dumps({{"status": "ok"}}))
     sys.exit(0)
 if args[:1] == ["health"]:
@@ -177,7 +164,7 @@ if args[:1] == ["health"]:
     if key:
         req.add_header("Authorization", "Bearer " + key)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _opener.open(req, timeout=5) as resp:
             healthy = resp.status == 200
             print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy, "account_id": "default", "user_id": "default", "role": role}}}}))
             sys.exit(0 if healthy else 1)
@@ -233,6 +220,22 @@ def assert_no_key_material(capsys):
     assert USER_KEY not in out.out + out.err
 
 
+def fail_os_replace_under_sandbox(monkeypatch, sandbox):
+    """只对沙盒内目标注入 os.replace 失败:ba.os 是全局 os 模块,无限补丁会
+    波及补丁窗口内任何无关的 os.replace 调用(2026-11-03 检视前逐字复制了
+    两份,现共享此一份)。恢复原始实现用:
+    monkeypatch.setattr(ba.os, "replace", ba.os.replace 的原始函数)。"""
+    real_replace = ba.os.replace
+
+    def failing_replace(src, dst, *args):
+        if str(dst).startswith(str(sandbox.tmp)):
+            raise OSError("disk full")
+        return real_replace(src, dst, *args)
+
+    monkeypatch.setattr(ba.os, "replace", failing_replace)
+    return real_replace
+
+
 # ---------- 用例 ----------
 
 
@@ -260,6 +263,13 @@ def test_first_init_via_user_registration(sandbox, ovserver, capsys):
     # 真实 CLI 配置是平铺 api_key/root_api_key,不是 profiles 嵌套形态。
     assert cli_conf.get("api_key") == USER_KEY
     assert cli_conf.get("root_api_key") == ROOT_KEY
+    # config add --name local 须副作用写 saved profile 且同样补 timeout
+    # (2026-11-03 检视:此前 stub 从不写它,该契约仅被手工文件验证)。
+    saved_conf = json.loads(
+        (sandbox.cli_cfg.parent / "ovcli.conf.local").read_text()
+    )
+    assert saved_conf.get("api_key") == USER_KEY
+    assert saved_conf.get("timeout") == 300
     assert_no_key_material(capsys)
 
 
@@ -375,16 +385,7 @@ def test_user_key_write_failure_enters_manual_recovery(
     sandbox, ovserver, monkeypatch, capsys
 ):
     """user 已创建但 key 落盘失败:不得抛 traceback,须提示轮换后人工恢复。"""
-    real_replace = ba.os.replace
-
-    def failing_replace(src, dst, *args):
-        # 只对沙盒内目标注入失败:ba.os 是全局 os 模块,无限补丁会波及
-        # 补丁窗口内任何无关的 os.replace 调用。
-        if str(dst).startswith(str(sandbox.tmp)):
-            raise OSError("disk full")
-        return real_replace(src, dst, *args)
-
-    monkeypatch.setattr(ba.os, "replace", failing_replace)
+    fail_os_replace_under_sandbox(monkeypatch, sandbox)
     rc = run_bootstrap(sandbox, ovserver)
 
     assert rc == ba.RC_MANUAL_RECOVERY
@@ -413,10 +414,12 @@ def test_existing_files_with_dead_key_errors_without_recreating(sandbox, ovserve
 
 
 def test_server_unreachable_errors(sandbox):
+    """首次初始化遇连接失败:必须判 RC_UPSTREAM(可重试),不得断言宽泛的
+    rc != 0 而放过误判人工轮换的回归(2026-11-03 检视收紧)。"""
     rc = run_bootstrap(
         sandbox, None, url="http://127.0.0.1:1"
     )
-    assert rc != 0
+    assert rc == ba.RC_UPSTREAM
     assert not sandbox.user_key.exists()
 
 
@@ -426,10 +429,7 @@ def test_transient_outage_in_idempotent_path_is_upstream_not_manual(
     """凭据有效但服务暂不可达:判 RC_UPSTREAM(可重试),不得误导为
     "认证无效,需人工恢复/轮换"(2026-11-02 检视)。"""
     assert run_bootstrap(sandbox, ovserver) == 0
-    rc = ba.run(
-        ROOT_KEY, "http://127.0.0.1:1", str(sandbox.cli_cfg),
-        str(sandbox.user_key), ov_bin=sandbox.ov_bin, env=dict(os.environ),
-    )
+    rc = run_bootstrap(sandbox, None, url="http://127.0.0.1:1")
     assert rc == ba.RC_UPSTREAM
     assert ovserver.accounts_calls == 1  # 不重复创建账户
 
@@ -535,22 +535,22 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
     good_cfg = json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY})
     sandbox.cli_cfg.write_text(good_cfg)
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "ok"
     # ROOT key 也返回 default/default;role=root 必须判失败。
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="root"))
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # 本部署 default 是运维 ADMIN;意外降级为 USER 不能视为初始化成功。
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="user"))
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(user_id="test"))
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # CLI 配置里的 api_key 必须与本地 stored user key 一致。
     sandbox.cli_cfg.write_text(json.dumps({"api_key": "different-key", "root_api_key": ROOT_KEY}))
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # root key 轮换后,配置里残留旧 root_api_key 也必须判失败。
     sandbox.cli_cfg.write_text(json.dumps({"api_key": USER_KEY, "root_api_key": "stale-root"}))
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # 缺 role 的结果同样失败。
     sandbox.cli_cfg.write_text(good_cfg)
     monkeypatch.setattr(
@@ -560,7 +560,20 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
             stdout=json.dumps({"ok": True, "result": {"healthy": True}}).encode(),
         ),
     )
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    # 顶层(非嵌套 result)信封无生产者:按 fail-closed 一律判失败
+    # (2026-11-03 检视移除了无依据的顶层兼容回退)。
+    monkeypatch.setattr(
+        ba, "_run_ov",
+        lambda *args: subprocess.CompletedProcess(
+            ["ov", "health"], 0,
+            stdout=json.dumps({
+                "ok": True, "healthy": True, "account_id": "default",
+                "user_id": "default", "role": "admin",
+            }).encode(),
+        ),
+    )
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
 
 
 def test_health_rejects_url_and_saved_profile_drift(monkeypatch, sandbox):
@@ -580,17 +593,17 @@ def test_health_rejects_url_and_saved_profile_drift(monkeypatch, sandbox):
     sandbox.cli_cfg.write_text(json.dumps(good))
     assert ba._ov_health_ok(
         "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
-    )
+    ) == "ok"
     sandbox.cli_cfg.write_text(json.dumps({**good, "url": "http://127.0.0.1:1933"}))
-    assert not ba._ov_health_ok(
+    assert ba._ov_health_ok(
         "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
-    )
+    ) == "invalid"
     sandbox.cli_cfg.write_text(json.dumps(good))
     saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
     saved.write_text(json.dumps({**good, "api_key": "stale-key"}))
-    assert not ba._ov_health_ok(
+    assert ba._ov_health_ok(
         "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
-    )
+    ) == "invalid"
 
 
 def test_health_rejects_root_only_config(monkeypatch, sandbox):
@@ -609,7 +622,32 @@ def test_health_rejects_root_only_config(monkeypatch, sandbox):
             }).encode(),
         ),
     )
-    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) \
+        == "invalid"
+
+
+def test_health_timeout_is_distinguished_from_invalid(monkeypatch, sandbox):
+    """ov health 超时(_run_ov 折叠为 124)必须可与服务端拒绝区分:
+    超时不是凭据问题,不得把有效密钥推向人工轮换(2026-11-03 检视)。"""
+    sandbox.cli_cfg.write_text(
+        json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY})
+    )
+    monkeypatch.setattr(
+        ba, "_run_ov",
+        lambda *args, **kwargs: subprocess.CompletedProcess(["ov", "health"], 124),
+    )
+    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) \
+        == "timeout"
+
+
+def test_health_timeout_in_idempotent_path_is_upstream(sandbox, ovserver, monkeypatch):
+    """幂等路径遇 ov health 超时:判 RC_UPSTREAM(可重试),不判人工恢复。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    monkeypatch.setattr(
+        ba, "_run_ov",
+        lambda *args, **kwargs: subprocess.CompletedProcess(["ov", "health"], 124),
+    )
+    assert run_bootstrap(sandbox, ovserver) == ba.RC_UPSTREAM
 
 
 def test_timeout_write_failure_is_reported_and_idempotent_retry_repairs(
@@ -620,15 +658,7 @@ def test_timeout_write_failure_is_reported_and_idempotent_retry_repairs(
     del cfg["timeout"]
     sandbox.cli_cfg.write_text(json.dumps(cfg))
 
-    real_replace = ba.os.replace
-
-    def failing_replace(src, dst, *args):
-        # 只对沙盒内目标注入失败,避免波及补丁窗口内的无关 os.replace。
-        if str(dst).startswith(str(sandbox.tmp)):
-            raise OSError()
-        return real_replace(src, dst, *args)
-
-    monkeypatch.setattr(ba.os, "replace", failing_replace)
+    real_replace = fail_os_replace_under_sandbox(monkeypatch, sandbox)
     assert run_bootstrap(sandbox, ovserver) == ba.RC_CLI_CONFIG
     assert "timeout" not in json.loads(sandbox.cli_cfg.read_text())
 
@@ -658,12 +688,25 @@ def test_atomic_write_replaces_symlink_without_following(sandbox):
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
-def test_stale_predictable_tmp_symlink_is_not_followed(sandbox, ovserver):
-    """预置可猜临时路径的符号链接时,完整 bootstrap 不得把 key/配置写入其目标。"""
+def test_atomic_write_leaves_no_temp_residue_and_ignores_stale_symlinks(
+    sandbox, ovserver
+):
+    """mkstemp 临时名含 8 位随机后缀且以 O_CREAT|O_EXCL 打开:预置符号链接
+    无法命中也无法被跟随(2026-11-03 检视:旧用例预置的 'ovcli.conf.tmp'
+    从不在写入路径上,属空转断言;本用例改为固化命名契约与无残留)。"""
     victim = sandbox.tmp / "victim"
     victim.write_text("unchanged")
+    # 可猜到的名字(含 mkstemp 前缀形态)都指向 victim:均不得被跟随
     (sandbox.cli_cfg.parent / "ovcli.conf.tmp").symlink_to(victim)
+    (sandbox.cli_cfg.parent / ".ovcli.conf.ZZZZZZZZ").symlink_to(victim)
     assert run_bootstrap(sandbox, ovserver) == 0
     assert victim.read_text() == "unchanged"
     assert not sandbox.cli_cfg.is_symlink()
     assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
+    # 完整运行后不得残留任何 .ovcli.conf.* 临时文件(预置符号链接除外:
+    # mkstemp 的随机名不会命中它们,它们本就不该被动到)
+    residue = [
+        p for p in sandbox.cli_cfg.parent.glob(".ovcli.conf.*")
+        if not p.is_symlink()
+    ]
+    assert residue == []

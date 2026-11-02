@@ -5,6 +5,9 @@
 重复文本),并在实际字符流头部 ~2%、中部 ~50%、尾部 ~98% 各植入一个唯一
 可检索标记(形如 LT{size}-HEAD/MID/TAIL-{hex}),用于验证超长文档深层检索。
 
+文件名使用精确字符数(longtext-<size>.md,2026-11-03 起):按 size//1000
+分桶会让同桶不同尺寸静默复用错误夹具(50500 与 50000 同名 longtext-50k)。
+
 用法:python3 tests/gen_longtext_fixture.py [--force] [尺寸字符数 ...]
 默认尺寸 50000 1000000 10000000 20000000;已有文件默认跳过,--force 才重建。
 """
@@ -40,7 +43,7 @@ def marker(size: int, pos: str) -> str:
 def gen(size: int, force: bool = False) -> Path:
     if size < 1000:
         raise ValueError("尺寸至少为 1000 字符,才能布置三个深层检索标记")
-    out = OUT_DIR / f"longtext-{size//1000}k.md"
+    out = OUT_DIR / f"longtext-{size}.md"
     if out.exists() and not force:
         print(f"{out.name}: 已存在,跳过(用 --force 重建)")
         return out
@@ -101,6 +104,11 @@ def gen(size: int, force: bool = False) -> Path:
 if __name__ == "__main__":
     args = sys.argv[1:]
     force = "--force" in args
-    sizes = [int(x) for x in args if x != "--force"] or [50000, 1_000_000, 10_000_000, 20_000_000]
+    try:
+        sizes = [int(x) for x in args if x != "--force"] \
+            or [50000, 1_000_000, 10_000_000, 20_000_000]
+    except ValueError:
+        print("用法错误:尺寸必须是整数(可选 --force)", file=sys.stderr)
+        sys.exit(2)
     for size in sizes:
         gen(size, force=force)

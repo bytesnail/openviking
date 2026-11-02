@@ -1,5 +1,6 @@
 """scripts/env_file.py 的 Compose env_file 兼容解析与校验测试。"""
 import json
+import urllib.request
 
 import pytest
 
@@ -57,6 +58,28 @@ def test_parse_rejects_backslash_escape_in_double_quotes(tmp_path):
         ef.parse_env_file(path)
 
 
+def test_parse_rejects_unterminated_quote(tmp_path):
+    """引号未闭合(或转义吃掉收尾引号):不得落入非引号路径原样放行,
+    否则又是"校验值 ≠ Compose 注入值"的静默分歧(2026-11-03 检视)。"""
+    with pytest.raises(ef.EnvFileError):
+        ef.parse_env_file(write(tmp_path, 'A="abc\\\n'))
+    with pytest.raises(ef.EnvFileError):
+        ef.parse_env_file(write(tmp_path, "B='abc\n"))
+
+
+def test_parse_rejects_export_tab_separator(tmp_path):
+    """export+tab 会被解析成名为 "export\\tKEY" 的变量,触发误导性的
+    "缺失"报错;必须直接明确拒绝(2026-11-03 检视)。"""
+    with pytest.raises(ef.EnvFileError):
+        ef.parse_env_file(write(tmp_path, "export\tZ_AI_API_KEY=goodkey123\n"))
+
+
+def test_vars_with_export_like_names_still_parse(tmp_path):
+    """exports/exporter 等以 export 开头的普通变量名不受 export 前缀规则影响。"""
+    path = write(tmp_path, "exports=1\nexporter=x\n")
+    assert ef.parse_env_file(path) == {"exports": "1", "exporter": "x"}
+
+
 def test_parse_indented_export_bom_and_last_wins(tmp_path):
     path = tmp_path / "secrets.env"
     path.write_bytes(
@@ -98,6 +121,56 @@ def test_precheck_rejects_existing_empty_root_key():
 def test_precheck_rejects_placeholder_or_short_root_key(root):
     with pytest.raises(ef.EnvFileError):
         ef.precheck_env({"Z_AI_API_KEY": "goodkey123", "OPENVIKING_ROOT_API_KEY": root})
+
+
+def test_placeholder_blacklist_has_exclusive_coverage(monkeypatch):
+    """黑名单词条长度均 <16,恒被长度下界先行拒绝(原测试零独占覆盖,删掉
+    黑名单照样绿);以注入 ≥16 占位符验证该分支自身仍生效
+    (2026-11-03 检视)。"""
+    monkeypatch.setattr(ef, "PLACEHOLDER_ROOT_KEYS", {"placeholderrootkey12345"})
+    with pytest.raises(ef.EnvFileError):
+        ef.precheck_env({
+            "Z_AI_API_KEY": "goodkey123",
+            "OPENVIKING_ROOT_API_KEY": "PlaceholderRootKey12345",
+        })
+
+
+def test_get_rejects_extra_arguments(tmp_path):
+    """get 与 precheck/validate 同纪律:严格等元数,多余参数(误写成
+    validate 形态)不得被静默忽略后照常输出密钥值(2026-11-03 检视)。"""
+    path = write(tmp_path, "A=not-a-real-secret\n")
+    assert ef.main(["env_file.py", "get", str(path), "A"]) == 0
+    assert ef.main(["env_file.py", "get", str(path), "A", "extra"]) == 2
+
+
+def test_direct_openers_stay_consistent_across_scripts(monkeypatch):
+    """三份 -I 脚本各自持有的 _DIRECT_OPENER 必须行为一致:禁代理 +
+    禁重定向。无法共享 import 是 -I 隔离的代价;本断言防止安全加固只落到
+    一份(2026-11-03 检视)。语义化检查:任何携带代理表的 handler 代理表
+    必须为空(空表 = 无 *_open 钩子 = 绝不走代理),禁重定向 handler 对
+    301 必须返回 None。"""
+    import bootstrap_auth as ba
+    import embedding_adapter as ea
+
+    # 敌意代理环境:若某份拷贝丢了 ProxyHandler({}) 而混入默认 handler,
+    # 其代理表在此现形(空代理表的实例不会注册进 opener.handlers)。
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:9")
+    monkeypatch.delenv("no_proxy", raising=False)
+    for mod in (ef, ba, ea):
+        opener = mod._DIRECT_OPENER
+        for h in opener.handlers:
+            if hasattr(h, "proxies"):
+                assert h.proxies == {}, f"{mod.__name__} 的 opener 继承了代理"
+        redirect_handlers = [
+            h for h in opener.handlers
+            if isinstance(h, urllib.request.HTTPRedirectHandler)
+        ]
+        assert len(redirect_handlers) == 1, f"{mod.__name__} 缺少禁重定向 handler"
+        req = urllib.request.Request("http://127.0.0.1:1/x")
+        assert redirect_handlers[0].redirect_request(
+            req, None, 301, "Moved", {}, "http://127.0.0.1:9/x"
+        ) is None, f"{mod.__name__} 的 opener 会跟随重定向"
 
 
 def _config(zai, root):

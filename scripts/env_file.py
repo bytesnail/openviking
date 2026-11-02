@@ -37,6 +37,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
+# 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/bootstrap_auth.py 与
+# scripts/embedding_adapter.py 各有一份(python -I 隔离运行,无法共享 import);
+# 本模块是探针(tests/e2e_adapter_probe.py)的复用来源;对任何一份的加固
+# 必须同步其余两份,tests/test_env_file.py 有行为一致性断言。
 
 # 变量引用语法只此一份:展开与"未展开残留"检测共用,防止两份字面量漂移。
 _VAR_PATTERN = re.compile(
@@ -62,6 +66,13 @@ def parse_env_value(value):
                 "双引号值内含反斜杠转义,本解析器不支持;请改用不含转义的值"
             )
         return token[1:-1]
+    if value.lstrip().startswith(('"', "'")):
+        # 引号开头却未整段匹配成合法引号值 = 引号未闭合,或转义吃掉了收尾
+        # 引号;原样走非引号路径放行会造成"本解析器值 ≠ Compose 注入值"
+        # 的静默分歧,必须显式报错(2026-11-03 检视)。
+        raise EnvFileError(
+            "引号值未闭合或含不支持的转义(双引号内不支持反斜杠转义)"
+        )
     # Compose:非引号值的行内注释以"空白 + #"开始,VALUE#literal 不算。
     # 必须在未 strip 的原文上切,保留"# 前是否有空白"的信息:先 strip 会把
     # `KEY=   # note` 变成值 "# note",而 compose 解析为空值。
@@ -80,14 +91,30 @@ def parse_env_file(path):
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
+        if line.startswith("export"):
+            rest = line[len("export"):]
+            if rest[:1] == " ":
+                line = rest.lstrip()
+            elif rest[:1] in "\t\r\v\f":
+                # export+tab 会被当成名为 "export\tKEY" 的变量,触发误导性的
+                # "缺失"报错;直接明确拒绝,不猜 compose 是否接受该变体
+                # (2026-11-03 检视)。
+                raise EnvFileError("export 前缀后必须是空格(不支持 tab 等其他空白)")
+            # 其余情况(如 exports=1)按普通变量名处理
         key, _, value = line.partition("=")
         key = key.strip()
         if not key:
             continue
         env[key] = parse_env_value(value)
     return env
+
+
+# 常见占位符黑名单;词条长度均 < 16,与下方长度下界构成两道独立防线
+# (黑名单为未来更长词条预留;tests/test_env_file.py 以注入方式覆盖该分支)。
+PLACEHOLDER_ROOT_KEYS = {
+    "changeme", "change-me", "changethis", "password", "secret",
+    "root", "test", "example", "placeholder", "dummy",
+}
 
 
 def precheck_env(env):
@@ -107,10 +134,7 @@ def precheck_env(env):
         )
     if not root.strip("xX"):
         raise EnvFileError("OPENVIKING_ROOT_API_KEY 是纯 X 占位符,视为未配置")
-    if root.lower() in {
-        "changeme", "change-me", "changethis", "password", "secret",
-        "root", "test", "example", "placeholder", "dummy",
-    }:
+    if root.lower() in PLACEHOLDER_ROOT_KEYS:
         raise EnvFileError("OPENVIKING_ROOT_API_KEY 是常见占位符,视为未配置")
     if len(root) < 16:
         raise EnvFileError("OPENVIKING_ROOT_API_KEY 过短(至少 16 字符)")
@@ -225,7 +249,10 @@ def check_model_drift(cfg):
 
 
 def main(argv):
-    if len(argv) >= 4 and argv[1] == "get":
+    # 子命令一律严格等元数:get 多带参数(误写成 validate 形态)会被静默
+    # 忽略并照常输出密钥值,必须与 precheck/validate 同纪律直接拒绝
+    # (2026-11-03 检视)。
+    if len(argv) == 4 and argv[1] == "get":
         try:
             env = parse_env_file(argv[2])
         except EnvFileError as exc:

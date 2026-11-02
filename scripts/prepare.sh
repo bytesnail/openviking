@@ -38,7 +38,14 @@ current_uid_gid="$(id -u):$(id -g)"
 command -v ss >/dev/null 2>&1 \
   || fail "缺少 ss,无法验证端口边界(见 README 前提);不安装就不放行"
 
-port_listening() { ss -H -tln "sport = :$1" 2>/dev/null | grep -q .; }
+port_listening() {
+  # 快照式判定(与 loopback_only_listener 同一纪律):grep -q 提前退出会让
+  # ss 在多行输出下撞 SIGPIPE,pipefail 把"占用"误判成"空闲"(fail-open);
+  # ss 自身失败也一律按"无法确认空闲"处理,绝不放行(2026-11-03 检视)。
+  local listeners
+  listeners="$(ss -H -tln "sport = :$1" 2>/dev/null)" || return 0
+  [ -n "$listeners" ]
+}
 loopback_only_listener() {
   local port=$1 local_addr listeners ipv4_seen=0
   # 一次 ss 取同一快照:存在性判定与地址枚举不得取自两次独立探测;
@@ -58,7 +65,7 @@ loopback_only_listener() {
 }
 for p in 1933 18353; do
   if port_listening "$p"; then
-    fail "端口 $p 已被占用(应为 OpenViking 部署保留);不杀既有进程,请先排查"
+    fail "端口 $p 无法确认空闲(被占用或 ss 探测失败;应为 OpenViking 部署保留);不杀既有进程,请先排查"
   fi
 done
 for p in 18351 18352; do
@@ -86,8 +93,11 @@ else
       case "$(basename "$entry")" in
         secrets)
           # 仅允许上次失败后留下的空目录;任何已有内容都属于未知状态。
-          [ -d "$entry" ] && [ -z "$(find "$entry" -mindepth 1 -print -quit)" ] \
-            || fail "state/secrets 含非本方案验证的数据;请先备份并人工确认"
+          # find 对不可遍历目录的 stdout 为空,必须先确认可读可进,否则
+          # "不可读"会被 -z 误判为"空"而在写 key 之后才失败(2026-11-03 检视)。
+          [ -d "$entry" ] && [ -r "$entry" ] && [ -x "$entry" ] \
+            && [ -z "$(find "$entry" -mindepth 1 -print -quit)" ] \
+            || fail "state/secrets 含非本方案验证的数据或不可读取;请先备份并人工确认"
           ;;
         *) fail "state 目录含非本方案创建的数据($(basename "$entry"));请先备份并人工确认,本脚本不清空、不接管" ;;
       esac

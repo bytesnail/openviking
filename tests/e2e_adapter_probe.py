@@ -30,6 +30,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 from embedding_adapter import single_vector  # noqa: E402
 from env_file import (  # noqa: E402
+    _DIRECT_OPENER,
     EnvFileError,
     loaded_model_ids,
     model_name_matches,
@@ -44,18 +45,9 @@ UPSTREAM = os.environ.get(
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 results = []
 
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """禁止跟随重定向:本探针只允许访问固定 loopback 端点,3xx 一律按失败
-    处理(返回 None 使 opener 以 HTTPError(3xx) 报错,不发后续请求)。"""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-_DIRECT_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), _NoRedirect()
-)
+# 传输层直接复用 env_file 的 _DIRECT_OPENER(禁代理 + 禁重定向):探针不运行
+# 在 -I 下,本文件原有第四份拷贝已删除;与部署脚本同语义,防止探针验证的
+# 传输比 prepare/validate 更弱(2026-11-03 检视)。
 
 
 def _configured_model():
@@ -111,6 +103,10 @@ def embed(url, inp):
 
 
 def cosine(a, b):
+    if len(a) != len(b):
+        # 维度不齐时 zip 会按较短向量静默截断,产出无意义数值误导排障;
+        # 返回 nan 让判据失败而非假通过(2026-11-03 检视)。
+        return float("nan")
     dot = sum(x * y for x, y in zip(a, b))
     return dot / math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))
 

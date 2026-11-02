@@ -4,23 +4,33 @@
 已包装输入不重复包装;非法 part、混合输入、超大输入被拒绝;多模态多向量/空向量
 响应返回 502;上游状态与错误安全处理,日志不含正文。
 """
+import http.client
 import json
 import logging
+import socket
 import threading
 import time
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import contextmanager
 
 import pytest
 
+import _http_fakes
 import embedding_adapter as ea
 
+# keep-alive 关闭/重连的合格结果二选一:连接级失败,或客户端自动重连后的
+# 正常应答(2026-11-03 检视:此元组原先在四个用例里逐字重复)。
+CLOSED_OR_RECONNECT = (
+    http.client.RemoteDisconnected, ConnectionError, http.client.BadStatusLine,
+    OSError,
+)
 
-# ---------- 测试工具:可编程的假上游(本地 llama.cpp 替身,§9.2 再做真实联调) ----------
+
+# ---------- 测试工具:可编程的假上游(骨架见 tests/_http_fakes.py) ----------
 
 
-class FakeUpstream:
+class FakeUpstream(_http_fakes.FakeServer):
     """记录请求、可编程响应的本地 /v1/embeddings + /health 假上游。"""
 
     def __init__(self):
@@ -33,7 +43,7 @@ class FakeUpstream:
         self._lock = threading.Lock()
         upstream = self
 
-        class Handler(BaseHTTPRequestHandler):
+        class Handler(_http_fakes.FakeBaseHandler):
             def _handle(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
@@ -50,51 +60,26 @@ class FakeUpstream:
                     if upstream.hang_seconds:
                         time.sleep(upstream.hang_seconds)
                     if self.path == "/health":
-                        self._respond(200, {"status": "ok"})
+                        self._json(200, {"status": "ok"})
                         return
                     status = upstream.response_status
                     if status == 200:
-                        raw = json.dumps(upstream.response_body).encode()
+                        payload = upstream.response_body
                     else:
-                        raw = json.dumps({"error": "secret-upstream-detail"}).encode()
-                    self.send_response(status)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(raw)))
-                    self.end_headers()
-                    try:
-                        self.wfile.write(raw)
-                    except (BrokenPipeError, ConnectionResetError):
-                        pass  # 适配器超时/断开后,假上游不再向已关闭 socket 写响应
+                        payload = {"error": "secret-upstream-detail"}
+                    self._json(status, payload)
                 finally:
                     with upstream._lock:
                         upstream._inflight -= 1
 
-            def _respond(self, status, obj):
-                raw = json.dumps(obj).encode()
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
-
             do_GET = _handle
             do_POST = _handle
 
-            def log_message(self, *args):  # 静音假上游日志
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
-        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-        self.thread.start()
+        super().__init__(Handler)
 
     @property
     def url(self):
-        return f"http://127.0.0.1:{self.server.server_address[1]}/v1/embeddings"
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
+        return super().url + "/v1/embeddings"
 
 
 @pytest.fixture()
@@ -122,6 +107,11 @@ def adapter(upstream):
     server.server_close()
 
 
+# 测试客户端与生产同纪律:直连(禁代理)opener,防 http_proxy 环境把 loopback
+# 测试路由到代理造成大面积假失败,也让安全用例的 Authorization 头不再过代理
+# (2026-11-03 检视;原先用继承代理的裸 urllib.urlopen)。
+
+
 def http_post(base, path, obj, headers=None, raw_body=None):
     data = raw_body if raw_body is not None else json.dumps(obj).encode()
     req = urllib.request.Request(
@@ -129,7 +119,7 @@ def http_post(base, path, obj, headers=None, raw_body=None):
     )
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with ea._DIRECT_OPENER.open(req, timeout=15) as resp:
             return resp.status, json.loads(resp.read() or b"null")
     except urllib.error.HTTPError as err:
         return err.code, json.loads(err.read() or b"null")
@@ -137,10 +127,47 @@ def http_post(base, path, obj, headers=None, raw_body=None):
 
 def http_get(base, path):
     try:
-        with urllib.request.urlopen(base + path, timeout=10) as resp:
+        with ea._DIRECT_OPENER.open(base + path, timeout=10) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as err:
         return err.code, err.read()
+
+
+def base_url(server):
+    return f"http://127.0.0.1:{server.server_address[1]}"
+
+
+@contextmanager
+def standalone_server(**overrides):
+    """make_server(port=0) + 线程起服 + 确定性收尾;替代原先 8 处手写样板
+    (2026-11-03 检视)。FakeUpstream 由调用方创建/关闭(需要编程其状态)。"""
+    kwargs = {
+        "host": "127.0.0.1", "port": 0,
+        "upstream_url": "http://127.0.0.1:1/v1/embeddings",
+        "upstream_timeout_seconds": 2, "max_body_bytes": 4096,
+        "max_concurrent": 2,
+    }
+    kwargs.update(overrides)
+    server = ea.make_server(**kwargs)
+    threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    ).start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+class Capture(logging.Handler):
+    """收集日志消息;两处安全用例共用(2026-11-03 检视前定义了两次)。"""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record.getMessage())
 
 
 TEXT_PART = {"type": "text", "text": "a red square"}
@@ -163,20 +190,20 @@ def mm_body():
 
 def test_text_string_forwarded_unchanged():
     body = {"model": "m", "input": "hello"}
-    out, wrapped = ea.transform_body(body)
-    assert out == body and wrapped is False
+    out, needs_check = ea.transform_body(body)
+    assert out is body and needs_check is False
 
 
 def test_text_batch_forwarded_unchanged():
     body = {"model": "m", "input": ["a", "b"]}
-    out, wrapped = ea.transform_body(body)
-    assert out == body and wrapped is False
+    out, needs_check = ea.transform_body(body)
+    assert out is body and needs_check is False
 
 
 def test_openviking_parts_get_content_wrapper():
     body = mm_body()
-    out, wrapped = ea.transform_body(body)
-    assert wrapped is True
+    out, needs_check = ea.transform_body(body)
+    assert needs_check is True
     assert out["input"] == [{"content": body["input"]}]
     assert out["model"] == "embeddinggemma-2"  # 其余字段保留
     assert out["encoding_format"] == "float"
@@ -184,23 +211,25 @@ def test_openviking_parts_get_content_wrapper():
 
 def test_already_wrapped_input_not_double_wrapped():
     body = {"model": "m", "input": [{"content": [dict(TEXT_PART), dict(IMAGE_PART)]}]}
-    out, wrapped = ea.transform_body(body)
-    assert out == body and wrapped is False
+    out, needs_check = ea.transform_body(body)
+    # 单项已包装输入不加壳(原样转发),但仍属"恰好一个向量"契约,需校验
+    # (2026-11-03 起 transform_body 直接返回该语义,调用点不再二次推导)。
+    assert out is body and needs_check is True
 
 
 def test_image_only_parts_get_content_wrapper():
     """纯图(无 text part)也属"非空且全为受支持 parts",须包装(2026-10-26 补测缺口)。"""
     parts = [dict(IMAGE_PART)]
-    out, wrapped = ea.transform_body({"model": "m", "input": parts})
-    assert wrapped is True
+    out, needs_check = ea.transform_body({"model": "m", "input": parts})
+    assert needs_check is True
     assert out["input"] == [{"content": parts}]
 
 
 def test_text_only_parts_list_wrapped():
     """全 text part 的列表同样包装,不当作文本批处理。"""
     parts = [dict(TEXT_PART), dict(TEXT_PART)]
-    out, wrapped = ea.transform_body({"model": "m", "input": parts})
-    assert wrapped is True
+    out, needs_check = ea.transform_body({"model": "m", "input": parts})
+    assert needs_check is True
     assert out["input"] == [{"content": parts}]
 
 
@@ -339,50 +368,35 @@ def test_upstream_permanent_400_preserves_client_error(adapter, upstream):
 def test_upstream_timeout_maps_502():
     fake = FakeUpstream()
     fake.hang_seconds = 3.0
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url=fake.url,
-        upstream_timeout_seconds=0.5, max_body_bytes=4096, max_concurrent=2,
-    )
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        status, _ = http_post(base, "/v1/embeddings", mm_body())
-        assert status == 502
+        with standalone_server(
+            upstream_url=fake.url, upstream_timeout_seconds=0.5
+        ) as server:
+            status, _ = http_post(base_url(server), "/v1/embeddings", mm_body())
+            assert status == 502
     finally:
-        server.shutdown(); server.server_close(); fake.close()
+        fake.close()
 
 
 def test_upstream_connection_error_maps_502():
     # 绑定 127.0.0.1:1(必然连接失败)作为上游
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
-        upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=2,
-    )
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
-        status, _ = http_post(base, "/v1/embeddings", {"model": "m", "input": "x"})
+    with standalone_server() as server:
+        status, _ = http_post(
+            base_url(server), "/v1/embeddings", {"model": "m", "input": "x"}
+        )
         assert status == 502
-    finally:
-        server.shutdown(); server.server_close()
 
 
 def test_upstream_response_over_cap_maps_502():
     fake = FakeUpstream()
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url=fake.url,
-        upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=1,
-        max_response_body_bytes=128,
-    )
-    threading.Thread(
-        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-    ).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        status, _ = http_post(base, "/v1/embeddings", mm_body())
-        assert status == 502
+        with standalone_server(
+            upstream_url=fake.url, max_concurrent=1, max_response_body_bytes=128
+        ) as server:
+            status, _ = http_post(base_url(server), "/v1/embeddings", mm_body())
+            assert status == 502
     finally:
-        server.shutdown(); server.server_close(); fake.close()
+        fake.close()
 
 
 def test_oversized_body_413(adapter):
@@ -496,8 +510,7 @@ def test_unknown_path_then_reuse_same_connection(adapter):
             )
             resp2 = conn.getresponse()
             outcome = (resp2.status, resp2.read())
-        except (http.client.RemoteDisconnected, ConnectionError,
-                http.client.BadStatusLine, OSError):
+        except CLOSED_OR_RECONNECT:
             outcome = "connection-closed"
         if outcome == "connection-closed":
             pass  # 服务端关闭连接:正确契约,复用必须由客户端重连
@@ -539,8 +552,7 @@ def test_invalid_content_length_closes_connection(adapter):
             conn.endheaders()
             conn.send(b"{}")
             outcome = conn.getresponse()
-        except (http.client.RemoteDisconnected, ConnectionError,
-                http.client.BadStatusLine, OSError):
+        except CLOSED_OR_RECONNECT:
             pass
         if outcome == "error":
             pass  # 连接级失败:同样正确(客户端必须重连)
@@ -576,18 +588,93 @@ def test_error_response_declares_connection_close(adapter):
         conn.close()
 
 
-def test_health_ok_without_upstream():
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
-        upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=2,
+@pytest.mark.parametrize("cl", [b"+13", b"1_3"])
+def test_non_canonical_content_length_rejected(adapter, cl):
+    """Content-Length 只允许纯 ASCII 数字:int() 还会接受 "+" 前缀与
+    下划线分组(均等于 13),须按 RFC 9110 收紧(2026-11-03 检视)。
+    附带发送完整合法正文:旧行为会按解析出的 13 字节放行成 200。"""
+    sock = socket.create_connection(
+        ("127.0.0.1", adapter.server_address[1]), timeout=10
     )
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
     try:
-        status, body = http_get(base, "/health")
-        assert status == 200
+        body = b'{"input":"x"} '  # 13 字节合法 JSON
+        sock.sendall(
+            b"POST /v1/embeddings HTTP/1.1\r\nHost: t\r\n"
+            b"Content-Type: application/json\r\nContent-Length: "
+            + cl + b"\r\n\r\n" + body
+        )
+        data = sock.recv(4096)
+        assert data.startswith(b"HTTP/1.1 400")
     finally:
-        server.shutdown(); server.server_close()
+        sock.close()
+
+
+def test_early_reject_response_survives_unread_body(adapter):
+    """拒绝路径未读正文即关连接:有界排水后,客户端把声明正文全量发出
+    (暂不读响应)也应收到 413,而不是被内核 RST 吞掉已写出的响应
+    (2026-11-03 检视)。"""
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", adapter.server_address[1], timeout=10
+    )
+    try:
+        body = b"x" * 8192  # adapter fixture 的 max_body_bytes=4096
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        conn.send(body)
+        resp = conn.getresponse()
+        assert resp.status == 413
+        resp.read()
+    finally:
+        conn.close()
+
+
+def test_write_failure_after_response_started_writes_no_second_status(monkeypatch):
+    """200 已开始写出后写失败:兜底路径绝不能再写第二个状态行,否则客户端
+    收到 200 头+截断正文+内嵌 500 块的损坏流(2026-11-03 检视)。"""
+    fake = FakeUpstream()
+    # ~5MB 有效单向量:超过收发两侧内核缓冲,客户端不读时服务端写超时,
+    # 恰好触发"响应已开始"的兜底路径。
+    fake.response_body = {"data": [{"embedding": [0.1] * 600000, "index": 0}]}
+    try:
+        with standalone_server(
+            upstream_url=fake.url, upstream_timeout_seconds=10
+        ) as server:
+            monkeypatch.setattr(ea.AdapterHandler, "timeout", 0.3)
+            body = json.dumps(mm_body()).encode()
+            sock = socket.create_connection(
+                ("127.0.0.1", server.server_address[1]), timeout=5
+            )
+            try:
+                sock.sendall(
+                    b"POST /v1/embeddings HTTP/1.1\r\nHost: t\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: "
+                    + str(len(body)).encode() + b"\r\n\r\n" + body
+                )
+                time.sleep(0.8)  # > 0.3s 写超时,兜底路径已执行完毕
+                sock.settimeout(2)
+                data = b""
+                try:
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                except OSError:
+                    pass
+                assert data.startswith(b"HTTP/1.1 200")
+                assert data.count(b"HTTP/1.1") == 1  # 旧 bug 会追加第二个状态行
+            finally:
+                sock.close()
+    finally:
+        fake.close()
+
+
+def test_health_ok_without_upstream():
+    with standalone_server() as server:
+        status, body = http_get(base_url(server), "/health")
+        assert status == 200
 
 
 def test_ready_200_when_upstream_healthy(adapter):
@@ -596,116 +683,102 @@ def test_ready_200_when_upstream_healthy(adapter):
 
 
 def test_ready_503_when_upstream_down():
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
-        upstream_timeout_seconds=2, max_body_bytes=4096, max_concurrent=2,
-    )
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    try:
-        status, _ = http_get(base, "/ready")
+    with standalone_server() as server:
+        status, _ = http_get(base_url(server), "/ready")
         assert status == 503
-    finally:
-        server.shutdown(); server.server_close()
 
 
 def test_connection_handler_threads_are_bounded():
-    import socket
-
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url="http://127.0.0.1:1/v1/embeddings",
-        upstream_timeout_seconds=1, max_body_bytes=4096, max_concurrent=1,
-        max_connections=2,
-    )
-    threading.Thread(
-        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
-    ).start()
-    baseline = threading.active_count()
-    clients = []
-    try:
-        for _ in range(4):
-            client = socket.create_connection(("127.0.0.1", server.server_address[1]))
-            # 不发送任何字节,handler 阻塞在 request-line read;关闭时不会产生
-            # 半请求解析/响应 BrokenPipe 噪音。
-            clients.append(client)
-        time.sleep(0.15)
-        # accept 主线程在 connection_slots 上等待,第三/第四连接只留在内核
-        # backlog,不能继续派生 handler 线程。
-        assert threading.active_count() - baseline <= 2
-    finally:
-        for client in clients:
-            client.close()
-        server.shutdown(); server.server_close()
+    with standalone_server(
+        upstream_timeout_seconds=1, max_concurrent=1, max_connections=2
+    ) as server:
+        baseline = threading.active_count()
+        clients = []
+        try:
+            for _ in range(4):
+                client = socket.create_connection(
+                    ("127.0.0.1", server.server_address[1])
+                )
+                # 不发送任何字节,handler 阻塞在 request-line read;关闭时不会产生
+                # 半请求解析/响应 BrokenPipe 噪音。
+                clients.append(client)
+            time.sleep(0.15)
+            # accept 主线程在 connection_slots 上等待,第三/第四连接只留在内核
+            # backlog,不能继续派生 handler 线程。
+            assert threading.active_count() - baseline <= 2
+        finally:
+            for client in clients:
+                client.close()
 
 
 def test_forward_concurrency_capped_at_two():
     fake = FakeUpstream()
     fake.hang_seconds = 1.5
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url=fake.url,
-        upstream_timeout_seconds=10, max_body_bytes=4096, max_concurrent=2,
-        forward_wait_seconds=5,
-    )
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    results = []
-    start = threading.Barrier(3)
-
-    def worker():
-        start.wait()
-        results.append(http_post(base, "/v1/embeddings", {"model": "m", "input": "x"}))
-
     try:
-        threads = [threading.Thread(target=worker) for _ in range(3)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        assert fake.max_inflight_seen <= 2
-        assert all(status == 200 for status, _ in results)
+        with standalone_server(
+            upstream_url=fake.url, upstream_timeout_seconds=10,
+            forward_wait_seconds=5,
+        ) as server:
+            results = []
+            start = threading.Barrier(3)
+
+            def worker():
+                start.wait()
+                results.append(
+                    http_post(
+                        base_url(server), "/v1/embeddings",
+                        {"model": "m", "input": "x"},
+                    )
+                )
+
+            threads = [threading.Thread(target=worker) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            assert fake.max_inflight_seen <= 2
+            assert all(status == 200 for status, _ in results)
     finally:
-        server.shutdown(); server.server_close(); fake.close()
+        fake.close()
 
 
 def test_overload_beyond_wait_rejected():
     fake = FakeUpstream()
     fake.hang_seconds = 2.0
-    server = ea.make_server(
-        host="127.0.0.1", port=0, upstream_url=fake.url,
-        upstream_timeout_seconds=10, max_body_bytes=4096, max_concurrent=1,
-        forward_wait_seconds=0.2,
-    )
-    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-    results = []
-
-    def worker():
-        results.append(
-            http_post(base, "/v1/embeddings", {"model": "m", "input": "x"})
-        )
-
     try:
-        threads = [threading.Thread(target=worker) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        statuses = sorted(s for s, _ in results)
-        assert statuses == [200, 503]  # 一个转发,一个因等待超时被拒
+        with standalone_server(
+            upstream_url=fake.url, upstream_timeout_seconds=10,
+            max_concurrent=1, forward_wait_seconds=0.2,
+        ) as server:
+            results = []
+            # 两请求必须同时在位(Barrier):否则第二个晚到时第一个已释放槽,
+            # 双双 200 的假阴会让正确代码误报失败(2026-11-03 检视)。
+            start = threading.Barrier(2)
+
+            def worker():
+                start.wait()
+                results.append(
+                    http_post(
+                        base_url(server), "/v1/embeddings",
+                        {"model": "m", "input": "x"},
+                    )
+                )
+
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            statuses = sorted(s for s, _ in results)
+            assert statuses == [200, 503]  # 一个转发,一个因等待超时被拒
     finally:
-        server.shutdown(); server.server_close(); fake.close()
+        fake.close()
 
 
 # ---------- 安全:日志与转发不携带正文/凭据(§3.2 职责 7/8) ----------
 
 
 def test_logs_and_upstream_contain_no_body_or_credentials(adapter, upstream):
-    records = []
-
-    class Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record.getMessage())
-
     handler = Capture()
     ea.LOG.addHandler(handler)
     try:
@@ -717,8 +790,8 @@ def test_logs_and_upstream_contain_no_body_or_credentials(adapter, upstream):
         )
     finally:
         ea.LOG.removeHandler(handler)
-    assert any("200" in m for m in records)  # 有访问日志
-    assert not any("TOPSECRET" in m for m in records)  # 但不含正文/凭据
+    assert any("200" in m for m in handler.records)  # 有访问日志
+    assert not any("TOPSECRET" in m for m in handler.records)  # 但不含正文/凭据
     sent_headers = upstream.requests[-1][2]
     assert "Authorization" not in sent_headers  # 不向本地上游转发凭据头
 
@@ -733,19 +806,30 @@ def test_upstream_log_origin_strips_userinfo_path_and_query():
 
 
 def test_response_vector_not_logged(adapter, upstream):
-    records = []
-
-    class Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record.getMessage())
-
     handler = Capture()
     ea.LOG.addHandler(handler)
     try:
         http_post(adapter.base_url, "/v1/embeddings", mm_body())
     finally:
         ea.LOG.removeHandler(handler)
-    assert not any("0.1" in m for m in records)  # 向量数值不进日志
+    assert not any("0.1" in m for m in handler.records)  # 向量数值不进日志
+
+
+def test_query_string_not_logged(adapter, upstream):
+    """查询串属于请求内容(可携带凭据),访问日志只保留去查询串的路径
+    (2026-11-03 检视:原先 self.path 原样入日志)。"""
+    handler = Capture()
+    ea.LOG.addHandler(handler)
+    try:
+        http_post(
+            adapter.base_url, "/v1/embeddings?token=TOPSECRET-query",
+            {"input": "x"},
+        )
+    finally:
+        ea.LOG.removeHandler(handler)
+    joined = "\n".join(handler.records)
+    assert "TOPSECRET-query" not in joined
+    assert "/v1/embeddings" in joined
 
 
 def test_short_declared_body_is_rejected(adapter, upstream):
@@ -789,8 +873,7 @@ def test_get_health_with_body_cannot_desync_next_request(adapter):
             conn.putrequest("GET", "/health")
             conn.endheaders()
             outcome = conn.getresponse()
-        except (http.client.RemoteDisconnected, ConnectionError,
-                http.client.BadStatusLine, OSError):
+        except CLOSED_OR_RECONNECT:
             pass
         if outcome == "error":
             pass  # 连接级失败:正确契约
@@ -823,8 +906,7 @@ def test_body_read_timeout_is_408_and_closes(adapter, monkeypatch):
             conn.putheader("Content-Length", "0")
             conn.endheaders()
             outcome = conn.getresponse()
-        except (http.client.RemoteDisconnected, ConnectionError,
-                http.client.BadStatusLine, OSError):
+        except CLOSED_OR_RECONNECT:
             pass
         if outcome == "error":
             pass  # 连接级失败:正确契约(服务端已关,复用必须失败或重连)
@@ -870,7 +952,7 @@ def test_slow_drip_body_cannot_exceed_total_deadline(adapter, monkeypatch):
 def test_keepalive_restores_header_timeout_after_body_read(adapter, upstream, monkeypatch):
     import http.client
 
-    monkeypatch.setattr(ea.AdapterHandler, "timeout", 0.3)
+    monkeypatch.setattr(ea.AdapterHandler, "timeout", 2.0)
     body = json.dumps({"model": "m", "input": "x"}).encode()
     conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
     try:
@@ -878,17 +960,19 @@ def test_keepalive_restores_header_timeout_after_body_read(adapter, upstream, mo
         conn.putheader("Content-Type", "application/json")
         conn.putheader("Content-Length", str(len(body)))
         conn.endheaders()
-        # 逐字节慢发约 0.1s(deadline 0.3s 的 1/3):占去约 1/3 deadline、
-        # 剩余 ~0.2s;慢 CI 上 sleep 调度开销累计也不足以吃满 deadline,
-        # 避免首轮被 408 误杀。0.2s 总预算对 0.3s deadline 余量过紧。
+        # 逐字节慢发约 0.6s(deadline 2.0s 的 30%):占去约 0.6s、剩余 ~1.4s。
+        # 2026-11-03 检视:旧版 0.3s deadline + 0.25s sleep 仅留 ~50ms 余量,
+        # 调度抖动即可让正确实现 flake;放大时间轴后两侧余量均为 0.3s。
         for byte in body:
             conn.send(bytes([byte]))
-            time.sleep(0.1 / len(body))
+            time.sleep(0.6 / len(body))
         resp = conn.getresponse()
         assert resp.status == 200
         resp.read()
 
-        time.sleep(0.25)  # > 未恢复时的剩余 timeout(~0.2s),< 恢复后的 0.3s
+        # 睡 1.7s:> 未恢复 bug 的剩余 ~1.4s(触发回归断言),
+        # < 恢复后的 2.0s(通过侧余量 0.3s)。
+        time.sleep(1.7)  # > 未恢复时的剩余 timeout(~0.2s),< 恢复后的 0.3s
         conn.request("GET", "/health")
         resp = conn.getresponse()
         assert resp.status == 200
