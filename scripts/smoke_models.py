@@ -17,9 +17,10 @@ from pathlib import Path
 FIXTURES = "/opt/openviking/fixtures"
 
 _NEGATION = re.compile(
-    r"\b(?:not|no|never|cannot|can't|isn't|aren't|wasn't|weren't)\b|不是|并非|不知道|无法"
+    r"\b(?:not|no|never|cannot|can't|isn't|aren't|wasn't|weren't)\b"
+    r"|不是|并非|不知道|无法|没有|不含|不等于|不存在"
 )
-_IMAGE_NEGATION = re.compile(_NEGATION.pattern + r"|不红|不紅|非红|非紅")
+_IMAGE_NEGATION = re.compile(_NEGATION.pattern + r"|不红|不紅|非红|非紅|无红|无紅")
 _MULTI_DIGIT = re.compile(r"\d{2,}")
 _STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
 _ENGLISH_TWO = re.compile(r"(?<![a-z-])two(?![a-z-])")
@@ -67,16 +68,18 @@ def _image_answer_ok(text):
 
 
 def _valid_rerank_scores(scores):
-    return (
-        isinstance(scores, (list, tuple))
-        and len(scores) == 2
-        and all(
+    if not (isinstance(scores, (list, tuple)) and len(scores) == 2):
+        return False
+    try:
+        return all(
             isinstance(score, (int, float))
             and not isinstance(score, bool)
             and math.isfinite(score)
             for score in scores
         )
-    )
+    except OverflowError:
+        # JSON 可表达任意精度整数,超出 float 范围按无效分数处理而非崩溃。
+        return False
 
 
 def load_config():

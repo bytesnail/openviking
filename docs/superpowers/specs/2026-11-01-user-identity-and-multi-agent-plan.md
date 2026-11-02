@@ -210,6 +210,14 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
   `docker compose exec -T -e OPENVIKING_CLI_CONFIG_FILE=/app/.openviking/ovcli.test.conf openviking ov health -o json`。
   必须核对输出的 `user_id=test`、`account_id=default`、`role=user`;不得依赖
   宿主环境变量、容器默认配置或不完整的 `docker compose exec -e ...` 片段。
+- 临时配置的落盘位置(2026-11-02 检视补充):上例把配置放进
+  `/app/.openviking/`(宿主 `state/`)虽可工作,但崩溃/中断会把明文 test key
+  残留进 `state/`,并随其后每次 tar 备份长期扩散——恰好重新引入 §4 以
+  "test 不再维护持久 CLI 副本"消除的多副本漂移。helper 应优先经
+  `docker compose exec -T openviking sh -c 'cat > /tmp/ovcli.test.conf && chmod 600 ...'`
+  从 stdin 把配置写进容器 tmpfs(不进 `state/`、不进备份);退而求其次才用
+  `state/` 内临时文件,且必须:验收后立即删除并核对、崩溃后重跑前先清理
+  残留、轮换 test key 时同步清理此类副本。
 - 若需要抵御测试脚本误用或同 UID 进程读取,须把测试运行器放入独立 OS 用户
   或容器,仅挂载 test key,不挂载 default key/users.json;本方案当前未实施
   该 OS 级隔离,相关验收不得宣称"对任何身份零影响"。
@@ -220,14 +228,25 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
    (role=user);响应 `user_key` 原子写入 `state/secrets/test_user_api_key`(600)。
    实现时参数化复用 `bootstrap_auth.py` 的 `_post_json`、user 注册、
    `_atomic_write_secret` 与"创建成功但落盘失败则轮换、绝不重建"恢复逻辑,
-   不另写一套 curl/原子写平行实现。本步不创建 `meteor`,只为缩小首个审批的
-   影响面;**注意:若 §4 的 key hashing 未启用/未确认,创建任何 user 时服务端
+   不另写一套 curl/原子写平行实现。(参数化需当场修改 `bootstrap_auth.py`:
+   现有 `_register_default_user`、`run()` 的 409 回退链与落盘失败提示均硬编码
+   default/admin,并非可直接传参的现成 helper;该修改属于本步批准范围内的
+   实现工作,不违反文首执行禁令——禁令针对批准前的改动。)
+   本步不创建 `meteor`,只为缩小首个审批的影响面;**注意:若 §4 的 key hashing
+   未启用/未确认,创建任何 user 时服务端
    都会把其 key 明文写入 `state/data/.../_system/users.json`(见 §4),因此
    "不落入 repo/备份"不能靠推迟创建实现**,只能靠 key hashing/外部账户或接受
    该副本。
 2. 参数化复用 `bootstrap_auth._ov_health_ok` 的 JSON envelope、root-fallback 与
    key/URL 一致性检查(预期 account/user/role 及 root key 是否必需必须作为参数,
-   不能原样硬调 default/admin helper);test 健康检查用临时 600 配置且完成后删除。
+   不能原样硬调 default/admin helper)。除身份断言外,还须参数化 helper 内两处
+   与 default 部署绑定的硬编码(2026-11-02 检视补充):其一,`_saved_profile_path`
+   固定拼同目录 `ovcli.conf.local`——test 临时配置与 default 配置同目录,原样
+   复用会把 default 的 saved profile 当作 test 的漂移检查对象而恒判失败,其自身
+   真正的漂移反而漏检;其二,`_cli_config_matches` 强制要求配置含与目标一致的
+   `root_api_key`——§5.5 的临时配置只含 test key,且 §2.4 明令 root key 不得
+   放进测试夹具,故该比较必须按身份设为可选,不能为实现"通过检查"而在临时
+   配置写入 root key。test 健康检查用临时 600 配置且完成后删除。
    `ov health -o json` 分别以 default 与 test 身份验证,除 `healthy=true` 外必须
    断言 `result.account_id=default`、`result.user_id` 分别为 `default`/`test`,
    且 `result.role` 为 `admin`/`user`(**`role=root` 判失败**:root-only 配置
@@ -282,6 +301,11 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
 
 ## 8. 方案修正记录(避免回退)
 
+- 2026-11-02 检视修正(仅文档与实现预核,不执行):§6.2 补齐 `_ov_health_ok`
+  helper 两处与 default 绑定的硬编码(saved profile 固定名 `ovcli.conf.local`、
+  `root_api_key` 强制比较)的参数化要求;§5.5 增加临时 test 配置不得残留
+  `state/`(优先容器 tmpfs,防崩溃残留随备份扩散)的机制要求;§6.1 明确
+  参数化需当场修改 `bootstrap_auth.py` 且属批准范围内的实现工作。
 - 2026-11-02 全项目复核:明确同账户/同 UID 方案不满足绝对"完全分离";test
   默认只保留 key 文件并使用安全 direct curl,健康检查用临时配置;补齐完整
   identity 命令、私有夹具清理、真实 MCP/数据面验收、批量 harness、客户端

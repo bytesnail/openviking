@@ -31,6 +31,32 @@ def test_parse_quotes_comments_and_whitespace(tmp_path):
     }
 
 
+def test_parse_empty_value_with_inline_comment_is_empty(tmp_path):
+    """`KEY=   # comment` 与 compose 一致解析为空值;注释文本不得成为变量值。
+
+    旧实现先 strip 再按"空白+#"切,导致该形态把整段注释当值通过 precheck
+    并写入 ov.conf,容器侧却由 compose 注入空值(2026-11-02 检视)。
+    """
+    path = write(
+        tmp_path,
+        "Z_AI_API_KEY=   # paste key here\n"
+        "OPENVIKING_ROOT_API_KEY=#literal-hash\n"
+        "B=plain # trailing\n",
+    )
+    env = ef.parse_env_file(path)
+    assert env["Z_AI_API_KEY"] == ""
+    assert env["OPENVIKING_ROOT_API_KEY"] == "#literal-hash"
+    assert env["B"] == "plain"
+
+
+def test_parse_rejects_backslash_escape_in_double_quotes(tmp_path):
+    """双引号内反斜杠转义:本解析器不实现转义而 compose 会解码,两侧值会
+    静默不一致;必须 fail closed 而不是把原文当值放行。"""
+    path = write(tmp_path, 'A="line1\\nline2"\n')
+    with pytest.raises(ef.EnvFileError):
+        ef.parse_env_file(path)
+
+
 def test_parse_indented_export_bom_and_last_wins(tmp_path):
     path = tmp_path / "secrets.env"
     path.write_bytes(
@@ -172,3 +198,22 @@ def test_loaded_model_ids_requires_exact_membership():
     ids = ef.loaded_model_ids({"data": [{"id": "EmbeddingGemma-2-old"}]})
     assert "embeddinggemma-2-old" in ids
     assert "embeddinggemma-2" not in ids
+
+
+def test_model_name_matches_tolerates_path_and_quant_suffix_forms():
+    """llama-server id 形态漂移:裸名/完整路径/量化后缀都要能匹配到同一模型。"""
+    path_ids = ef.loaded_model_ids({
+        "models": [{"name": "/mnt/usr/models/unsloth/embeddinggemma-2-GGUF/"
+                             "embeddinggemma-2-F16.gguf"}],
+    })
+    assert ef.model_name_matches("embeddinggemma-2", path_ids)
+    assert ef.model_name_matches("EmbeddingGemma-2 ", path_ids)
+    bare_ids = {"embeddinggemma-2"}
+    assert ef.model_name_matches("embeddinggemma-2", bare_ids)
+    assert not ef.model_name_matches("embeddinggemma-3", path_ids)
+    assert not ef.model_name_matches("qwen3-reranker-0.6b", path_ids)
+    assert not ef.model_name_matches("", path_ids)
+    assert not ef.model_name_matches(None, path_ids)
+    # 不同路径下的同名文件:basename 相同即匹配
+    other_dir = {"/data/models/embeddinggemma-2.gguf"}
+    assert ef.model_name_matches("embeddinggemma-2", other_dir)

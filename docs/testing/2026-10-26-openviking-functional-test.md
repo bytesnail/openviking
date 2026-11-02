@@ -127,8 +127,8 @@
 ```bash
 cd /mnt/usr/tools/openviking
 python3 -m pytest tests/ -q                        # 单元:适配器协议 + 认证初始化(无外部依赖)
-python3 tests/e2e_adapter_probe.py                 # 适配器实况 7 项(需服务在位,不耗 GLM)
-bash tests/e2e_auth_matrix.sh                      # 认证边界 8 项(不耗 GLM)
+python3 tests/e2e_adapter_probe.py                 # 适配器实况 8 项(含 model-loaded;需服务在位,不耗 GLM)
+bash tests/e2e_auth_matrix.sh                      # 认证边界基础 9 项(test key 存在时追加 4 项 USER 行;不耗 GLM)
 docker compose exec -T openviking openviking-server doctor      # 10 项,含真实 embedding 探针
 docker compose exec -T openviking python -I -B /opt/openviking/scripts/smoke_models.py  # 2 次 GLM + rerank
 ```

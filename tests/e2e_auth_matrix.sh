@@ -38,12 +38,14 @@ if [[ ! "$BASE" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
   echo "FAIL-SETUP: BASE 仅允许无路径的 http loopback URL" >&2
   exit 1
 fi
-code() { curl -q -s -o /dev/null -w '%{http_code}' -m 15 "$@"; }
+# --noproxy '*':BASE 虽限 loopback,但设了 http_proxy/ALL_PROXY 的环境会把
+# 请求(连 ROOT/ADMIN key 头)送经代理;与 bootstrap/adapter 的禁代理纪律一致。
+code() { curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 15 "$@"; }
 code_auth() { # code_auth <header 行> <curl 参数...>;header 经 stdin 传入,不进 argv
   local header=$1
   shift
   printf 'header = "%s"\n' "$header" \
-    | curl -q -s -o /dev/null -w '%{http_code}' -m 15 -K - "$@"
+    | curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 15 -K - "$@"
 }
 fails=0
 

@@ -32,6 +32,7 @@ from embedding_adapter import single_vector  # noqa: E402
 from env_file import (  # noqa: E402
     EnvFileError,
     loaded_model_ids,
+    model_name_matches,
     parse_env_file,
     validate_config,
 )
@@ -42,7 +43,19 @@ UPSTREAM = os.environ.get(
 ).rstrip("/")
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 results = []
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """禁止跟随重定向:本探针只允许访问固定 loopback 端点,3xx 一律按失败
+    处理(返回 None 使 opener 以 HTTPError(3xx) 报错,不发后续请求)。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_DIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect()
+)
 
 
 def _configured_model():
@@ -113,14 +126,18 @@ def data_url(path):
 
 
 def check_loaded_model():
-    """配置的模型名必须出现在上游 /v1/models;请求里的 model 字段不足以校验。"""
+    """配置的模型名必须能匹配上游 /v1/models;请求里的 model 字段不足以校验。
+
+    匹配容忍 llama-server 的 id 形态漂移(裸名 / 完整路径 / 量化后缀),
+    见 env_file.model_name_matches;完全不同的模型名仍判 FAIL。
+    """
     try:
         with _DIRECT_OPENER.open(UPSTREAM + "/v1/models", timeout=10) as resp:
             data = json.load(resp)
         ids = loaded_model_ids(data)
         check(
             "model-loaded",
-            MODEL.lower() in ids,
+            model_name_matches(MODEL, ids),
             f"configured={MODEL} loaded={' '.join(sorted(ids)) or '(empty)'}",
         )
     except Exception as exc:
@@ -134,13 +151,18 @@ def main():
     q = "红色方块的图片"
     va = embed(ADAPTER, q)
     vu = embed(UPSTREAM, q)
-    check("text-parity", len(va) == 768 and len(vu) == 768 and cosine(va, vu) > 0.999,
-          f"dim_adapter={len(va)} dim_upstream={len(vu)} cosine={cosine(va, vu):.6f}")
+    # 维度不齐时 cosine 会按较短向量静默截断,得到无意义数值误导排障;
+    # 详情里只在维度一致时才计算 cosine。
+    c_parity = cosine(va, vu) if len(va) == len(vu) else float("nan")
+    check("text-parity", len(va) == 768 and len(vu) == 768 and c_parity > 0.999,
+          f"dim_adapter={len(va)} dim_upstream={len(vu)} cosine={c_parity:.6f}")
 
     # 2. OpenViking 裸 parts 多模态形态 → 恰好一个 768 维向量
+    # (同一 red.png 只读取/编码一次,步骤 2 与 2b 复用)
+    red_data_url = data_url(FIXTURES / "red.png")
     red_parts = [
         {"type": "text", "text": "describe this image"},
-        {"type": "image_url", "image_url": {"url": data_url(FIXTURES / "red.png")}},
+        {"type": "image_url", "image_url": {"url": red_data_url}},
     ]
     status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": red_parts})
     vecs = body.get("data", []) if isinstance(body, dict) else []
@@ -150,7 +172,7 @@ def main():
     # 留存步骤 2 的 red 向量供步骤 3 复用(2b 会覆盖 vecs/status)
 
     # 2b. 纯图 parts(无 text part)同样包装且可用(2026-10-26 补测)
-    img_only = [{"type": "image_url", "image_url": {"url": data_url(FIXTURES / "red.png")}}]
+    img_only = [{"type": "image_url", "image_url": {"url": red_data_url}}]
     status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": img_only})
     vecs = body.get("data", []) if isinstance(body, dict) else []
     image_only_vector = single_vector(body) if status == 200 else None

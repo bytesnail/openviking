@@ -27,6 +27,14 @@ def test_text_probe_rejects_nonempty_wrong_answer(answer):
     assert failures == ["vlm-text"]
 
 
+@pytest.mark.parametrize("answer", ["1+1不等于2", "答案不是2", "没有2", "不等于二"])
+def test_text_probe_rejects_chinese_negation_forms(answer):
+    """中文否定式(没有/不等于/不是)不得因含 "2"/"二" 被误判通过(2026-11-02 检视)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == ["vlm-text"]
+
+
 @pytest.mark.parametrize("answer", ["2", "二", "two", "2。", "答案是2", "答案是二", "the answer is two", "1+1=2"])
 def test_text_probe_accepts_expected_answer(answer):
     failures = []
@@ -38,6 +46,19 @@ def test_text_probe_accepts_expected_answer(answer):
     "blue", "The image is not red; it is blue.", "The image isn't red", "不红", "hundred", "不是红色",
 ])
 def test_image_probe_rejects_nonempty_wrong_color(monkeypatch, answer):
+    monkeypatch.setattr(
+        sm, "FIXTURES", str(Path(__file__).resolve().parent / "fixtures")
+    )
+    failures = []
+    sm.smoke_vlm_image(DummyVLM(image=answer), failures)
+    assert failures == ["vlm-image"]
+
+
+@pytest.mark.parametrize("answer", [
+    "图中没有红色", "图中无红色", "图中不含红色", "图中不存在红色",
+])
+def test_image_probe_rejects_chinese_negation_forms(monkeypatch, answer):
+    """中文否定式(没有/无红/不含/不存在)含 "红" 字时不得误判通过(2026-11-02 检视)。"""
     monkeypatch.setattr(
         sm, "FIXTURES", str(Path(__file__).resolve().parent / "fixtures")
     )

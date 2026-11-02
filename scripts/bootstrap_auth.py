@@ -35,7 +35,21 @@ USER_KEY_ENV = "OPENVIKING_USER_API_KEY"
 ROOT_KEY_ENV = "OPENVIKING_ROOT_API_KEY"
 # 本地管理请求必须直连;默认 urllib opener 会继承 http_proxy,可能把
 # root Authorization 或本机数据交给外部代理。
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """禁止跟随重定向。
+
+    urllib 默认对 301/302/303 的 POST 会转 GET 并原样携带 Authorization
+    (含 root key)追到 Location 目标(实测确认)。返回 None 使 opener 以
+    HTTPError(3xx) 报错,不发送后续请求。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_DIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect()
+)
 
 
 def _direct_urlopen(request, timeout):
@@ -116,6 +130,22 @@ def _register_default_user(base_url, root_key, timeout=30):
     )
 
 
+def _server_reachable(base_url, timeout=5):
+    """无凭据探测服务是否可达;任何 HTTP 应答(含 401/403)都算可达。"""
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/health", method="GET"
+    )
+    try:
+        with _direct_urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return True
+    except urllib.error.HTTPError:
+        return True
+    except (urllib.error.URLError, http.client.HTTPException, OSError,
+            ValueError):
+        return False
+
+
 def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
     """以密钥经子进程环境的方式调用 ov CLI;返回 CompletedProcess。
 
@@ -151,13 +181,19 @@ def _saved_profile_path(cli_config_path):
     )
 
 
-def _cli_config_matches(path, base_url, root_key, user_key):
+def _load_cli_config(path):
+    """读取并解析 CLI 配置;任何读取/解析失败返回 None(配置可能含凭据,勿记录原文)。"""
     try:
         with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
     except (OSError, ValueError):
-        return False
-    if not isinstance(cfg, dict):
+        return None
+    return cfg if isinstance(cfg, dict) else None
+
+
+def _cli_config_matches(path, base_url, root_key, user_key):
+    cfg = _load_cli_config(path)
+    if cfg is None:
         return False
     configured_url = cfg.get("url") or DEFAULT_BASE_URL
     return (
@@ -245,13 +281,18 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
         saved_path = _saved_profile_path(cli_config_path)
         if _cli_config_matches(saved_path, base_url, root_key, stored_key) \
                 and not _cli_config_matches(cli_config_path, base_url, root_key, stored_key):
+            saved_cfg = _load_cli_config(saved_path)
+            if saved_cfg is None:
+                print(
+                    "错误:从 saved profile 恢复 ovcli.conf 失败(读取/解析失败)",
+                    file=sys.stderr,
+                )
+                return RC_MANUAL_RECOVERY
             try:
-                with open(saved_path, encoding="utf-8") as fh:
-                    saved_cfg = json.load(fh)
                 _atomic_write_secret(Path(cli_config_path), json.dumps(saved_cfg))
                 cli_cfg_exists = True
                 print("已从匹配的 saved profile 原子恢复 ovcli.conf")
-            except (OSError, ValueError) as exc:
+            except OSError as exc:
                 print(
                     f"错误:从 saved profile 恢复 ovcli.conf 失败({type(exc).__name__})",
                     file=sys.stderr,
@@ -264,22 +305,32 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             _ensure_cli_language(
                 ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
             )
+            # 先做身份/漂移核查,再做任何写回(含 timeout 修补):漂移的
+            # saved profile 必须原样保留现场,不得先追加字段后报错。
+            if not _ov_health_ok(
+                ov_bin, cli_config_path, root_key, stored_key, env, base_url=base_url
+            ):
+                if not _server_reachable(base_url):
+                    print(
+                        "错误:服务暂不可达(连接失败),非凭据问题;"
+                        "待服务恢复后重跑即可",
+                        file=sys.stderr,
+                    )
+                    return RC_UPSTREAM
+                print(
+                    "错误:本地凭据存在但认证无效,需人工恢复/轮换(不重复创建账户)",
+                    file=sys.stderr,
+                )
+                return RC_MANUAL_RECOVERY
             if not _ensure_cli_timeout(cli_config_path):
                 print("错误:无法确保 ovcli.conf 的 timeout=300", file=sys.stderr)
                 return RC_CLI_CONFIG
-            if _ov_health_ok(
-                ov_bin, cli_config_path, root_key, stored_key, env, base_url=base_url
-            ):
-                print("已初始化:现有认证有效且身份为 default/default,幂等退出")
-                return RC_OK
-            print(
-                "错误:本地凭据存在但认证无效,需人工恢复/轮换(不重复创建账户)",
-                file=sys.stderr,
-            )
-            return RC_MANUAL_RECOVERY
-        # 能走到这里说明没有可用于恢复 active 的匹配 saved。active 缺失而
-        # 不一致 saved 仍存在时,先 fail closed;连 timeout 也不能改写它。
-        if not cli_cfg_exists and os.path.exists(saved_path):
+            print("已初始化:现有认证有效且身份为 default/default,幂等退出")
+            return RC_OK
+        # 走到这里 cli_cfg_exists 必为 False(上方分支所有路径均已返回)。
+        # active 缺失而不一致 saved 仍存在时,先 fail closed;连 timeout 也
+        # 不能改写它。
+        if os.path.exists(saved_path):
             print(
                 "错误:ovcli.conf 缺失且 saved profile 与目标 URL/key 不一致;"
                 "已原样保留,需人工恢复/轮换",
@@ -383,12 +434,16 @@ def _ensure_timeout_file(path, timeout=300):
         print(f"错误:{name} 顶层不是对象,无法确保 timeout", file=sys.stderr)
         return False
     current = cfg.get("timeout")
-    valid = (
-        isinstance(current, (int, float))
-        and not isinstance(current, bool)
-        and math.isfinite(current)
-        and current >= timeout
-    )
+    try:
+        valid = (
+            isinstance(current, (int, float))
+            and not isinstance(current, bool)
+            and math.isfinite(current)
+            and current >= timeout
+        )
+    except OverflowError:
+        # JSON 可表达任意精度整数;超出 float 范围按"非法值"重写为 300,不崩溃。
+        valid = False
     if valid:
         try:
             os.chmod(path, 0o600)

@@ -3,8 +3,10 @@
 
 解析规则覆盖 Docker Compose env_file 的常用形态:
 - UTF-8 BOM、CRLF、缩进行、`export KEY=...`、`KEY = value`、最后一条赋值生效;
-- 双/单引号、行内注释(` #` 起;`VALUE#literal` 保留);
-- 不实现 `$`/`${}` 插值与双引号转义(本项目密钥为 hex,不含这些字符)。
+- 双/单引号、行内注释(` #` 起;`VALUE#literal` 与紧跟 `=` 的 `#literal` 保留;
+  `KEY=   # comment` 的注释不算值,解析为空);
+- 不实现 `$`/`${}` 插值与双引号转义(本项目密钥为 hex,不含这些字符;
+  双引号值内出现反斜杠转义时直接报错,防止"校验通过但 Compose 注入不同值")。
 
 用法:
   env_file.py get <secrets.env> <NAME>          输出 NAME 的值(调用方捕获,不打印)
@@ -14,12 +16,32 @@
 所有错误只输出步骤/异常类型,绝不回显密钥值。
 """
 import json
+import posixpath
 import re
 import sys
 import urllib.request
 
 
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """禁止跟随重定向。
+
+    urllib 默认对 301/302/303 的 POST 会转 GET 并原样携带 Authorization 等
+    header 追到 Location 目标(实测确认),本地管理/校验请求绝不允许被重定向
+    带走。返回 None 使 opener 以 HTTPError(3xx) 报错,不发送后续请求。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_DIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect()
+)
+
+# 变量引用语法只此一份:展开与"未展开残留"检测共用,防止两份字面量漂移。
+_VAR_PATTERN = re.compile(
+    r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
+)
 
 
 class EnvFileError(Exception):
@@ -27,16 +49,23 @@ class EnvFileError(Exception):
 
 
 def parse_env_value(value):
-    value = value.strip()
     quoted = (
-        re.fullmatch(r'("(?:[^"\\]|\\.)*")\s*(?:#.*)?', value)
-        or re.fullmatch(r"('[^']*')\s*(?:#.*)?", value)
+        re.fullmatch(r'\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?', value)
+        or re.fullmatch(r"\s*('[^']*')\s*(?:#.*)?", value)
     )
     if quoted:
-        # 不实现双引号转义;本项目密钥为 hex,不含引号/反斜杠。
-        return quoted.group(1)[1:-1]
-    # Compose:非引号值的空白 + # 开始行内注释,VALUE#literal 不算。
-    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+        token = quoted.group(1)
+        if token.startswith('"') and "\\" in token:
+            # 不实现双引号转义;compose 会按转义解码而本解析器保留原文,
+            # 两侧值会静默不一致,故 fail closed。本项目密钥为 hex,不含反斜杠。
+            raise EnvFileError(
+                "双引号值内含反斜杠转义,本解析器不支持;请改用不含转义的值"
+            )
+        return token[1:-1]
+    # Compose:非引号值的行内注释以"空白 + #"开始,VALUE#literal 不算。
+    # 必须在未 strip 的原文上切,保留"# 前是否有空白"的信息:先 strip 会把
+    # `KEY=   # note` 变成值 "# note",而 compose 解析为空值。
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
 
 
 def parse_env_file(path):
@@ -90,15 +119,11 @@ def precheck_env(env):
 
 def _expand_config_vars(raw, env):
     """只用 Compose env_file 提供的值展开,不读取或修改宿主 os.environ。"""
-    pattern = re.compile(
-        r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
-    )
-
     def replace(match):
         name = match.group(1) or match.group(2)
         return env.get(name, match.group(0))
 
-    return pattern.sub(replace, raw)
+    return _VAR_PATTERN.sub(replace, raw)
 
 
 def validate_config(env, config_path):
@@ -109,11 +134,7 @@ def validate_config(env, config_path):
         raise EnvFileError(f"读取 ov.conf 失败({type(exc).__name__})") from None
     expanded = _expand_config_vars(raw, env)
     leftover = sorted(set(
-        name or short
-        for name, short in re.findall(
-            r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))",
-            expanded,
-        )
+        name or short for name, short in _VAR_PATTERN.findall(expanded)
     ))
     if leftover:
         raise EnvFileError(f"配置含未展开的变量引用: {', '.join(leftover)}")
@@ -150,6 +171,29 @@ def loaded_model_ids(data):
     }
 
 
+def model_name_matches(model, ids):
+    """配置模型名与加载列表是否指同一模型(容忍 id 形态漂移)。
+
+    llama-server 的 id 形态随版本漂移:早期为裸名(embeddinggemma-2),
+    2026-11-02 实测两端口均为完整路径(/mnt/.../embeddinggemma-2-F16.gguf)。
+    判定:id、basename 或去扩展名 stem 恰等于配置名,或以"配置名-"开头
+    (量化/精度后缀变体);完全无关的名字仍判不匹配,保留漂移预警意义。
+    """
+    if not isinstance(model, str) or not model.strip():
+        return False
+    target = model.strip().lower()
+    for item in ids:
+        if not isinstance(item, str):
+            continue
+        clean = item.strip().lower()
+        base = posixpath.basename(clean)
+        stem = base.rsplit(".", 1)[0] if "." in base else base
+        if clean == target or base == target or stem == target \
+                or stem.startswith(target + "-"):
+            return True
+    return False
+
+
 def check_model_drift(cfg):
     """模型名漂移预警(只警告,不阻断)。"""
     embedding = cfg.get("embedding")
@@ -168,14 +212,14 @@ def check_model_drift(cfg):
             ) as response:
                 data = json.load(response)
             ids = loaded_model_ids(data)
-            if model.lower() in ids:
+            if model_name_matches(model, ids):
                 continue
             detail = " ".join(sorted(ids)) or "(加载列表为空)"
         except Exception as exc:
             detail = f"查询失败({type(exc).__name__}),跳过核对"
         print(
-            f"PREPARE_WARN: {label} 上游({port})/v1/models 未含 {model!r}({detail});"
-            "模型名可能漂移,请人工确认",
+            f"PREPARE_WARN: {label} 上游({port})/v1/models 未匹配到 {model!r}"
+            f"(含路径/量化后缀形态)({detail});模型名可能漂移,请人工确认",
             file=sys.stderr,
         )
 

@@ -310,6 +310,18 @@ def test_prewrapped_multimodal_invalid_vector_502(adapter, upstream):
     assert status == 502
 
 
+def test_prewrapped_batch_over_one_item_rejected_400(adapter, upstream):
+    """多项 wrapped 批量输入必产生多向量(必然 502),应在转换阶段 400 拒绝,
+    不浪费整批上游推理(2026-11-02 检视)。"""
+    body = {"model": "m", "input": [
+        {"content": [dict(TEXT_PART)]},
+        {"content": [dict(TEXT_PART)]},
+    ]}
+    status, _ = http_post(adapter.base_url, "/v1/embeddings", body)
+    assert status == 400
+    assert upstream.requests == []
+
+
 def test_upstream_http_500_maps_to_generic_502(adapter, upstream):
     upstream.response_status = 500
     status, payload = http_post(adapter.base_url, "/v1/embeddings", mm_body())
@@ -498,7 +510,12 @@ def test_unknown_path_then_reuse_same_connection(adapter):
 
 
 def test_invalid_content_length_closes_connection(adapter):
-    """非法 Content-Length 的 400 之后连接必须关闭(体未读,不能复用)。"""
+    """非法 Content-Length 的 400 之后连接必须关闭(体未读,不能复用)。
+
+    服务端现以 `Connection: close` 显式声明关闭,http.client 会透明重连:
+    合格结果二选一——连接级失败,或重连后得到完整、不含残留体字节污染的
+    正常应答;绝不允许出现由未读体字节错位解析出的伪应答。
+    """
     import http.client
 
     conn = http.client.HTTPConnection(
@@ -512,17 +529,49 @@ def test_invalid_content_length_closes_connection(adapter):
         conn.send(b'{"input":"x"}')
         resp = conn.getresponse()
         assert resp.status == 400
+        assert resp.getheader("Connection") == "close"
         resp.read()
-        # 服务端已关连接:复用必须失败(写入即 EPIPE 或读取得到连接级错误),
-        # 而不是收到伪应答
-        with pytest.raises((http.client.RemoteDisconnected, ConnectionError,
-                            http.client.BadStatusLine, OSError)):
+        outcome = "error"
+        try:
             conn.putrequest("POST", "/v1/embeddings")
             conn.putheader("Content-Type", "application/json")
             conn.putheader("Content-Length", "2")
             conn.endheaders()
             conn.send(b"{}")
-            conn.getresponse()
+            outcome = conn.getresponse()
+        except (http.client.RemoteDisconnected, ConnectionError,
+                http.client.BadStatusLine, OSError):
+            pass
+        if outcome == "error":
+            pass  # 连接级失败:同样正确(客户端必须重连)
+        else:
+            raw = outcome.read()
+            assert outcome.status == 400
+            # `{}` 是合法 JSON 但非对象 → transform 阶段拒绝
+            assert json.loads(raw)["error"]["type"] == "invalid_request"
+    finally:
+        conn.close()
+
+
+def test_error_response_declares_connection_close(adapter):
+    """强制关闭的错误响应必须显式带 Connection: close,协议正确的
+    keep-alive 客户端才不会复用注定被关的连接(2026-11-02 检视)。"""
+    import http.client
+
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", adapter.server_address[1], timeout=10
+    )
+    try:
+        raw = b'{"input":"x"}x'  # 14 字节,合法长度但非法 JSON → 400
+        conn.putrequest("POST", "/v1/embeddings")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(raw)))
+        conn.endheaders()
+        conn.send(raw)
+        resp = conn.getresponse()
+        assert resp.status == 400
+        assert resp.getheader("Connection") == "close"
+        resp.read()
     finally:
         conn.close()
 
@@ -721,6 +770,8 @@ def test_short_declared_body_is_rejected(adapter, upstream):
 
 
 def test_get_health_with_body_cannot_desync_next_request(adapter):
+    """GET /health 带未读体后必须关闭连接并显式声明;复用方重连后得到的
+    必须是干净的新应答,绝不能是体字节错位解析出的伪应答。"""
     import http.client
 
     conn = http.client.HTTPConnection("127.0.0.1", adapter.server_address[1], timeout=10)
@@ -731,12 +782,22 @@ def test_get_health_with_body_cannot_desync_next_request(adapter):
         conn.send(b"{}")
         resp = conn.getresponse()
         assert resp.status == 200
+        assert resp.getheader("Connection") == "close"
         resp.read()
-        with pytest.raises((http.client.RemoteDisconnected, ConnectionError,
-                            http.client.BadStatusLine, OSError)):
+        outcome = "error"
+        try:
             conn.putrequest("GET", "/health")
             conn.endheaders()
-            conn.getresponse()
+            outcome = conn.getresponse()
+        except (http.client.RemoteDisconnected, ConnectionError,
+                http.client.BadStatusLine, OSError):
+            pass
+        if outcome == "error":
+            pass  # 连接级失败:正确契约
+        else:
+            raw = outcome.read()
+            assert outcome.status == 200
+            assert json.loads(raw) == {"status": "ok"}
     finally:
         conn.close()
 
@@ -754,13 +815,23 @@ def test_body_read_timeout_is_408_and_closes(adapter, monkeypatch):
         conn.send(b"{")
         resp = conn.getresponse()
         assert resp.status == 408
+        assert resp.getheader("Connection") == "close"
         assert json.loads(resp.read())["error"]["type"] == "request_timeout"
-        with pytest.raises((http.client.RemoteDisconnected, ConnectionError,
-                            http.client.BadStatusLine, OSError)):
+        outcome = "error"
+        try:
             conn.putrequest("POST", "/v1/embeddings")
             conn.putheader("Content-Length", "0")
             conn.endheaders()
-            conn.getresponse()
+            outcome = conn.getresponse()
+        except (http.client.RemoteDisconnected, ConnectionError,
+                http.client.BadStatusLine, OSError):
+            pass
+        if outcome == "error":
+            pass  # 连接级失败:正确契约(服务端已关,复用必须失败或重连)
+        else:
+            raw = outcome.read()
+            assert outcome.status == 400
+            assert json.loads(raw)["error"]["type"] == "invalid_json"
     finally:
         conn.close()
 
@@ -807,15 +878,17 @@ def test_keepalive_restores_header_timeout_after_body_read(adapter, upstream, mo
         conn.putheader("Content-Type", "application/json")
         conn.putheader("Content-Length", str(len(body)))
         conn.endheaders()
-        # 首轮占去大部分 deadline,使剩余的 socket timeout 小于下一轮等待。
+        # 逐字节慢发约 0.1s(deadline 0.3s 的 1/3):占去约 1/3 deadline、
+        # 剩余 ~0.2s;慢 CI 上 sleep 调度开销累计也不足以吃满 deadline,
+        # 避免首轮被 408 误杀。0.2s 总预算对 0.3s deadline 余量过紧。
         for byte in body:
             conn.send(bytes([byte]))
-            time.sleep(0.2 / len(body))
+            time.sleep(0.1 / len(body))
         resp = conn.getresponse()
         assert resp.status == 200
         resp.read()
 
-        time.sleep(0.2)  # > 首轮剩余 timeout,但 < 恢复后的 0.3s
+        time.sleep(0.25)  # > 未恢复时的剩余 timeout(~0.2s),< 恢复后的 0.3s
         conn.request("GET", "/health")
         resp = conn.getresponse()
         assert resp.status == 200

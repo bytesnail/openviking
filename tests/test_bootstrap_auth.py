@@ -375,8 +375,14 @@ def test_user_key_write_failure_enters_manual_recovery(
     sandbox, ovserver, monkeypatch, capsys
 ):
     """user 已创建但 key 落盘失败:不得抛 traceback,须提示轮换后人工恢复。"""
-    def failing_replace(*args):
-        raise OSError("disk full")
+    real_replace = ba.os.replace
+
+    def failing_replace(src, dst, *args):
+        # 只对沙盒内目标注入失败:ba.os 是全局 os 模块,无限补丁会波及
+        # 补丁窗口内任何无关的 os.replace 调用。
+        if str(dst).startswith(str(sandbox.tmp)):
+            raise OSError("disk full")
+        return real_replace(src, dst, *args)
 
     monkeypatch.setattr(ba.os, "replace", failing_replace)
     rc = run_bootstrap(sandbox, ovserver)
@@ -412,6 +418,40 @@ def test_server_unreachable_errors(sandbox):
     )
     assert rc != 0
     assert not sandbox.user_key.exists()
+
+
+def test_transient_outage_in_idempotent_path_is_upstream_not_manual(
+    sandbox, ovserver
+):
+    """凭据有效但服务暂不可达:判 RC_UPSTREAM(可重试),不得误导为
+    "认证无效,需人工恢复/轮换"(2026-11-02 检视)。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    rc = ba.run(
+        ROOT_KEY, "http://127.0.0.1:1", str(sandbox.cli_cfg),
+        str(sandbox.user_key), ov_bin=sandbox.ov_bin, env=dict(os.environ),
+    )
+    assert rc == ba.RC_UPSTREAM
+    assert ovserver.accounts_calls == 1  # 不重复创建账户
+
+
+def test_drifted_saved_profile_is_not_mutated_before_manual_recovery(
+    sandbox, ovserver
+):
+    """saved profile 漂移时,幂等路径必须先核查后写回:不得先给它补
+    timeout/chmod 再报人工恢复(保留现场)。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    cfg = json.loads(sandbox.cli_cfg.read_text())
+    drifted = {k: v for k, v in cfg.items() if k != "timeout"}
+    drifted["api_key"] = "older-rotated-key"
+    saved.write_text(json.dumps(drifted))
+    os.chmod(saved, 0o644)
+
+    assert run_bootstrap(sandbox, ovserver) == ba.RC_MANUAL_RECOVERY
+
+    # 原样保留:内容未追加 timeout,权限未被收紧
+    assert json.loads(saved.read_text()) == drifted
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o644
 
 
 def test_secrets_dir_created_with_tight_mode(sandbox, ovserver):
@@ -581,7 +621,14 @@ def test_timeout_write_failure_is_reported_and_idempotent_retry_repairs(
     sandbox.cli_cfg.write_text(json.dumps(cfg))
 
     real_replace = ba.os.replace
-    monkeypatch.setattr(ba.os, "replace", lambda *args: (_ for _ in ()).throw(OSError()))
+
+    def failing_replace(src, dst, *args):
+        # 只对沙盒内目标注入失败,避免波及补丁窗口内的无关 os.replace。
+        if str(dst).startswith(str(sandbox.tmp)):
+            raise OSError()
+        return real_replace(src, dst, *args)
+
+    monkeypatch.setattr(ba.os, "replace", failing_replace)
     assert run_bootstrap(sandbox, ovserver) == ba.RC_CLI_CONFIG
     assert "timeout" not in json.loads(sandbox.cli_cfg.read_text())
 

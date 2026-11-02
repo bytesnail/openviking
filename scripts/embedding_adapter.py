@@ -2,8 +2,9 @@
 """OpenViking v0.5.2 多模态 embedding 协议适配器(设计 §3.2)。
 
 只做一件事:OpenViking 发出的裸 typed-parts 多模态 `input` 与本机 llama.cpp
-要求的 `[{"content": parts}]` 外壳之间的形态转换;纯文本、文本批处理与已包装
-输入原样转发。仅用 Python 标准库,配合镜像内 venv Python 运行。
+要求的 `[{"content": parts}]` 外壳之间的形态转换;纯文本、文本批处理与单项
+已包装输入原样转发(多项 wrapped 批量输入按"恰好一个向量"契约以 400 拒绝)。
+仅用 Python 标准库,配合镜像内 venv Python 运行。
 
 安全约束:只监听 loopback;不读取任何密钥;不记录请求正文、图片、向量、
 Authorization 头或响应正文;转发并发上限受限,不排队无界请求。
@@ -25,7 +26,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LOG = logging.getLogger("embedding_adapter")
 LOG.setLevel(logging.INFO)  # 访问日志为 INFO;确保未配置 root handler 时仍可达
 # 模型请求与 readiness 均只访问本机,禁止继承宿主代理发送文本/图片。
-_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """禁止跟随重定向。
+
+    urllib 默认会把 301/302/303 的 POST 转 GET 追到 Location 目标(GET
+    路径则原样跟随)。上游只允许是固定 loopback 地址,绝不允许任何 3xx
+    把请求(或探测)引去别处。返回 None 使 opener 以 HTTPError(3xx) 报错。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_DIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect()
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18353
@@ -83,10 +98,15 @@ def single_vector(body):
     vector = body["data"][0].get("embedding")
     if not isinstance(vector, list) or not vector:
         return None
-    if not all(
-        isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-        for x in vector
-    ):
+    try:
+        finite = all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            for x in vector
+        )
+    except OverflowError:
+        # JSON 可表达任意精度整数;超出 float 范围按无效向量处理而非 500。
+        return None
+    if not finite:
         return None
     if not any(x != 0 for x in vector):
         return None  # 全零向量无法归一化,余弦相似度未定义
@@ -110,7 +130,8 @@ def transform_body(body):
     """按 §3.2 分类并转换请求体;返回 (新请求体, 是否为多模态包装)。
 
     拒绝(RequestError):非对象、缺 input、input 非字符串/列表、空列表、
-    混合形态、含不支持 part 类型或字段非法。不猜测转换。
+    混合形态、含不支持 part 类型或字段非法、多项 wrapped 批量输入。
+    不猜测转换。
     """
     if not isinstance(body, dict):
         raise RequestError(400, "invalid_request", "request body must be a JSON object")
@@ -126,6 +147,16 @@ def transform_body(body):
     if all(isinstance(x, str) for x in inp):
         return body, False
     if _is_wrapped_input(inp):
+        # 多项 wrapped 批量输入会让上游返回 N 个向量,而本适配器的多模态
+        # 契约是"恰好一个向量"——原样转发只会把整批推理结果 502 掉
+        # (ov.conf embedding.max_retries 还会放大成 N×3 次推理),在
+        # 转换阶段就以 400 拒绝,不猜测转换。
+        if len(inp) != 1:
+            raise RequestError(
+                400,
+                "unsupported_input",
+                "wrapped input must contain exactly one item",
+            )
         return body, False
     if all(_is_text_part(x) or _is_image_part(x) for x in inp):
         return {**body, "input": [{"content": inp}]}, True
@@ -187,18 +218,23 @@ class AdapterHandler(BaseHTTPRequestHandler):
 
     # ---- 响应工具:统一 JSON 输出,错误信息一律通用化,不回显上游正文 ----
 
-    def _send_json(self, status, obj):
+    def _send_json(self, status, obj, close=False):
         raw = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        if close:
+            # 服务端确定不复用连接时必须向客户端声明;否则协议正确的
+            # keep-alive 客户端有权复用连接,复用请求只会撞上单方面关闭。
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(raw)
 
     def _send_error_json(self, status, code, message):
         # 错误路径可能尚未读完请求体;统一关闭,防止 keep-alive 请求错位。
         self.close_connection = True
-        self._send_json(status, {"error": {"message": message, "type": code}})
+        self._send_json(status, {"error": {"message": message, "type": code}},
+                        close=True)
 
     def log_request(self, code="-", size="-"):
         # 空连接/坏请求行可能在 command/path 赋值前触发日志。
@@ -221,22 +257,23 @@ class AdapterHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def do_GET(self):
-        # GET 也可能带体;成功响应前不读体,因此统一禁止连接复用。
+        # GET 也可能带体;成功响应前不读体,因此统一禁止连接复用
+        # (close=True 向客户端显式声明,防复用撞上单方面关闭)。
         self.close_connection = True
         if self.path == "/health":
-            self._send_json(200, {"status": "ok"})
+            self._send_json(200, {"status": "ok"}, close=True)
             return
         if self.path == "/ready":
             if self._upstream_healthy():
-                self._send_json(200, {"status": "ready", "upstream": "ok"})
+                self._send_json(200, {"status": "ready", "upstream": "ok"}, close=True)
             else:
-                self._send_json(503, {"status": "unavailable", "upstream": "down"})
+                self._send_json(
+                    503, {"status": "unavailable", "upstream": "down"}, close=True
+                )
             return
         if self.path == "/v1/embeddings":
-            self.close_connection = True  # 未读潜在请求体,关闭连接防止 keep-alive 错位
             self._send_error_json(405, "method_not_allowed", "use POST")
             return
-        self.close_connection = True  # 同上:未知路径不读体,直接关连接
         self._send_error_json(404, "not_found", "unknown path")
 
     def do_POST(self):
@@ -416,6 +453,40 @@ def make_server(host=DEFAULT_HOST, port=DEFAULT_PORT, upstream_url=DEFAULT_UPSTR
     )
 
 
+def _env_int(name, default, minimum=1):
+    """读取整数环境变量;非法值或缺下界立即报错退出。
+
+    不校验的后果:非整数以裸 traceback 崩溃并进入 restart 循环;
+    EMBEDDING_MAX_CONNECTIONS=0 会让 BoundedSemaphore(0) 把 accept 主循环
+    在首个连接上永久阻塞(静默无响应),两者都必须 fail loud。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"配置错误:{name} 必须是整数,当前值无法解析"
+        ) from None
+    if value < minimum:
+        raise SystemExit(f"配置错误:{name} 必须 >= {minimum}")
+    return value
+
+
+def _loopback_host(host):
+    """宿主地址必须显式是 loopback:模块安全约束是"只监听 loopback",
+    容器为 host 网络且适配器无认证,误绑 0.0.0.0 会把无鉴权代理暴露到局域网,
+    必须 fail loud 而非静默照绑。"""
+    resolved = {"localhost": "127.0.0.1"}.get(host, host)
+    if resolved not in ("127.0.0.1", "::1"):
+        raise SystemExit(
+            f"配置错误:EMBEDDING_ADAPTER_HOST={host} 不是 loopback;"
+            "本适配器只允许绑定 127.0.0.1/::1/localhost"
+        )
+    return resolved
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -423,20 +494,18 @@ def main():
         stream=sys.stderr,
     )
     server = make_server(
-        host=os.environ.get("EMBEDDING_ADAPTER_HOST", DEFAULT_HOST),
-        port=int(os.environ.get("EMBEDDING_ADAPTER_PORT", DEFAULT_PORT)),
+        host=_loopback_host(os.environ.get("EMBEDDING_ADAPTER_HOST", DEFAULT_HOST)),
+        port=_env_int("EMBEDDING_ADAPTER_PORT", DEFAULT_PORT),
         upstream_url=os.environ.get("EMBEDDING_UPSTREAM_URL", DEFAULT_UPSTREAM),
-        upstream_timeout_seconds=int(
-            os.environ.get("EMBEDDING_UPSTREAM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT)
+        upstream_timeout_seconds=_env_int(
+            "EMBEDDING_UPSTREAM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT
         ),
-        max_body_bytes=int(os.environ.get("EMBEDDING_MAX_BODY_BYTES", DEFAULT_MAX_BODY)),
-        max_concurrent=int(os.environ.get("EMBEDDING_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT)),
-        max_response_body_bytes=int(os.environ.get(
+        max_body_bytes=_env_int("EMBEDDING_MAX_BODY_BYTES", DEFAULT_MAX_BODY),
+        max_concurrent=_env_int("EMBEDDING_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT),
+        max_response_body_bytes=_env_int(
             "EMBEDDING_MAX_RESPONSE_BODY_BYTES", DEFAULT_MAX_RESPONSE_BODY
-        )),
-        max_connections=int(os.environ.get(
-            "EMBEDDING_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS
-        )),
+        ),
+        max_connections=_env_int("EMBEDDING_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS),
     )
     LOG.info(
         "listening host=%s port=%d upstream=%s",
