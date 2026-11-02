@@ -19,14 +19,14 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
   他人 key;因此 default/root key 在效果上可读取所有 user 数据,必须按最高
   敏感级保护。**
 - 不启用 VikingBot(无 18790 Gateway)。
-- 真实凭据在 `secrets.env`(600)、`state/secrets/user_api_key`、
-  `state/ovcli.conf` 与 `state/ovcli.conf.local`、容器环境,以及 OpenViking
-  服务端 key 存储 `state/data/viking/default/_system/users.json`(当前 644,
-  外层 `state` 700;详见下节"认证凭据位置");`ov.conf` 仅保存 `${VAR}` 引用。
+- 真实凭据的完整清单、位置与权限见下节"认证凭据位置";`ov.conf` 仅保存
+  `${VAR}` 引用。
 
 ## 前提
 
-- `secrets.env` 已存在且含非占位 `Z_AI_API_KEY`(缺失时 `prepare.sh` 会明确报错;`OPENVIKING_ROOT_API_KEY` 可由其自动生成)。
+- 宿主需有 `bash`、`python3`(`prepare.sh` 的 secrets/config 校验与密钥生成)、
+  `curl`(认证矩阵)、`ss`(端口检查)、`tar`(备份)与 Docker Compose。
+- `secrets.env` 已存在且含非占位 `Z_AI_API_KEY`(缺失时 `prepare.sh` 会明确报错);`OPENVIKING_ROOT_API_KEY` 缺失时由 `prepare.sh` 自动生成 32 字节 hex,手工提供时须非占位且至少 16 字符。
 - `model-serving/bin/serve.sh status` 显示两个模型运行(18351/18352 在位)。
 - 当前用户 UID/GID 为 `1000:1000`(与 `compose.yaml` 的 `user` 一致;其他用户部署须先显式改 Compose 与 `scripts/prepare.sh` 中的常量)。
 - 端口 1933、18353 空闲。
@@ -56,9 +56,15 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 - User key:`state/secrets/user_api_key`(600),**以及服务端存储
   `state/data/viking/default/_system/users.json`(当前 644;该文件保存每个
   user 的明文 key,随 `state/` 进入备份)**。
-- CLI 配置:`state/ovcli.conf` 与 `state/ovcli.conf.local`(两者均 600、内容
-  应一致,均含 User key 与 root key);前者由 bootstrap 生成,后者人工维护,
-  bootstrap **不写**此文件,轮换/清理任一密钥时须同步处理两份配置。
+- CLI 配置:`state/ovcli.conf`(active)与 `state/ovcli.conf.local`(后者是
+  `ov config add --name local` 写入的 **CLI saved profile**,不是手工副本;
+  bootstrap 通过该命令间接写入)。saved profile 路径固定为同目录
+  `ovcli.conf.<name>`,与 active 配置文件名无关;创建 test 配置时不要用
+  `--name local`(会覆盖 default 的 saved profile),应使用独立 name。两者均
+  600、内容应一致,均含 User key 与
+  root key;轮换/清理任一密钥时须同步处理两份配置。bootstrap 会同时为 active
+  配置与 saved profile 补 `"timeout": 300`(已有则不覆盖);若 active 配置丢失
+  而 user key 仍在,重跑 bootstrap 会用 `--force` 重建 active 与 saved profile。
   轮换 user key 后 users.json 由 Admin API 更新,但旧备份仍含旧 key。
 - `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
   创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
@@ -67,6 +73,9 @@ Studio(`http://127.0.0.1:1933/studio`)登录用 User key:在本地终端自行
 `cat state/secrets/user_api_key` 读取,不要复制进对话或日志。**不要在 agent
 会话或工具调用中执行该 `cat`**(会把明文带进 transcript);agent 需要凭据值时
 只能走变量中转或 `read -s` 式无回显输入。
+`state/data/viking/default/_system/users.json` 保存同一批明文 key(当前 644,
+同 UID 可读),同样禁止 cat/Read/粘贴;`state` 的 700 只对同机其他 OS 用户
+生效,不构成对同 UID agent/测试进程的隔离边界。
 
 ## 验收
 
@@ -81,10 +90,15 @@ curl -fsS http://127.0.0.1:1933/ready
 - `doctor` 须全项通过(embedding 探针为真实请求,返回 768 维)。
 - `smoke_models.py` 发起 2 次 GLM 真实调用与 1 次 rerank 真实请求,消耗少量
   Coding Plan 用量;`ov health -o json` 须含 `"healthy": true`,且
-  `result.account_id/user_id` 均为 `default`(排除无 key 或错身份的假通过)。
+  `result.account_id/user_id` 均为 `default`、`result.role` 为 `admin` 或
+  `user`(**`role=root` 必须判失败**:root-only 配置也会返回
+  default/default/healthy,不能作为数据面验收)。
 - 扩展功能面(2026-10-26 两轮全量通过):`python3 tests/e2e_adapter_probe.py`
-  (适配器实况 7 项)与 `bash tests/e2e_auth_matrix.sh`(认证边界 8 项)不
-  消耗 GLM,可随时重跑;完整矩阵、发现(F1–F4)与复测方法见
+  (适配器实况 8 项,含配置模型名与 /v1/models 加载列表比对)与
+  `bash tests/e2e_auth_matrix.sh`(基础认证边界 9 项;
+  `state/secrets/test_user_api_key` 存在时自动追加 4 项 USER 边界,否则
+  SKIP)不消耗 GLM,可随时重跑;该矩阵默认覆盖 ROOT/ADMIN,普通 USER 边界需先
+  按方案 §5.1 创建 test 并重跑。完整矩阵、发现(F1–F4)与复测方法见
   `docs/testing/2026-10-26-openviking-functional-test.md`。
 - 端到端(§9.4):
 
@@ -95,8 +109,10 @@ docker compose exec -T openviking ov find "紫鸢尾-7 号信标的校准码"
 docker compose exec -T openviking ov ls viking://resources
 ```
 
-- `--to` 必须指向不存在的 URI:已存在时是"替换"语义,旧内容会被更新掉
-  (多资源导入每资源独立 `--to`,或先 `mkdir` 再用 `--parent`)。
+- 上述固定 `--to` URI 在当前基线中已存在(见方案 §6.3),因此是"替换"语义:
+  仅用于冒烟资源,勿指向真实数据;若需保留旧冒烟内容,改用唯一 URI 或先删除。
+- `--to` 指向已存在 URI 时是"替换"语义,旧内容会被更新掉;真实资源必须使用
+  不存在的新 URI(多资源导入每资源独立 `--to`,或先 `mkdir` 再用 `--parent`)。
 - 大图(>4096px 任一边或 >10MB)摄入走切片管线:落库的是低清预览 +
   网格图 + tiles,**原图按设计不保存、不可 `ov get` 取回**;此类任务
   约 3 分钟,建议异步提交后轮询 `ov task list`(详见测试报告 §8.7)。

@@ -331,7 +331,7 @@ curl -fsSL https://openviking.ai/install | bash -s -- \
 | key | 能否可能通过安装器 status 探测 | 后续数据面/MCP |
 |---|---|---|
 | USER | 可以；status 不要求 ADMIN | 官方明确支持，受 account/user 与资源 ACL 约束 |
-| ADMIN | 可以 | 可以，但以自己的 user 身份访问，不等于可任意切换他人身份 |
+| ADMIN | 可以 | 可以，但以自己的 user 身份访问；**在 v0.5.2.1 上还可通过 `GET /api/v1/admin/accounts/<acct>/users`（默认 `include_credentials=true`）取得本账户所有 user 的明文 key，并可轮换任何 user 的 key**，效果上等价于账户内数据访问（见 [auth-roles 笔记 §2.2/§5.2](2026-11-02-openviking-agent-auth-roles.md)） |
 | ROOT | **也可能通过**，因为 `/api/v1/system/status` 在 ROOT allowlist | API Key 模式下不能访问 tenant-scoped 数据 API；不应作为正常插件/MCP 数据 key |
 
 官方两层 key 模型和 tenant 规则见 [Authentication L46-L55、L156-L165](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/docs/en/guides/04-authentication.md#L156-L165)；MCP 明确要求 User/Admin key，见 [MCP Authentication L28-L35](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/docs/en/guides/06-mcp-integration.md#L28-L35)。ROOT 的 allowlist 和 tenant 拒绝实现见 [`api_key.py` L17-L35、L203-L217](https://github.com/volcengine/OpenViking/blob/f5e6203033a13469c3d9a937f2ca39492ea69c51/openviking/server/auth/plugins/api_key.py#L203-L217)。

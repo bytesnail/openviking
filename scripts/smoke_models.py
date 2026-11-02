@@ -9,9 +9,51 @@
 """
 import json
 import os
+import re
 import sys
 
 FIXTURES = "/opt/openviking/fixtures"
+
+_NEGATION = re.compile(r"\b(?:not|no|never|cannot|can't)\b|不是|并非|不知道|无法")
+_MULTI_DIGIT = re.compile(r"\d{2,}")
+_STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
+_RED_WORD = re.compile(r"\bred\b")
+
+
+def _normalize_answer(text):
+    if not isinstance(text, str):
+        return ""
+    return text.strip().lower().rstrip("。.!！?？ ")
+
+
+def _text_answer_ok(text):
+    """接受 correct 的 2/二/two 及自然短语;拒绝 2025/12/否定句。"""
+    normalized = _normalize_answer(text)
+    if not normalized:
+        return False
+    if normalized in {"2", "二", "兩", "两", "two"}:
+        return True
+    if _NEGATION.search(normalized) or _MULTI_DIGIT.search(normalized):
+        return False
+    # 允许 "答案是2" / "1+1=2" 等,但 2 不能是多位数的一部分。
+    return _STANDALONE_TWO.search(normalized) is not None
+
+
+def _image_answer_ok(text):
+    """接受 red/红/红色 及自然短语;拒绝否定句、blue/hundred。"""
+    normalized = _normalize_answer(text)
+    if not normalized:
+        return False
+    if normalized in {"红", "紅", "红色", "紅色", "red"}:
+        return True
+    if (
+        _NEGATION.search(normalized)
+        or "blue" in normalized
+        or "蓝" in normalized
+        or "藍" in normalized
+    ):
+        return False
+    return _RED_WORD.search(normalized) is not None or "红" in normalized or "紅" in normalized
 
 
 def load_config():
@@ -23,11 +65,9 @@ def load_config():
 def smoke_vlm_text(vlm, failures):
     try:
         text = vlm.get_completion(prompt="用一个词回答:1 加 1 等于几?")
-        nonempty = isinstance(text, str) and bool(text.strip())
-        hint = (
-            "2" in text or "二" in text or "兩" in text or "两" in text
-            or "two" in text.lower()
-        ) if nonempty else False
+        # 语义判据:不接受 "2025"/"12"/否定句等含 "2" 的 substring 假通过,
+        # 但允许 "答案是2"/"1+1=2" 这类自然正确回答。
+        hint = _text_answer_ok(text)
         print(f"[vlm-text]   {'OK' if hint else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} answer_correct={hint}")
         if not hint:
             failures.append("vlm-text")
@@ -45,9 +85,10 @@ def smoke_vlm_image(vlm, failures):
         text = vlm.get_vision_completion(
             prompt="这张图片的主要颜色是什么?只用一个词回答。", images=[image_bytes]
         )
-        nonempty = isinstance(text, str) and bool(text.strip())
-        mentions_red = ("红" in text or "紅" in text or "red" in text.lower()) if nonempty else False
-        ok = nonempty and mentions_red
+        # 语义判据:拒绝 "not red"/"hundred"/blue 等 substring/否定假通过,
+        # 但允许 "这张图片是红色" 这类自然正确回答。
+        mentions_red = _image_answer_ok(text)
+        ok = mentions_red
         print(
             f"[vlm-image]  {'OK' if ok else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} "
             f"mentions_red={mentions_red}"

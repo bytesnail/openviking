@@ -1,6 +1,8 @@
 """smoke_models 语义判据:非空但错误的模型响应不得判成功。"""
 from pathlib import Path
 
+import pytest
+
 import smoke_models as sm
 
 
@@ -16,31 +18,39 @@ class DummyVLM:
         return self.image
 
 
-def test_text_probe_rejects_nonempty_wrong_answer():
+@pytest.mark.parametrize("answer", [
+    "banana", "2025", "12", "I cannot compute 2+2", "不知道,2?",
+])
+def test_text_probe_rejects_nonempty_wrong_answer(answer):
     failures = []
-    sm.smoke_vlm_text(DummyVLM(text="banana"), failures)
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
     assert failures == ["vlm-text"]
 
 
-def test_text_probe_accepts_expected_answer():
+@pytest.mark.parametrize("answer", ["2", "二", "two", "2。", "答案是2", "1+1=2"])
+def test_text_probe_accepts_expected_answer(answer):
     failures = []
-    sm.smoke_vlm_text(DummyVLM(text="two"), failures)
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
     assert failures == []
 
 
-def test_image_probe_rejects_nonempty_wrong_color(monkeypatch):
+@pytest.mark.parametrize("answer", [
+    "blue", "The image is not red; it is blue.", "hundred", "不是红色",
+])
+def test_image_probe_rejects_nonempty_wrong_color(monkeypatch, answer):
     monkeypatch.setattr(
         sm, "FIXTURES", str(Path(__file__).resolve().parent / "fixtures")
     )
     failures = []
-    sm.smoke_vlm_image(DummyVLM(image="blue"), failures)
+    sm.smoke_vlm_image(DummyVLM(image=answer), failures)
     assert failures == ["vlm-image"]
 
 
-def test_image_probe_accepts_red(monkeypatch):
+@pytest.mark.parametrize("answer", ["red", "红", "红色", "red。", "The image is red", "这张图片是红色"])
+def test_image_probe_accepts_red(monkeypatch, answer):
     monkeypatch.setattr(
         sm, "FIXTURES", str(Path(__file__).resolve().parent / "fixtures")
     )
     failures = []
-    sm.smoke_vlm_image(DummyVLM(image="red"), failures)
+    sm.smoke_vlm_image(DummyVLM(image=answer), failures)
     assert failures == []

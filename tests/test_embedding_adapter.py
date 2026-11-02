@@ -292,6 +292,7 @@ def test_multimodal_array_json_502(adapter, upstream):
     {"data": [{"embedding": []}]},
     {"data": [{"embedding": [0.1, "bad"]}]},
     {"data": [{"embedding": [float("nan")]}]},
+    {"data": [{"embedding": [0.0] * 768}]},  # 全零向量:余弦未定义
 ])
 def test_multimodal_invalid_vector_502(adapter, upstream, response_body):
     upstream.response_body = response_body

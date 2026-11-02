@@ -117,6 +117,9 @@ def _health_url(upstream_url):
 
 class AdapterHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # headers 与 body 分两次写;不关 Nagle 会在 loopback keep-alive 上触发
+    # delayed-ACK,每个响应多约 40ms(实测;socketserver 会设 TCP_NODELAY)。
+    disable_nagle_algorithm = True
     # 入站读超时:声明 Content-Length 后停滞的连接不再永久占住线程
     # (慢速合法大请求不受影响——超时是按每次 read 计,不是按总时长计)
     timeout = 120
@@ -226,6 +229,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
                     and math.isfinite(x)
                     for x in vector
                 )
+                # 全零向量无法归一化(余弦未定义),与 e2e 探针的判据一致。
+                and any(x != 0 for x in vector)
             )
             if not valid_vector:
                 LOG.warning("multimodal vector response invalid")

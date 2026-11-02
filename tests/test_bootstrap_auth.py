@@ -92,7 +92,10 @@ class FakeOvServer:
                     self._json(404, {"error": "not found"})
                     return
                 auth = self.headers.get("Authorization")
-                if auth != f"Bearer {server.accepted_user_key}":
+                if auth not in (
+                    f"Bearer {server.accepted_user_key}",
+                    f"Bearer {ROOT_KEY}",  # 真实 /health 也接受 ROOT;用于覆盖 root-fallback
+                ):
                     self._json(401, {"status": "error"})
                     return
                 self._json(200, {"status": "ok", "healthy": True})
@@ -128,29 +131,55 @@ import json, os, sys, urllib.request, urllib.error
 cfg_path = os.environ["OPENVIKING_CLI_CONFIG_FILE"]
 args = sys.argv[1:]
 if args[:1] == ["language"]:
-    # 模拟真实 CLI:语言设置写入独立 settings 文件
-    settings = os.path.join(os.path.dirname(cfg_path), "ovcli.settings.conf")
+    # 模拟真实 CLI:语言设置固定在 $HOME/.openviking/ovcli.settings.conf。
+    settings_dir = os.path.join(os.environ["HOME"], ".openviking")
+    os.makedirs(settings_dir, exist_ok=True)
+    settings = os.path.join(settings_dir, "ovcli.settings.conf")
     with open(settings, "w") as fh:
         json.dump({{"language": args[1] if len(args) > 1 else "en"}}, fh)
     sys.exit(0)
 if args[:3] == ["config", "add", "custom"]:
+    if os.environ.get("OV_STUB_ARGS_FILE"):
+        with open(os.environ["OV_STUB_ARGS_FILE"], "w") as fh:
+            fh.write(" ".join(args))
     if os.environ.get("OV_STUB_CONFIG_FAIL") == "1":
         sys.exit(3)
     url = args[args.index("--url") + 1]
-    key = os.environ[os.environ.get("OV_STUB_USER_ENV", "OPENVIKING_USER_API_KEY")]
-    conf = {{"active": "local", "profiles": {{"local": {{"url": url, "api_key": key}}}}}}
+    api_env = (
+        args[args.index("--api-key-env") + 1]
+        if "--api-key-env" in args else "OPENVIKING_USER_API_KEY"
+    )
+    key = os.environ[api_env]
+    conf = {{"api_key": key, "url": url}}
+    if "--root-api-key-env" in args:
+        root_env = args[args.index("--root-api-key-env") + 1]
+        root_key = os.environ.get(root_env)
+        if root_key:
+            conf["root_api_key"] = root_key
     with open(cfg_path, "w") as fh:
         json.dump(conf, fh)
     print(json.dumps({{"status": "ok"}}))
     sys.exit(0)
 if args[:1] == ["health"]:
+    settings = os.path.join(os.environ["HOME"], ".openviking", "ovcli.settings.conf")
+    if not os.path.exists(settings):
+        print("OpenViking needs a display language before running commands.", file=sys.stderr)
+        sys.exit(2)
     conf = json.load(open(cfg_path))
-    req = urllib.request.Request(conf["profiles"][conf["active"]]["url"] + "/health")
-    req.add_header("Authorization", "Bearer " + conf["profiles"][conf["active"]]["api_key"])
+    url = conf.get("url") or os.environ.get("OV_STUB_URL") or "http://127.0.0.1:1933"
+    key = conf.get("api_key")
+    role = "admin"
+    if not key:
+        # 模拟真实 CLI:api_key 缺失时回退 root_api_key,服务端返回 role=root。
+        key = conf.get("root_api_key")
+        role = "root"
+    req = urllib.request.Request(url + "/health")
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             healthy = resp.status == 200
-            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy, "account_id": "default", "user_id": "default", "role": "admin"}}}}))
+            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy, "account_id": "default", "user_id": "default", "role": role}}}}))
             sys.exit(0 if healthy else 1)
     except Exception:
         print(json.dumps({{"ok": False, "result": {{"healthy": False}}}}))
@@ -223,11 +252,14 @@ def test_first_init_via_user_registration(sandbox, ovserver, capsys):
     assert stat.S_IMODE(sandbox.cli_cfg.stat().st_mode) == 0o600
     assert ovserver.accounts_calls == 1 and ovserver.users_calls == 1
     # CLI 首跑需要语言设置,bootstrap 必须先行设置
-    settings = sandbox.cli_cfg.parent / "ovcli.settings.conf"
+    settings = sandbox.home / ".openviking" / "ovcli.settings.conf"
     assert settings.exists() and "zh-CN" in settings.read_text()
     # bootstrap 须固化 CLI timeout(README 运维结论,重建后免手工补写)
     cli_conf = json.loads(sandbox.cli_cfg.read_text())
     assert cli_conf.get("timeout") == 300
+    # 真实 CLI 配置是平铺 api_key/root_api_key,不是 profiles 嵌套形态。
+    assert cli_conf.get("api_key") == USER_KEY
+    assert cli_conf.get("root_api_key") == ROOT_KEY
     assert_no_key_material(capsys)
 
 
@@ -245,6 +277,60 @@ def test_rerun_idempotent_no_second_account(sandbox, ovserver):
     assert run_bootstrap(sandbox, ovserver) == 0
     assert run_bootstrap(sandbox, ovserver) == 0
     assert ovserver.accounts_calls == 1  # 幂等:不重复创建账户
+
+
+def test_rerun_rebuilds_missing_language_settings(sandbox, ovserver):
+    """部分恢复缺 ovcli.settings.conf 时,幂等路径须先重建语言设置,不能误报凭据无效。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    settings = sandbox.home / ".openviking" / "ovcli.settings.conf"
+    settings.unlink()
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert settings.exists()
+
+
+def test_saved_profile_gets_timeout(sandbox, ovserver):
+    """ov config add --name local 的 saved profile 也要补 timeout。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    saved.write_text(json.dumps({"api_key": USER_KEY}))
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert json.loads(saved.read_text())["timeout"] == 300
+
+
+def test_saved_profile_path_is_ovcli_conf_name(sandbox, ovserver):
+    """saved profile 固定为同目录 ovcli.conf.<name>,与 active 文件名无关。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    active = sandbox.cli_cfg.parent / "ovcli.test.conf"
+    active.write_text(json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY}))
+    saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    saved.write_text(
+        json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY, "timeout": 60})
+    )
+    assert ba._ensure_cli_timeout(str(active))
+    assert json.loads(active.read_text())["timeout"] == 300
+    assert json.loads(saved.read_text())["timeout"] == 300
+
+
+def test_timeout_below_minimum_is_raised_and_mode_tightened(sandbox, ovserver):
+    """timeout=60 不足且 644 配置必须被修正为 300/600,而不是只检查存在性。"""
+    assert run_bootstrap(sandbox, ovserver) == 0
+    cfg = json.loads(sandbox.cli_cfg.read_text())
+    cfg["timeout"] = 60
+    sandbox.cli_cfg.write_text(json.dumps(cfg))
+    os.chmod(sandbox.cli_cfg, 0o644)
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300
+    assert stat.S_IMODE(sandbox.cli_cfg.stat().st_mode) == 0o600
+
+
+def test_recovery_uses_force_for_saved_profile(sandbox, ovserver, monkeypatch):
+    """active 配置缺失而 saved profile 可能 stale 时,恢复路径须允许 --force。"""
+    args_file = sandbox.tmp / "config-add-args"
+    monkeypatch.setenv("OV_STUB_ARGS_FILE", str(args_file))
+    assert run_bootstrap(sandbox, ovserver) == 0
+    sandbox.cli_cfg.unlink()  # active 配置丢失,saved profile/用户 key 仍在
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert "--force" in args_file.read_text()
 
 
 def test_account_and_user_exist_but_key_missing_errors(sandbox, ovserver, capsys):
@@ -373,26 +459,60 @@ def test_missing_ov_binary_returns_structured_error(sandbox, ovserver, capsys):
 
 
 def test_health_requires_default_identity(monkeypatch, sandbox):
-    def health_with_identity(user_id="default", account_id="default"):
+    def health_with_identity(user_id="default", account_id="default", role="admin"):
         return subprocess.CompletedProcess(
             ["ov", "health"], 0,
             stdout=json.dumps({
                 "ok": True,
                 "result": {
-                    "healthy": True, "account_id": account_id, "user_id": user_id,
+                    "healthy": True, "account_id": account_id,
+                    "user_id": user_id, "role": role,
                 },
             }).encode(),
         )
 
+    good_cfg = json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY})
+    sandbox.cli_cfg.write_text(good_cfg)
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
     assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    # ROOT key 也返回 default/default;role=root 必须判失败。
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="root"))
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(user_id="test"))
     assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    # CLI 配置里的 api_key 必须与本地 stored user key 一致。
+    sandbox.cli_cfg.write_text(json.dumps({"api_key": "different-key", "root_api_key": ROOT_KEY}))
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    # root key 轮换后,配置里残留旧 root_api_key 也必须判失败。
+    sandbox.cli_cfg.write_text(json.dumps({"api_key": USER_KEY, "root_api_key": "stale-root"}))
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+    # 缺 role 的结果同样失败。
+    sandbox.cli_cfg.write_text(good_cfg)
     monkeypatch.setattr(
         ba, "_run_ov",
         lambda *args: subprocess.CompletedProcess(
             ["ov", "health"], 0,
             stdout=json.dumps({"ok": True, "result": {"healthy": True}}).encode(),
+        ),
+    )
+    assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
+
+
+def test_health_rejects_root_only_config(monkeypatch, sandbox):
+    """api_key 缺失时 CLI 回退 root_api_key;health 的 default/default 不构成通过。"""
+    sandbox.cli_cfg.write_text(json.dumps({"root_api_key": ROOT_KEY}))
+    monkeypatch.setattr(
+        ba, "_run_ov",
+        lambda *args: subprocess.CompletedProcess(
+            ["ov", "health"], 0,
+            stdout=json.dumps({
+                "ok": True,
+                "result": {
+                    "healthy": True, "account_id": "default",
+                    "user_id": "default", "role": "root",
+                },
+            }).encode(),
         ),
     )
     assert not ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {})
@@ -429,3 +549,14 @@ def test_atomic_write_replaces_symlink_without_following(sandbox):
     assert not target.is_symlink()
     assert target.read_text() == "new-secret\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_stale_predictable_tmp_symlink_is_not_followed(sandbox, ovserver):
+    """预置可猜临时路径的符号链接时,完整 bootstrap 不得把 key/配置写入其目标。"""
+    victim = sandbox.tmp / "victim"
+    victim.write_text("unchanged")
+    (sandbox.cli_cfg.parent / "ovcli.conf.tmp").symlink_to(victim)
+    assert run_bootstrap(sandbox, ovserver) == 0
+    assert victim.read_text() == "unchanged"
+    assert not sandbox.cli_cfg.is_symlink()
+    assert json.loads(sandbox.cli_cfg.read_text())["timeout"] == 300

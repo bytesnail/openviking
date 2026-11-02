@@ -32,6 +32,9 @@ RC_MANUAL_RECOVERY = 4
 
 USER_KEY_ENV = "OPENVIKING_USER_API_KEY"
 ROOT_KEY_ENV = "OPENVIKING_ROOT_API_KEY"
+# `ov config add --name local` 会额外写一个 saved profile(`ovcli.conf.local`);
+# 健康检查/超时加固/恢复流程都必须把它当作 CLI 生成的文件处理,而非手工副本。
+CLI_PROFILE_NAME = "local"
 
 
 def _atomic_write_secret(path, content):
@@ -53,13 +56,13 @@ def _atomic_write_secret(path, content):
 
 def _post_json(url, body, root_key, timeout=30):
     """POST JSON with root key; return (status:int, payload:dict|None); status=0 on connection failure."""
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {root_key}"},
-        method="POST",
-    )
     try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {root_key}"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
             raw = resp.read() or b"null"
@@ -73,7 +76,10 @@ def _post_json(url, body, root_key, timeout=30):
         except ValueError:
             payload = None
         return err.code, payload
-    except (urllib.error.URLError, http.client.HTTPException, OSError):
+    except (urllib.error.URLError, http.client.HTTPException, OSError,
+            ValueError, UnicodeError):
+        # 非法 base URL/非 Latin-1 key 会让 Request 构造抛 ValueError/UnicodeError;
+        # 折叠为连接失败,保持"失败只报步骤与退出码"的契约。
         return 0, None
     try:
         payload = json.loads(raw)
@@ -150,11 +156,28 @@ def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env) -> bool:
     if isinstance(result, dict):
         healthy = result.get("healthy", healthy)
         identity = result
-    return (
+    # 仅核对 account/user 不够:ROOT key 也会返回 account_id/user_id=default。
+    # 必须排除 role=root,并确认 CLI 配置里存的就是本地 user key(而不是
+    # CLI 在 api_key 缺失时回退到 root_api_key)。
+    if not (
         healthy is True
         and identity.get("account_id") == "default"
         and identity.get("user_id") == "default"
-    )
+        and identity.get("role") in ("admin", "user")
+    ):
+        return False
+    try:
+        with open(cli_config_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if (
+        not isinstance(cfg, dict)
+        or cfg.get("api_key") != user_key
+        or cfg.get("root_api_key") != root_key
+    ):
+        return False
+    return True
 
 
 def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
@@ -186,6 +209,12 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             print("错误:user_api_key 存在但为空,需人工恢复/轮换", file=sys.stderr)
             return RC_MANUAL_RECOVERY
         if cli_cfg_exists:
+            # 部分恢复可能只缺 ovcli.settings.conf;CLI 的显示语言门禁会让
+            # `ov health` 在发请求前退出。必须先尽力重建语言设置,否则会把
+            # 有效凭据误报为"认证无效"。
+            _ensure_cli_language(
+                ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
+            )
             if not _ensure_cli_timeout(cli_config_path):
                 print("错误:无法确保 ovcli.conf 的 timeout=300", file=sys.stderr)
                 return RC_CLI_CONFIG
@@ -197,10 +226,13 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
                 file=sys.stderr,
             )
             return RC_MANUAL_RECOVERY
-        # user_key 在而 ovcli.conf 缺失(上次 CLI 配置步骤失败):补建配置
+        # user_key 在而 ovcli.conf 缺失(上次 CLI 配置步骤失败):补建配置。
+        # CLI 可能已留有同名 saved profile(ovcli.conf.local);恢复路径允许
+        # --force 覆盖该 CLI 生成文件,否则 stale profile 会让每次重跑都失败。
         print("检测到 user_api_key 但缺 ovcli.conf,补建 CLI 配置")
         return _configure_cli(
-            ov_bin, base_url, cli_config_path, root_key, stored_key, env
+            ov_bin, base_url, cli_config_path, root_key, stored_key, env,
+            force=True,
         )
 
     if cli_cfg_exists:  # 走到这里 user_key_file 必为 False(上方分支均已返回)
@@ -272,51 +304,88 @@ def _ensure_cli_language(ov_bin, env):
         pass
 
 
-def _ensure_cli_timeout(cli_config_path, timeout=300):
-    """确保 ovcli.conf 顶层有 "timeout";已设置时不覆盖。
+def _ensure_timeout_file(path, timeout=300):
+    """确保单个 CLI 配置顶层有 "timeout";已设置时不覆盖。
 
-    返回是否已确保。配置含凭据,必须用唯一临时文件原子替换;任何读取、
-    解析或写入失败都显式上报,不能让健康检查掩盖缺失的 timeout。
+    配置含凭据,必须用唯一临时文件原子替换;任何读取、解析或写入失败都显式
+    上报,不能让健康检查掩盖缺失的 timeout。
     """
+    name = os.path.basename(path)
     try:
-        with open(cli_config_path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             cfg = json.load(fh)
     except (OSError, ValueError) as exc:
         print(
-            f"错误:读取/解析 ovcli.conf 失败({type(exc).__name__}),无法确保 timeout",
+            f"错误:读取/解析 {name} 失败({type(exc).__name__}),无法确保 timeout",
             file=sys.stderr,
         )
         return False
     if not isinstance(cfg, dict):
-        print("错误:ovcli.conf 顶层不是对象,无法确保 timeout", file=sys.stderr)
+        print(f"错误:{name} 顶层不是对象,无法确保 timeout", file=sys.stderr)
         return False
-    if "timeout" in cfg:
+    current = cfg.get("timeout")
+    valid = (
+        isinstance(current, (int, float))
+        and not isinstance(current, bool)
+        and current >= timeout
+    )
+    if valid:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            print(
+                f"错误:收紧 {name} 权限失败({type(exc).__name__})",
+                file=sys.stderr,
+            )
+            return False
         return True
+    # 缺失、非数值或小于 300 的 timeout 都视为不足;写成 300。
     cfg["timeout"] = timeout
     try:
-        _atomic_write_secret(Path(cli_config_path), json.dumps(cfg))
+        _atomic_write_secret(Path(path), json.dumps(cfg))
     except OSError as exc:
         print(
-            f"错误:原子写入 ovcli.conf 失败({type(exc).__name__}),无法确保 timeout",
+            f"错误:原子写入 {name} 失败({type(exc).__name__}),无法确保 timeout",
             file=sys.stderr,
         )
         return False
     return True
 
 
-def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
+def _ensure_cli_timeout(cli_config_path, timeout=300):
+    """确保 active 配置与 CLI saved profile 都有 >= timeout;已足够时不覆盖。
+
+    `ov config add --name local` 会额外写 `ovcli.conf.<name>`(与 active
+    配置文件名无关,固定为同目录的 `ovcli.conf.<name>`);只修 active 配置会在
+    激活 saved profile 后丢失 timeout。
+    """
+    if not _ensure_timeout_file(cli_config_path, timeout):
+        return False
+    saved_path = os.path.join(
+        os.path.dirname(cli_config_path), f"ovcli.conf.{CLI_PROFILE_NAME}"
+    )
+    if os.path.exists(saved_path) and not _ensure_timeout_file(saved_path, timeout):
+        return False
+    return True
+
+
+def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env,
+                   force=False):
     _ensure_cli_language(ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path})
+    args = [
+        "config", "add", "custom",
+        "--name", CLI_PROFILE_NAME,
+        "--url", base_url,
+        "--activate",
+        "-o", "json",
+        "--api-key-env", USER_KEY_ENV,
+        "--root-api-key-env", ROOT_KEY_ENV,
+    ]
+    if force:
+        args.append("--force")
     proc = _run_ov(
         ov_bin,
-        [
-            "config", "add", "custom",
-            "--name", "local",
-            "--url", base_url,
-            "--activate",
-            "-o", "json",
-            "--api-key-env", USER_KEY_ENV,
-            "--root-api-key-env", ROOT_KEY_ENV,
-        ],
+        args,
         cli_config_path,
         root_key,
         user_key,

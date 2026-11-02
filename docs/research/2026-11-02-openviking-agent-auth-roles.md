@@ -3,7 +3,7 @@
 - **研究/访问日期**：2026-11-02
 - **问题**：个人用户 `meteor` 若保持 `role=user`，能否使用官方安装器、CLI、MCP 与官方 agent 工具？哪些操作才真正需要 ROOT/ADMIN？
 - **范围**：自托管 OpenViking 的 **API Key 模式**为主；覆盖官方统一安装器、CLI、内置 MCP，以及 Claude Code、Codex、OpenCode、pi、DeepSeek Harness（DSH）、Hermes 和 Agent Plugins 接入。Trusted/Dev 等模式只作为例外说明。
-- **方法约束**：只采用 OpenViking 官方文档、官方仓库源码和官方安装脚本；未把本机部署配置或既有方案当作官方依据。未执行安装器，未调用管理 API，未创建/轮换用户或 key，未重启部署，未读取任何凭据值，也未做本机实测。
+- **方法约束**：只采用 OpenViking 官方文档、官方仓库源码和官方安装脚本；未把本机部署配置或既有方案当作官方依据。未执行安装器，未调用管理 API，未创建/轮换用户或 key，未重启部署；仅对本机 `state/data/viking/default/_system/users.json` 做过只读的存储形态核对（未记录/回显任何凭据值），未对本机服务发起其他实测。
 
 ## 一句话结论
 
@@ -29,7 +29,7 @@
 | 角色/凭据 | 官方规定的用途 | 日常数据面 |
 |---|---|---|
 | ROOT / root key | 账户管理、Admin API 和选定的 system/monitoring 操作 | **API Key 模式下不能访问 tenant 数据** |
-| ADMIN / 账户绑定 key | 普通操作 + 管理**自己账户**内的用户 | 可以，但以**自己的 user 身份**访问 |
+| ADMIN / 账户绑定 key | 普通操作 + 管理**自己账户**内的用户 | 可以，但以**自己的 user 身份**访问；在 v0.5.2.1 上还可列举本账户 user 明文 key/轮换他人 key，效果上等价于账户内数据访问（§2.2） |
 | USER / 账户绑定 key | 普通操作，例如 `ls`、read、find、sessions | 可以，受命名空间与资源 ACL 约束 |
 
 来源：[Authentication → Two-Layer API Key System](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L46-L55)、[Roles and Permissions](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L620-L630)。
@@ -42,7 +42,7 @@
 
 资源 ACL 是另一层授权，不应与账户角色混为一谈：普通数据操作仍受资源 ACL；ADMIN 对账户共享资源有隐式 `manage`，但资源 `manage` 本身并不赋予账户管理员权限。[Authentication L628](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L628-L630)、[MCP resource permissions](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/06-mcp-integration.md#L214-L229)、[ACL supported URIs](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/concepts/15-acl.md#L7-L19)。
 
-**但“直接数据请求不能切身份”不等于 ADMIN 拿不到别人的数据（2026-11-02 源码 + 本机实测补充）**：在 v0.5.2.1 上，`GET /api/v1/admin/accounts/{id}/users` 默认 `include_credentials=true`，ROOT/ADMIN 的响应包含本账户所有 user 的**明文 `api_key`**；ADMIN 还可 `POST /api/v1/admin/accounts/{id}/users/{uid}/key` 轮换任何 user 的 key 并拿到新 key。用该 key 直接以目标 user 身份发请求即可读取其私有数据。当前 main 已改为 ROOT 取明文、ADMIN 只取自己的 key + 他人掩码前缀；该掩码差异**不能**倒推到 v0.5.2.1。因此 ADMIN/ROOT key 在效果上等价于账户内全部 user 数据的访问能力，必须按 crown-jewel 保护。
+**但“直接数据请求不能切身份”不等于 ADMIN 拿不到别人的数据（2026-11-02 源码 + 本机存储形态核对）**：在 v0.5.2.1 上，`GET /api/v1/admin/accounts/{id}/users` 默认 `include_credentials=true`，ROOT/ADMIN 的响应包含本账户所有 user 的**明文 `api_key`**；ADMIN 还可 `POST /api/v1/admin/accounts/{id}/users/{uid}/key` 轮换任何 user 的 key 并拿到新 key。用该 key 直接以目标 user 身份发请求即可读取其私有数据。当前 main 已改为 ROOT 取明文、ADMIN 只取自己的 key + 他人掩码前缀；该掩码差异**不能**倒推到 v0.5.2.1。因此 ADMIN/ROOT key 在效果上等价于账户内全部 user 数据的访问能力，必须按 crown-jewel 保护。
 
 ## 3. 官方统一安装器是否要求 ADMIN
 
@@ -131,7 +131,7 @@ v0.5.2.1 证据：[Admin API Reference L642-L649](https://github.com/volcengine/
 ## 7. 例外与证据限制
 
 - **Trusted mode 是不同认证模型**：客户端/网关可持部署 root key，同时发送 account/user identity headers；这不是要求 `meteor` 的个人角色为 ADMIN。Hermes 文档也明确把 root key + identity headers 限定为 trusted 部署。[Authentication modes](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/04-authentication.md#L7-L21)、[Hermes trusted-mode note](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/examples/hermes-plugin/CONFIGURATION.md#L106-L109)。Dev mode 不需要 key，但只适合 loopback 本地开发，不能用来证明生产接入权限。[MCP Authentication](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/guides/06-mcp-integration.md#L28-L35)。
-- 本笔记是**静态第一方资料核查**，未对本机 v0.5.2.1 发请求，因此“不会阻碍”有官方文档与源码支持，但不是一次本机安装验收结果。
+- 本笔记以**静态第一方资料核查**为主；仅对 `state/data/viking/default/_system/users.json` 做过只读存储形态核对，未对本机 v0.5.2.1 发请求，因此“不会阻碍”有官方文档与源码支持，但不是一次本机安装验收结果。
 - OpenCode、Codex、DSH 的各自页面使用泛称“API key”，未在每个页面重复写“USER role 足够”；表中已标出这是结合其官方架构与 canonical Authentication/MCP 规则所得，而非虚构每页都有明确角色字样。
 - 未逐一审计所有社区插件、所有云厂商托管控制台或 OIDC/LDAP 映射；结论范围是 §范围中列出的官方自托管接入面。官方集成总入口本身也统一指向 Authentication 作为远程 API key 前提。[Agent integrations overview L36-L38](https://github.com/volcengine/OpenViking/blob/de6a440390f169be83e29b62d26b647eadd86a53/docs/en/agent-integrations/01-overview.md#L36-L38)。
 - main 和线上安装器会持续变化；可点击源码链接均固定到本次记录的 commit，动态 URL 的内容以 **2026-11-02** 访问结果为准。

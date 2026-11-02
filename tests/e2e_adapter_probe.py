@@ -4,6 +4,8 @@
 前置:compose 两个 service 与 model-serving(18351)在位。直接对
 127.0.0.1:18353(适配器)与 18351(上游)发请求,验证:
 
+0. config/ov.conf 的 embedding 模型名确实出现在 18351 /v1/models 加载列表
+   (llama-server 不校验请求 model 字段,仅靠请求无法发现模型名漂移);
 1. 纯文本经适配器与直连上游的向量一致(cosine≈1);
 2. OpenViking 裸 parts 多模态形态返回恰好一个 768 维向量;
 3. "红色方块"查询下 red 向量相似度高于 blue(视觉语义);
@@ -114,7 +116,29 @@ def data_url(path):
         return "data:image/png;base64," + base64.b64encode(fh.read()).decode()
 
 
+def check_loaded_model():
+    """配置的模型名必须出现在上游 /v1/models;请求里的 model 字段不足以校验。"""
+    try:
+        with urllib.request.urlopen(UPSTREAM + "/v1/models", timeout=10) as resp:
+            data = json.load(resp)
+        items = data.get("data") or data.get("models") or []
+        ids = " ".join(
+            str(item.get("id") or item.get("name") or "")
+            for item in items
+            if isinstance(item, dict)
+        ).lower()
+        check(
+            "model-loaded",
+            MODEL.lower() in ids,
+            f"configured={MODEL} loaded={ids or '(empty)'}",
+        )
+    except Exception as exc:
+        check("model-loaded", False, f"error={type(exc).__name__}")
+
+
 def main():
+    check_loaded_model()
+
     # 1. 纯文本:适配器与直连上游向量一致性
     q = "红色方块的图片"
     va = embed(ADAPTER, q)
