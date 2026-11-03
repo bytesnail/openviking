@@ -11,6 +11,7 @@
 
 输出纪律:任何输出不含密钥值,失败只报步骤与退出码。
 """
+import argparse
 import http.client
 import json
 import math
@@ -64,8 +65,9 @@ DEFAULT_BASE_URL = "http://127.0.0.1:1933"
 
 
 def _atomic_write_secret(path, content):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(path.parent, 0o700)
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "w") as fh:
@@ -123,14 +125,152 @@ def _post_accounts(base_url, root_key, timeout=30):
     )
 
 
-def _register_default_user(base_url, root_key, timeout=30):
-    """Register an admin user under the auto-created default account on v0.5.2 first startup (accounts endpoint returns 409)."""
+def _register_user(base_url, root_key, user_id, role, timeout=30):
     return _post_json(
         base_url.rstrip("/") + "/api/v1/admin/accounts/default/users",
-        {"user_id": "default", "role": "admin"},
+        {"user_id": user_id, "role": role},
         root_key,
         timeout,
     )
+
+
+def _register_default_user(base_url, root_key, timeout=30):
+    """Register the default admin after v0.5.2 first-start account creation."""
+    return _register_user(base_url, root_key, "default", "admin", timeout)
+
+
+def _rotate_user_key(base_url, root_key, user_id, timeout=30):
+    return _post_json(
+        base_url.rstrip("/")
+        + f"/api/v1/admin/accounts/default/users/{user_id}/key",
+        {},
+        root_key,
+        timeout,
+    )
+
+
+def _cli_config_for_output(path):
+    if not os.path.exists(path):
+        return {}
+    cfg = _load_cli_config(path)
+    if cfg is None or "root_api_key" in cfg:
+        raise ValueError("CLI config is invalid or contains root_api_key")
+    return cfg
+
+
+def _write_user_output(user_key, base_url, user_id, user_key_path, cli_config_path):
+    if user_key_path:
+        _atomic_write_secret(Path(user_key_path), user_key)
+        return
+    cfg = _cli_config_for_output(cli_config_path)
+    cfg.update({
+        "url": base_url,
+        "api_key": user_key,
+        "account": "default",
+        "user": user_id,
+    })
+    _atomic_write_secret(Path(cli_config_path), json.dumps(cfg))
+
+
+def _response_user_key(status, payload):
+    if status == 401 or status == 403:
+        print("错误:root key 被服务端拒绝", file=sys.stderr)
+        return RC_INVALID_ROOT_KEY, None
+    if status == 409:
+        print("错误:user 已存在但本地凭据缺失;禁止重复创建,请修复输出后轮换", file=sys.stderr)
+        return RC_MANUAL_RECOVERY, None
+    if status != 200:
+        print(f"错误:user 管理请求失败(admin API status={status})", file=sys.stderr)
+        return RC_UPSTREAM, None
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        print("错误:user 管理响应信封非 ok,拒绝继续", file=sys.stderr)
+        return RC_NO_USER_KEY, None
+    result = payload.get("result")
+    user_key = result.get("user_key") if isinstance(result, dict) else None
+    if not user_key:
+        print("错误:响应缺少 result.user_key,拒绝继续", file=sys.stderr)
+        return RC_NO_USER_KEY, None
+    return RC_OK, user_key
+
+
+def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
+                   cli_config_path=None, timeout=30):
+    """创建单个 user 并安全落盘;已有本地凭据时不再次创建。"""
+    if not root_key or not user_id or not role or (
+        bool(user_key_path) == bool(cli_config_path)
+    ):
+        print("错误:provision-user 需要 root key、user/role 且恰好一个输出路径", file=sys.stderr)
+        return RC_BAD_ENV
+    try:
+        if user_key_path and os.path.exists(user_key_path):
+            with open(user_key_path, encoding="utf-8") as fh:
+                if not fh.read().strip():
+                    raise ValueError("empty user key")
+            return RC_OK
+        if cli_config_path:
+            cfg = _cli_config_for_output(cli_config_path)
+            if cfg.get("api_key"):
+                if not (
+                    cfg.get("url", "").rstrip("/") == base_url.rstrip("/")
+                    and cfg.get("account") == "default"
+                    and cfg.get("user") == user_id
+                ):
+                    raise ValueError("CLI config belongs to another identity")
+                return RC_OK
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"错误:本地凭据输出不可安全复用({type(exc).__name__})", file=sys.stderr)
+        return RC_MANUAL_RECOVERY
+
+    status, payload = _register_user(base_url, root_key, user_id, role, timeout)
+    rc, user_key = _response_user_key(status, payload)
+    if rc != RC_OK:
+        return rc
+    try:
+        _write_user_output(
+            user_key, base_url, user_id, user_key_path, cli_config_path,
+        )
+    except (OSError, ValueError) as exc:
+        print(
+            f"错误:user 已创建但 key 落盘失败({type(exc).__name__});"
+            "禁止重复创建,修复输出后使用 rotate-user",
+            file=sys.stderr,
+        )
+        return RC_MANUAL_RECOVERY
+    print(f"已创建 user={user_id} 并写入凭据(600)")
+    return RC_OK
+
+
+def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
+                cli_config_path=None, timeout=30):
+    """轮换单个 user key 并原子更新唯一指定输出。"""
+    if not root_key or not user_id or (
+        bool(user_key_path) == bool(cli_config_path)
+    ):
+        print("错误:rotate-user 需要 root key、user 且恰好一个输出路径", file=sys.stderr)
+        return RC_BAD_ENV
+    try:
+        if cli_config_path:
+            _cli_config_for_output(cli_config_path)
+    except (OSError, ValueError) as exc:
+        print(f"错误:轮换输出配置不可安全复用({type(exc).__name__})", file=sys.stderr)
+        return RC_MANUAL_RECOVERY
+    status, payload = _rotate_user_key(base_url, root_key, user_id, timeout)
+    rc, user_key = _response_user_key(status, payload)
+    if rc != RC_OK:
+        return rc
+    try:
+        _write_user_output(
+            user_key, base_url, user_id, user_key_path, cli_config_path,
+        )
+    except (OSError, ValueError) as exc:
+        print(
+            f"错误:新 key 落盘失败({type(exc).__name__});"
+            "禁止创建 user,修复输出后再次轮换",
+            file=sys.stderr,
+        )
+        return RC_MANUAL_RECOVERY
+    print(f"已轮换 user={user_id} 并更新凭据(600)")
+    return RC_OK
 
 
 def _server_reachable(base_url, timeout=5):
@@ -155,7 +295,10 @@ def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
     超时不抛异常:折叠为 returncode=124,保持"失败只报步骤与退出码"的契约。
     """
     child_env = dict(env)
-    child_env[ROOT_KEY_ENV] = root_key
+    if root_key is None:
+        child_env.pop(ROOT_KEY_ENV, None)
+    else:
+        child_env[ROOT_KEY_ENV] = root_key
     child_env["OPENVIKING_CLI_CONFIG_FILE"] = cli_config_path
     if user_key is not None:
         child_env[USER_KEY_ENV] = user_key
@@ -178,9 +321,9 @@ def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
         return subprocess.CompletedProcess(args, returncode=127)
 
 
-def _saved_profile_path(cli_config_path):
+def _saved_profile_path(cli_config_path, profile_name=CLI_PROFILE_NAME):
     return os.path.join(
-        os.path.dirname(cli_config_path), f"ovcli.conf.{CLI_PROFILE_NAME}"
+        os.path.dirname(cli_config_path), f"ovcli.conf.{profile_name}"
     )
 
 
@@ -194,25 +337,34 @@ def _load_cli_config(path):
     return cfg if isinstance(cfg, dict) else None
 
 
-def _cfg_matches(cfg, base_url, root_key, user_key):
+def _cfg_matches(cfg, base_url, root_key, user_key, require_root_key=True):
     """对已解析的配置 dict 做一致性判定;None/非 dict 一律不匹配。"""
     if not isinstance(cfg, dict):
         return False
-    configured_url = cfg.get("url") or DEFAULT_BASE_URL
+    configured_url = cfg.get("url")
+    root_matches = (
+        cfg.get("root_api_key") == root_key
+        if require_root_key
+        else "root_api_key" not in cfg
+    )
     return (
         isinstance(configured_url, str)
         and configured_url.rstrip("/") == base_url.rstrip("/")
         and cfg.get("api_key") == user_key
-        and cfg.get("root_api_key") == root_key
+        and root_matches
     )
 
 
-def _cli_config_matches(path, base_url, root_key, user_key):
-    return _cfg_matches(_load_cli_config(path), base_url, root_key, user_key)
+def _cli_config_matches(path, base_url, root_key, user_key, require_root_key=True):
+    return _cfg_matches(
+        _load_cli_config(path), base_url, root_key, user_key, require_root_key,
+    )
 
 
 def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env,
-                  base_url=DEFAULT_BASE_URL) -> str:
+                  base_url=DEFAULT_BASE_URL, *, expected_account,
+                  expected_user, expected_role, require_root_key,
+                  saved_profile_path) -> str:
     """三态判定:"ok" / "invalid"(凭据或配置不符)/ "timeout"(ov 超时)。
 
     超时(_run_ov 折叠为 returncode 124)不等于凭据无效,调用方必须区别
@@ -242,19 +394,21 @@ def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env,
     # CLI 在 api_key 缺失时回退到 root_api_key)。
     if not (
         result.get("healthy") is True
-        and result.get("account_id") == "default"
-        and result.get("user_id") == "default"
-        and result.get("role") == "admin"
+        and result.get("account_id") == expected_account
+        and result.get("user_id") == expected_user
+        and result.get("role") == expected_role
+        and expected_role != "root"
     ):
         return "invalid"
-    if not _cli_config_matches(cli_config_path, base_url, root_key, user_key):
-        return "invalid"
-    saved_path = _saved_profile_path(cli_config_path)
-    # active 健康不能证明 saved profile 没漂移;否则 config switch local 会
-    # 静默恢复旧服务器、旧 key 或错误身份。
-    if os.path.exists(saved_path) and not _cli_config_matches(
-        saved_path, base_url, root_key, user_key
+    if not _cli_config_matches(
+        cli_config_path, base_url, root_key, user_key, require_root_key,
     ):
+        return "invalid"
+    # 是否检查 saved profile 由调用方显式决定;临时配置没有检查对象。
+    if saved_profile_path is not None and os.path.exists(saved_profile_path) \
+            and not _cli_config_matches(
+                saved_profile_path, base_url, root_key, user_key, require_root_key,
+            ):
         return "invalid"
     return "ok"
 
@@ -316,7 +470,11 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             # 先做身份/漂移核查,再做任何写回(含 timeout 修补):漂移的
             # saved profile 必须原样保留现场,不得先追加字段后报错。
             health = _ov_health_ok(
-                ov_bin, cli_config_path, root_key, stored_key, env, base_url=base_url
+                ov_bin, cli_config_path, root_key, stored_key, env,
+                base_url=base_url, expected_account="default",
+                expected_user="default", expected_role="admin",
+                require_root_key=True,
+                saved_profile_path=_saved_profile_path(cli_config_path),
             )
             if health == "timeout":
                 print(
@@ -488,7 +646,7 @@ def _ensure_timeout_file(path, timeout=300):
     return True
 
 
-def _ensure_cli_timeout(cli_config_path, timeout=300):
+def _ensure_cli_timeout(cli_config_path, timeout=300, profile_name=CLI_PROFILE_NAME):
     """确保 active 配置与 CLI saved profile 都有 >= timeout;已足够时不覆盖。
 
     `ov config add --name local` 会额外写 `ovcli.conf.<name>`(与 active
@@ -497,19 +655,20 @@ def _ensure_cli_timeout(cli_config_path, timeout=300):
     """
     if not _ensure_timeout_file(cli_config_path, timeout):
         return False
-    saved_path = _saved_profile_path(cli_config_path)
+    saved_path = _saved_profile_path(cli_config_path, profile_name)
     if os.path.exists(saved_path) and not _ensure_timeout_file(saved_path, timeout):
         return False
     return True
 
 
-def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
+def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env,
+                   profile_name=CLI_PROFILE_NAME):
     _warn_if_language_setup_failed(_ensure_cli_language(
         ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
     ))
     args = [
         "config", "add", "custom",
-        "--name", CLI_PROFILE_NAME,
+        "--name", profile_name,
         "--url", base_url,
         "--activate",
         "-o", "json",
@@ -541,11 +700,14 @@ def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
             file=sys.stderr,
         )
         return RC_CLI_CONFIG
-    if not _ensure_cli_timeout(cli_config_path):
+    if not _ensure_cli_timeout(cli_config_path, profile_name=profile_name):
         return RC_CLI_CONFIG
 
     health = _ov_health_ok(
-        ov_bin, cli_config_path, root_key, user_key, env, base_url=base_url
+        ov_bin, cli_config_path, root_key, user_key, env,
+        base_url=base_url, expected_account="default", expected_user="default",
+        expected_role="admin", require_root_key=True,
+        saved_profile_path=_saved_profile_path(cli_config_path, profile_name),
     )
     if health == "timeout":
         print(
@@ -560,7 +722,79 @@ def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env):
     return RC_OK
 
 
+def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
+               account_id="default", user_id, role="user"):
+    """用只含 USER key 的临时配置验证身份,并尽力保证退出后无副本。"""
+    if not base_url or not user_id or role == "root":
+        return RC_BAD_ENV
+    env = dict(os.environ if env is None else env)
+    env.pop(ROOT_KEY_ENV, None)
+    try:
+        with open(user_key_path, encoding="utf-8") as fh:
+            user_key = fh.read().strip()
+        if not user_key:
+            raise ValueError("empty user key")
+        if os.path.lexists(cli_config_path):
+            os.unlink(cli_config_path)
+        cfg = {
+            "url": base_url, "api_key": user_key,
+            "account": account_id, "user": user_id,
+        }
+        _atomic_write_secret(Path(cli_config_path), json.dumps(cfg))
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"错误:无法准备临时身份配置({type(exc).__name__})", file=sys.stderr)
+        return RC_MANUAL_RECOVERY
+
+    rc = RC_OK
+    try:
+        child_env = {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
+        _warn_if_language_setup_failed(_ensure_cli_language(ov_bin, child_env))
+        health = _ov_health_ok(
+            ov_bin, cli_config_path, None, user_key, env,
+            base_url=base_url, expected_account=account_id,
+            expected_user=user_id, expected_role=role, require_root_key=False,
+            saved_profile_path=None,
+        )
+        if health == "timeout":
+            rc = RC_UPSTREAM
+        elif health != "ok":
+            rc = RC_AUTH_VERIFY
+    finally:
+        try:
+            if os.path.lexists(cli_config_path):
+                os.unlink(cli_config_path)
+        except OSError as exc:
+            print(f"错误:临时身份配置删除失败({type(exc).__name__})", file=sys.stderr)
+            rc = RC_MANUAL_RECOVERY
+    if rc == RC_OK:
+        print(f"身份验证通过:{account_id}/{user_id}/{role};临时配置已删除")
+    else:
+        print(f"错误:身份验证未通过(user={user_id}, rc={rc})", file=sys.stderr)
+    return rc
+
+
 def main():
+    parser = argparse.ArgumentParser(description="OpenViking 用户认证初始化与检查")
+    sub = parser.add_subparsers(dest="command")
+    provision = sub.add_parser("provision-user")
+    provision.add_argument("--user-id", required=True)
+    provision.add_argument("--role", required=True)
+    output = provision.add_mutually_exclusive_group(required=True)
+    output.add_argument("--key-file")
+    output.add_argument("--cli-config")
+    rotate = sub.add_parser("rotate-user")
+    rotate.add_argument("--user-id", required=True)
+    output = rotate.add_mutually_exclusive_group(required=True)
+    output.add_argument("--key-file")
+    output.add_argument("--cli-config")
+    check = sub.add_parser("check-user")
+    check.add_argument("--user-id", required=True)
+    check.add_argument("--role", default="user")
+    check.add_argument("--account", default="default")
+    check.add_argument("--key-file", required=True)
+    check.add_argument("--config-file")
+    args = parser.parse_args()
+
     root_key = os.environ.get(ROOT_KEY_ENV, "")
     base_url = os.environ.get("OPENVIKING_BOOTSTRAP_URL", DEFAULT_BASE_URL)
     cli_config_path = os.environ.get(
@@ -571,9 +805,27 @@ def main():
     )
     user_key_path = os.environ.get("OPENVIKING_USER_KEY_FILE", default_user_key)
     ov_bin = os.environ.get("OV_BIN", "ov")
-    sys.exit(
-        run(root_key, base_url, cli_config_path, user_key_path, ov_bin=ov_bin)
-    )
+
+    if args.command == "provision-user":
+        rc = provision_user(
+            root_key, base_url, args.user_id, args.role,
+            user_key_path=args.key_file, cli_config_path=args.cli_config,
+        )
+    elif args.command == "rotate-user":
+        rc = rotate_user(
+            root_key, base_url, args.user_id,
+            user_key_path=args.key_file, cli_config_path=args.cli_config,
+        )
+    elif args.command == "check-user":
+        rc = check_user(
+            ov_bin, base_url,
+            args.config_file or f"/tmp/ovcli.{args.user_id}.conf",
+            args.key_file, account_id=args.account,
+            user_id=args.user_id, role=args.role,
+        )
+    else:
+        rc = run(root_key, base_url, cli_config_path, user_key_path, ov_bin=ov_bin)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

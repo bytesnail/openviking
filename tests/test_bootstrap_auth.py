@@ -10,6 +10,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -20,15 +21,15 @@ import bootstrap_auth as ba
 REPO = Path(__file__).resolve().parents[1]
 ROOT_KEY = "ROOTKEY-test-0000000000000000000000000000"
 USER_KEY = "USERKEY-test-1111111111111111111111111111"
+TEST_KEY = "USERKEY-test-2222222222222222222222222222"
+ROTATED_KEY = "USERKEY-rotated-333333333333333333333333"
 
 
 # ---------- 假 OpenViking server(骨架见 tests/_http_fakes.py) ----------
 
 
 class FakeOvServer(_http_fakes.FakeServer):
-    """实现 bootstrap_auth 依赖的接口:POST /api/v1/admin/accounts、
-    POST /api/v1/admin/accounts/default/users(v0.5.2 首启自动建空壳账户后的
-    正规注册路径)、GET /health(带 User key 认证)。"""
+    """实现账户初始化、任意 user 注册/轮换与健康探测。"""
 
     def __init__(self):
         self.shell_account_exists = True   # v0.5.2 服务端首启行为
@@ -36,8 +37,12 @@ class FakeOvServer(_http_fakes.FakeServer):
         self.accepted_user_key = None
         self.accounts_calls = 0
         self.users_calls = 0
+        self.rotation_calls = 0
         self.drop_user_key = False  # 模拟 trusted 模式缺 user_key 字段
         self.success_status = 200
+        self.users = {}
+        self.last_user_id = None
+        self.last_role = None
         server = self
 
         class Handler(_http_fakes.FakeBaseHandler):
@@ -46,6 +51,10 @@ class FakeOvServer(_http_fakes.FakeServer):
                     return True
                 self._json(401, {"status": "error", "message": "invalid root key"})
                 return False
+
+            def _body(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                return json.loads(self.rfile.read(length) or b"{}")
 
             def do_POST(self):
                 if self.path == "/api/v1/admin/accounts":
@@ -68,22 +77,47 @@ class FakeOvServer(_http_fakes.FakeServer):
                     server.users_calls += 1
                     if not self._auth_root():
                         return
-                    if server.user_exists:
+                    body = self._body()
+                    uid = body["user_id"]
+                    server.last_user_id = uid
+                    server.last_role = body["role"]
+                    if (uid == "default" and server.user_exists) or uid in server.users:
                         self._json(409, {
                             "status": "error",
                             "error": {"code": "ALREADY_EXISTS",
-                                      "message": "User already exists: default"},
+                                      "message": f"User already exists: {uid}"},
                         })
                         return
-                    server.user_exists = True
-                    self._register_result({"account_id": "default", "user_id": "default"})
+                    if uid == "default":
+                        server.user_exists = True
+                    self._register_result({
+                        "account_id": "default", "user_id": uid, "role": body["role"],
+                    })
+                    return
+                prefix = "/api/v1/admin/accounts/default/users/"
+                if self.path.startswith(prefix) and self.path.endswith("/key"):
+                    server.rotation_calls += 1
+                    if not self._auth_root():
+                        return
+                    uid = self.path[len(prefix):-len("/key")]
+                    server.users[uid] = ROTATED_KEY
+                    if uid == "default":
+                        server.accepted_user_key = ROTATED_KEY
+                    self._json(200, {"status": "ok", "result": {
+                        "account_id": "default", "user_id": uid,
+                        "user_key": ROTATED_KEY,
+                    }})
                     return
                 self._json(404, {"error": "not found"})
 
             def _register_result(self, result):
+                uid = result.get("user_id") or result.get("admin_user_id")
                 if not server.drop_user_key:
-                    result["user_key"] = USER_KEY
-                    server.accepted_user_key = USER_KEY
+                    key = USER_KEY if uid == "default" else TEST_KEY
+                    result["user_key"] = key
+                    server.users[uid] = key
+                    if uid == "default":
+                        server.accepted_user_key = key
                 self._json(server.success_status, {"status": "ok", "result": result})
 
             def do_GET(self):
@@ -91,10 +125,11 @@ class FakeOvServer(_http_fakes.FakeServer):
                     self._json(404, {"error": "not found"})
                     return
                 auth = self.headers.get("Authorization")
-                if auth not in (
-                    f"Bearer {server.accepted_user_key}",
-                    f"Bearer {ROOT_KEY}",  # 真实 /health 也接受 ROOT;用于覆盖 root-fallback
-                ):
+                valid = {
+                    f"Bearer {key}" for uid, key in server.users.items() if uid != "default"
+                }
+                valid.update((f"Bearer {server.accepted_user_key}", f"Bearer {ROOT_KEY}"))
+                if auth not in valid:
                     self._json(401, {"status": "error"})
                     return
                 self._json(200, {"status": "ok", "healthy": True})
@@ -153,9 +188,16 @@ if args[:1] == ["health"]:
         print("OpenViking needs a display language before running commands.", file=sys.stderr)
         sys.exit(2)
     conf = json.load(open(cfg_path))
+    if os.environ.get("OV_STUB_HEALTH_AUDIT"):
+        with open(os.environ["OV_STUB_HEALTH_AUDIT"], "w") as audit:
+            json.dump({{"config": conf, "root_env_present": bool(os.environ.get("OPENVIKING_ROOT_API_KEY"))}}, audit)
     url = conf.get("url") or os.environ.get("OV_STUB_URL") or "http://127.0.0.1:1933"
     key = conf.get("api_key")
     role = "admin"
+    user_id = "default"
+    if key == "{TEST_KEY}" or key == "{ROTATED_KEY}":
+        user_id = "test"
+        role = "user"
     if not key:
         # 模拟真实 CLI:api_key 缺失时回退 root_api_key,服务端返回 role=root。
         key = conf.get("root_api_key")
@@ -166,7 +208,7 @@ if args[:1] == ["health"]:
     try:
         with _opener.open(req, timeout=5) as resp:
             healthy = resp.status == 200
-            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy, "account_id": "default", "user_id": "default", "role": role}}}}))
+            print(json.dumps({{"ok": healthy, "result": {{"healthy": healthy, "account_id": "default", "user_id": user_id, "role": role}}}}))
             sys.exit(0 if healthy else 1)
     except Exception:
         print(json.dumps({{"ok": False, "result": {{"healthy": False}}}}))
@@ -218,6 +260,19 @@ def assert_no_key_material(capsys):
     out = capsys.readouterr()
     assert ROOT_KEY not in out.out + out.err
     assert USER_KEY not in out.out + out.err
+
+
+def health_ok(sb, *args, **kwargs):
+    """既有 default/admin 健康用例的显式参数样板。"""
+    return getattr(ba, "_ov_health_ok")(
+        *args,
+        expected_account="default",
+        expected_user="default",
+        expected_role="admin",
+        require_root_key=True,
+        saved_profile_path=ba._saved_profile_path(args[1]),
+        **kwargs,
+    )
 
 
 def fail_os_replace_under_sandbox(monkeypatch, sandbox):
@@ -532,25 +587,27 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
             }).encode(),
         )
 
-    good_cfg = json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY})
+    good_cfg = json.dumps({
+        "url": ba.DEFAULT_BASE_URL, "api_key": USER_KEY, "root_api_key": ROOT_KEY,
+    })
     sandbox.cli_cfg.write_text(good_cfg)
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "ok"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "ok"
     # ROOT key 也返回 default/default;role=root 必须判失败。
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="root"))
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # 本部署 default 是运维 ADMIN;意外降级为 USER 不能视为初始化成功。
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(role="user"))
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity(user_id="test"))
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # CLI 配置里的 api_key 必须与本地 stored user key 一致。
     sandbox.cli_cfg.write_text(json.dumps({"api_key": "different-key", "root_api_key": ROOT_KEY}))
     monkeypatch.setattr(ba, "_run_ov", lambda *args: health_with_identity())
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # root key 轮换后,配置里残留旧 root_api_key 也必须判失败。
     sandbox.cli_cfg.write_text(json.dumps({"api_key": USER_KEY, "root_api_key": "stale-root"}))
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # 缺 role 的结果同样失败。
     sandbox.cli_cfg.write_text(good_cfg)
     monkeypatch.setattr(
@@ -560,7 +617,7 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
             stdout=json.dumps({"ok": True, "result": {"healthy": True}}).encode(),
         ),
     )
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
     # 顶层(非嵌套 result)信封无生产者:按 fail-closed 一律判失败
     # (2026-11-03 检视移除了无依据的顶层兼容回退)。
     monkeypatch.setattr(
@@ -573,7 +630,7 @@ def test_health_requires_default_identity(monkeypatch, sandbox):
             }).encode(),
         ),
     )
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) == "invalid"
 
 
 def test_health_rejects_url_and_saved_profile_drift(monkeypatch, sandbox):
@@ -591,17 +648,17 @@ def test_health_rejects_url_and_saved_profile_drift(monkeypatch, sandbox):
     expected = "http://127.0.0.1:21933"
     good = {"api_key": USER_KEY, "root_api_key": ROOT_KEY, "url": expected}
     sandbox.cli_cfg.write_text(json.dumps(good))
-    assert ba._ov_health_ok(
+    assert health_ok(sandbox,
         "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
     ) == "ok"
     sandbox.cli_cfg.write_text(json.dumps({**good, "url": "http://127.0.0.1:1933"}))
-    assert ba._ov_health_ok(
+    assert health_ok(sandbox,
         "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
     ) == "invalid"
     sandbox.cli_cfg.write_text(json.dumps(good))
     saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
     saved.write_text(json.dumps({**good, "api_key": "stale-key"}))
-    assert ba._ov_health_ok(
+    assert health_ok(sandbox,
         "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}, base_url=expected,
     ) == "invalid"
 
@@ -622,7 +679,7 @@ def test_health_rejects_root_only_config(monkeypatch, sandbox):
             }).encode(),
         ),
     )
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) \
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) \
         == "invalid"
 
 
@@ -636,7 +693,7 @@ def test_health_timeout_is_distinguished_from_invalid(monkeypatch, sandbox):
         ba, "_run_ov",
         lambda *args, **kwargs: subprocess.CompletedProcess(["ov", "health"], 124),
     )
-    assert ba._ov_health_ok("ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) \
+    assert health_ok(sandbox,"ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {}) \
         == "timeout"
 
 
@@ -710,3 +767,211 @@ def test_atomic_write_leaves_no_temp_residue_and_ignores_stale_symlinks(
         if not p.is_symlink()
     ]
     assert residue == []
+
+
+def test_atomic_write_leaves_existing_parent_mode_unchanged(sandbox):
+    parent = sandbox.tmp / "existing-parent"
+    parent.mkdir(mode=0o755)
+    os.chmod(parent, 0o755)
+    target = parent / "secret"
+    ba._atomic_write_secret(target, "test-secret")
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_provision_test_user_writes_key_without_cli_config(sandbox, ovserver, capsys):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", user_key_path=str(key_path),
+    ) == ba.RC_OK
+    assert key_path.read_text() == TEST_KEY
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert ovserver.last_user_id == "test" and ovserver.last_role == "user"
+    assert ovserver.users_calls == 1 and ovserver.accounts_calls == 0
+    assert_no_key_material(capsys)
+
+
+def test_provision_existing_local_key_does_not_create(sandbox, ovserver):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    key_path.parent.mkdir()
+    key_path.write_text(TEST_KEY)
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", user_key_path=str(key_path),
+    ) == ba.RC_OK
+    assert key_path.read_text() == TEST_KEY
+    assert ovserver.users_calls == 0
+
+
+def test_provision_conflict_requires_rotation_without_recreating(sandbox, ovserver):
+    ovserver.users["test"] = "server-only-key"
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", user_key_path=str(key_path),
+    ) == ba.RC_MANUAL_RECOVERY
+    assert ovserver.users_calls == 1 and ovserver.rotation_calls == 0
+    assert not key_path.exists()
+
+
+def test_provision_write_failure_recovers_only_via_rotation(
+    sandbox, ovserver, monkeypatch
+):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    real_replace = fail_os_replace_under_sandbox(monkeypatch, sandbox)
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", user_key_path=str(key_path),
+    ) == ba.RC_MANUAL_RECOVERY
+    assert ovserver.users_calls == 1 and not key_path.exists()
+
+    monkeypatch.setattr(ba.os, "replace", real_replace)
+    assert ba.rotate_user(
+        ROOT_KEY, ovserver.url, "test", user_key_path=str(key_path),
+    ) == ba.RC_OK
+    assert key_path.read_text() == ROTATED_KEY
+    assert ovserver.users_calls == 1 and ovserver.rotation_calls == 1
+
+
+def test_provision_meteor_writes_root_free_cli_config(sandbox, ovserver):
+    config = sandbox.home / ".openviking" / "ovcli.conf"
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    cfg = json.loads(config.read_text())
+    assert cfg == {
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor",
+    }
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+
+
+def test_provision_rejects_non_ok_envelope(sandbox, monkeypatch):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    monkeypatch.setattr(ba, "_register_user", lambda *args: (200, {
+        "status": "error", "result": {"user_key": TEST_KEY},
+    }))
+    assert ba.provision_user(
+        ROOT_KEY, "http://127.0.0.1:1933", "test", "user",
+        user_key_path=str(key_path),
+    ) != ba.RC_OK
+    assert not key_path.exists()
+
+
+def test_provision_requires_exactly_one_output(sandbox, ovserver):
+    assert ba.provision_user(ROOT_KEY, ovserver.url, "test", "user") == ba.RC_BAD_ENV
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user",
+        user_key_path=str(sandbox.user_key), cli_config_path=str(sandbox.cli_cfg),
+    ) == ba.RC_BAD_ENV
+    assert ovserver.users_calls == 0
+
+
+def test_custom_profile_does_not_touch_default_saved_profile(sandbox, ovserver):
+    assert run_bootstrap(sandbox, ovserver) == 0
+    default_saved = sandbox.cli_cfg.parent / "ovcli.conf.local"
+    before = default_saved.read_bytes()
+    custom = sandbox.state / "ovcli.test.conf"
+    assert ba._configure_cli(
+        sandbox.ov_bin, ovserver.url, str(custom), ROOT_KEY, USER_KEY,
+        dict(os.environ), profile_name="test",
+    ) == ba.RC_OK
+    assert custom.exists()
+    assert (sandbox.state / "ovcli.conf.test").exists()
+    assert default_saved.read_bytes() == before
+    assert json.loads((sandbox.state / "ovcli.conf.test").read_text())["timeout"] == 300
+
+
+def test_check_user_uses_temporary_root_free_config(sandbox, ovserver, monkeypatch):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", user_key_path=str(key_path),
+    ) == ba.RC_OK
+    config = sandbox.tmp / "container-tmp" / "ovcli.test.conf"
+    audit = sandbox.tmp / "health-audit.json"
+    monkeypatch.setenv("OV_STUB_HEALTH_AUDIT", str(audit))
+    env = dict(os.environ)
+    env[ba.ROOT_KEY_ENV] = ROOT_KEY
+    assert ba.check_user(
+        sandbox.ov_bin, ovserver.url, str(config), str(key_path), env,
+        account_id="default", user_id="test", role="user",
+    ) == ba.RC_OK
+    observed = json.loads(audit.read_text())
+    assert observed["config"] == {
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "test",
+    }
+    assert observed["root_env_present"] is False
+    assert not config.exists()
+    assert (sandbox.home / ".openviking" / "ovcli.settings.conf").exists()
+
+
+def test_health_accepts_explicit_test_identity_without_saved_profile(
+    monkeypatch, sandbox
+):
+    sandbox.cli_cfg.write_text(json.dumps({
+        "url": "http://127.0.0.1:21933", "api_key": TEST_KEY,
+        "account": "default", "user": "test",
+    }))
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: subprocess.CompletedProcess(
+        ["ov", "health"], 0,
+        stdout=json.dumps({"ok": True, "result": {
+            "healthy": True, "account_id": "default", "user_id": "test", "role": "user",
+        }}).encode(),
+    ))
+    assert ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), None, TEST_KEY, {},
+        base_url="http://127.0.0.1:21933", expected_account="default",
+        expected_user="test", expected_role="user", require_root_key=False,
+        saved_profile_path=None,
+    ) == "ok"
+
+
+def test_health_rejects_root_material_in_root_free_config(monkeypatch, sandbox):
+    sandbox.cli_cfg.write_text(json.dumps({
+        "url": "http://127.0.0.1:21933", "api_key": TEST_KEY,
+        "root_api_key": ROOT_KEY,
+    }))
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: subprocess.CompletedProcess(
+        ["ov", "health"], 0,
+        stdout=json.dumps({"ok": True, "result": {
+            "healthy": True, "account_id": "default", "user_id": "test", "role": "user",
+        }}).encode(),
+    ))
+    assert ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), None, TEST_KEY, {},
+        base_url="http://127.0.0.1:21933", expected_account="default",
+        expected_user="test", expected_role="user", require_root_key=False,
+        saved_profile_path=None,
+    ) == "invalid"
+
+
+def test_health_requires_explicit_url(monkeypatch, sandbox):
+    sandbox.cli_cfg.write_text(json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY}))
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: subprocess.CompletedProcess(
+        ["ov", "health"], 0,
+        stdout=json.dumps({"ok": True, "result": {
+            "healthy": True, "account_id": "default", "user_id": "default", "role": "admin",
+        }}).encode(),
+    ))
+    assert ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {},
+        base_url="http://127.0.0.1:21933", expected_account="default",
+        expected_user="default", expected_role="admin", require_root_key=True,
+        saved_profile_path=None,
+    ) == "invalid"
+
+
+def test_main_provision_user_subcommand(sandbox, ovserver, monkeypatch):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    monkeypatch.setenv(ba.ROOT_KEY_ENV, ROOT_KEY)
+    monkeypatch.setenv("OPENVIKING_BOOTSTRAP_URL", ovserver.url)
+    monkeypatch.setenv("OPENVIKING_CLI_CONFIG_FILE", str(sandbox.cli_cfg))
+    monkeypatch.setenv("OPENVIKING_USER_KEY_FILE", str(sandbox.user_key))
+    monkeypatch.setenv("OV_BIN", sandbox.ov_bin)
+    monkeypatch.setattr(sys, "argv", [
+        "bootstrap_auth.py", "provision-user", "--user-id", "test",
+        "--role", "user", "--key-file", str(key_path),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        ba.main()
+    assert exc.value.code == 0
+    assert key_path.read_text() == TEST_KEY
+    assert ovserver.last_user_id == "test"
