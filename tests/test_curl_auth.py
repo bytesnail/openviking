@@ -96,7 +96,7 @@ class FakeIdentityServer(_http_fakes.FakeServer):
                 return json.loads(self.rfile.read(length) or b"{}")
 
             def do_POST(self):
-                if self.path != "/api/v1/fs/write":
+                if self.path != "/api/v1/content/write":
                     self._json(404, {"status": "error"})
                     return
                 uid = self._identity()
@@ -123,7 +123,7 @@ class FakeIdentityServer(_http_fakes.FakeServer):
                 parsed = urlparse(self.path)
                 uid = self._identity()
                 uri = parse_qs(parsed.query).get("uri", [""])[0]
-                if parsed.path != "/api/v1/fs/read" or uid is None:
+                if parsed.path != "/api/v1/content/read" or uid is None:
                     self._json(404, {"status": "error"})
                     return
                 owner = server.resources.get(uri)

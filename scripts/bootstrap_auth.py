@@ -342,6 +342,9 @@ def _cfg_matches(cfg, base_url, root_key, user_key, require_root_key=True):
     if not isinstance(cfg, dict):
         return False
     configured_url = cfg.get("url")
+    if configured_url is None and require_root_key:
+        # 兼容既有 default CLI 配置;root-free 临时身份配置必须显式含 URL。
+        configured_url = DEFAULT_BASE_URL
     root_matches = (
         cfg.get("root_api_key") == root_key
         if require_root_key

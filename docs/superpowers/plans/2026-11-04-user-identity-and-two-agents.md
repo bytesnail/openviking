@@ -54,7 +54,7 @@
 - [ ] **Step 3: 运行测试确认新用例失败**
   Run: `python3 -m pytest tests/test_bootstrap_auth.py -q`；Expected: 新泛化用例 FAIL，既有用例作为对照。
 - [ ] **Step 4: 实现通用接口并保持 default 包装路径**
-  `_register_default_user()` 调用 `_register_user(..., "default", "admin")`；`_cfg_matches` 不再默认补 URL，`require_root_key=False` 时禁止 root 字段；`_run_ov` 在 root_key 为 None 时删除继承的 ROOT 环境。创建成功但写入失败只给轮换恢复路径，不重复创建。
+  `_register_default_user()` 调用 `_register_user(..., "default", "admin")`；root-free 临时配置的 `_cfg_matches` 不得默认补 URL，default 旧配置保留文档化默认地址兼容；`require_root_key=False` 时禁止 root 字段；`_run_ov` 在 root_key 为 None 时删除继承的 ROOT 环境。创建成功但写入失败只给轮换恢复路径，不重复创建。
 - [ ] **Step 5: 实现临时 check-user 配置与 CLI 子命令**
   `check-user` 从 key 文件读取 USER key，在 `/tmp` 或调用者指定沙箱路径写 600 临时配置，净化 root 环境，新 HOME 缺语言设置时先复用 `_ensure_cli_language`，核对显式 account/user/role，finally 删除；所有错误只打印步骤/退出码。
 - [ ] **Step 6: 运行完整单测**
@@ -81,7 +81,7 @@
 - [ ] **Step 3: 抽取 helper 并改造认证矩阵**
   矩阵 source `tests/curl_auth.sh`；保持现有 ROOT/ADMIN/USER 状态断言与 `REQUIRE_USER=1` 行为不变。
 - [ ] **Step 4: 实现 direct-curl 隔离闭环**
-  以 `POST /api/v1/fs/write`（`mode=replace`、`wait=true`、`processing_mode=vectors_only`）写双方私有夹具；自有 read 为 200，交叉 read 为 403|404；`DELETE /api/v1/fs?uri=...&recursive=true&wait=true` 清理并复核。trap 尽力清理，失败即非零，不打印响应体。
+  以 `POST /api/v1/content/write`（`mode=replace`、`wait=true`、`processing_mode=vectors_only`）写双方私有夹具；自有 read 为 200，交叉 read 为 403|404；`DELETE /api/v1/fs?uri=...&recursive=true&wait=true` 以 300 秒超时清理并复核。trap 尽力清理，失败即非零，不打印响应体。
 - [ ] **Step 5: 运行离线测试和矩阵基线**
   Run: `python3 -m pytest tests/test_curl_auth.py -q && bash tests/e2e_auth_matrix.sh`；Expected: fake-curl PASS；尚无 test key 时矩阵 USER 行只允许 SKIP。
 - [ ] **Step 6: 提交 Task 2**

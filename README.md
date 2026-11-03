@@ -58,26 +58,40 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 与 `OPENVIKING_USER_KEY_FILE` 后才有意义;另可用 `OPENVIKING_BOOTSTRAP_URL`
 与 `OV_BIN` 覆盖服务地址与 CLI 可执行名(2026-11-03 检视补记)。
 
-### 认证凭据位置(敏感,勿粘贴到任何对话/issue)
+### 三身份与认证凭据位置(敏感,勿粘贴到任何对话/issue)
+
+| 身份 | user_id / role | 用途 | 持久凭据位置 |
+|---|---|---|---|
+| 部署运维 | `default` / `admin` | bootstrap、doctor/smoke、部署验收 | `state/secrets/user_api_key` 与 default CLI 配置 |
+| 正式个人 | `meteor` / `user` | Claude Code、OpenCode 的真实记忆与资源 | 宿主 `~/.openviking/ovcli.conf`(600),repo 不另存 key |
+| 测试 | `test` / `user` | 数据面功能测试、隔离与插件实验 | `state/secrets/test_user_api_key`(600) |
+
+root/default key 均属 crown-jewel:在 v0.5.2.1 可经 Admin API 列举或轮换
+user key,不得放进 Agent 或测试夹具。三身份方案及隔离边界详见
+[多身份与多 Agent 方案](docs/superpowers/specs/2026-11-01-user-identity-and-multi-agent-plan.md)。
 
 - root key:`secrets.env` 的 `OPENVIKING_ROOT_API_KEY`(容器环境注入),以及
   bootstrap 生成的 active 配置 `state/ovcli.conf` 与 CLI saved profile
   `state/ovcli.conf.local`。
-- User key:`state/secrets/user_api_key`(600),**以及服务端存储
-  `state/data/viking/default/_system/users.json`(当前 644;该文件保存每个
-  user 的明文 key,随 `state/` 进入备份)**。
-- CLI 配置:`state/ovcli.conf`(active)与 `state/ovcli.conf.local`(后者是
-  `ov config add --name local` 写入的 **CLI saved profile**,不是手工副本;
-  bootstrap 通过该命令间接写入)。saved profile 路径固定为同目录
-  `ovcli.conf.<name>`,与 active 配置文件名无关;创建 test 配置时不要用
-  `--name local`(会覆盖 default 的 saved profile),应使用独立 name。两者均
-  600,URL 与 User/root key 必须一致,timeout 均须为有限且 `>=300` 的数值;
-  轮换/清理任一密钥时须同步处理两份配置。bootstrap 会同时为 active
-  配置与 saved profile 补 `"timeout": 300`(已有则不覆盖),并核对两者的 URL、
-  User/root key 与目标部署一致;active 丢失或中断写坏时,只在 saved profile
-  与目标 URL/key 完全一致时原子恢复 active,不自动 `--force` 覆盖 saved。
-  不一致时进入人工恢复并保留现场。轮换 user key 后 users.json 由 Admin API
-  更新,但旧备份仍含旧 key。
+- User key:default 在 `state/secrets/user_api_key`,test 在
+  `state/secrets/test_user_api_key`,均为 600;meteor 只写宿主
+  `~/.openviking/ovcli.conf`(600),repo 不另存裸 key。服务端
+  `state/data/viking/default/_system/users.json` 另存每个 user 的明文 key
+  (当前文件 644),并随 `state/` 进入备份;该文件与备份同样禁止读取回显、
+  上传或入库。
+- default CLI 配置:`state/ovcli.conf`(active)与 `state/ovcli.conf.local`
+  (saved profile,由 `ov config add --name local` 写入)均须 600。bootstrap
+  幂等核对二者的 URL、user/root key 与身份,并同步有限且 `>=300` 的 timeout;
+  不一致时保留现场并进入人工恢复,不得自动 `--force` 覆盖。旧 default 配置
+  缺省 `url` 时兼容文档化 loopback 默认值;新临时身份配置必须显式写 URL。
+- test 默认**不创建持久 CLI active/saved profile**。身份检查统一用
+  `bootstrap_auth.py check-user`,它生成仅含 test key 的临时 600 配置、显式
+  设置 CLI 配置路径、断言 `default/test/user`,并在结束后删除。需要轮换时
+  使用 `bootstrap_auth.py rotate-user --user-id test --key-file ...`,不要重复
+  创建 user。专项持久 CLI 测试仍须单独批准,并使用独立 profile 名。
+- 同账户 user 隔离只是服务端普通数据面的协作式隔离:同 UID 进程仍能读取本机
+  凭据,ADMIN/ROOT 仍有管理面间接访问能力;共享区、模型 token、向量库与任务
+  队列也不是 user 级隔离边界。需要强隔离时必须另用独立账户/实例与 OS 边界。
 - `state/ov.conf`(root 属主、0 字节)是 dockerd 在 bind 挂载外层 state 内
   创建的挂载点存根,容器内被真实 `config/ov.conf` 覆盖,非凭据,勿删。
 
@@ -88,6 +102,34 @@ Studio(`http://127.0.0.1:1933/studio`)登录用 User key:在本地终端自行
 `state/data/viking/default/_system/users.json` 保存同一批明文 key(当前 644,
 同 UID 可读),同样禁止 cat/Read/粘贴;`state` 的 700 只对同机其他 OS 用户
 生效,不构成对同 UID agent/测试进程的隔离边界。
+
+### 测试身份纪律
+
+凡会写数据或验证用户数据面的功能测试一律使用 test 身份,目标优先
+`viking://user/test/resources/...`;不写 `viking://agent/*`,不写真实记忆。
+项目脚本 source 不含密钥加载逻辑的 `tests/curl_auth.sh`,以 direct curl、
+stdin `-K -` 传 key,不得 source 整个认证矩阵。共享区写入仅限专门的共享语义
+测试,并须使用专用 URI 和验收后清理。
+
+```bash
+# test 身份健康检查:临时配置位于容器 /tmp,命令完成后即删除
+docker compose exec -T openviking python -I -B \
+  /opt/openviking/scripts/bootstrap_auth.py check-user \
+  --user-id test --role user \
+  --key-file /app/.openviking/secrets/test_user_api_key \
+  --config-file /tmp/ovcli.test.conf
+
+# 强制 USER 权限边界 + default/test 双向私有隔离与夹具清理
+REQUIRE_USER=1 bash tests/e2e_auth_matrix.sh
+USER_A=default USER_B=test \
+  USER_A_KEY_FILE=state/secrets/user_api_key \
+  USER_B_KEY_FILE=state/secrets/test_user_api_key \
+  bash tests/e2e_user_isolation.sh
+```
+
+容器 `/tmp` 当前是 overlay 可写层,restart 不会清除;不得依赖重启清理临时
+配置。上述隔离验收只证明普通数据面私有读写,不构成对 ADMIN/ROOT 或同 UID
+进程的安全边界。
 
 ## 验收
 
@@ -107,11 +149,10 @@ curl -fsS http://127.0.0.1:1933/ready
   default/default/healthy,而 USER default 无法执行所需运维管理)。
 - 扩展功能面(2026-10-26 两轮全量通过):`python3 tests/e2e_adapter_probe.py`
   (适配器实况 8 项,含配置模型名与 /v1/models 加载列表比对)与
-  `bash tests/e2e_auth_matrix.sh`(基础认证边界 9 项;
-  `state/secrets/test_user_api_key` 存在时自动追加 4 项 USER 边界,否则
-  SKIP;完整 USER 验收用 `REQUIRE_USER=1 bash tests/e2e_auth_matrix.sh`,使缺失
-  USER 行直接失败)不消耗 GLM,可随时重跑;矩阵只覆盖状态边界,不替代方案
-  §6.3 的私有读写隔离检查。普通 USER 边界需先按方案 §6.1 创建 test 并重跑。
+  `bash tests/e2e_auth_matrix.sh`(基础认证边界 9 项 + 4 项 USER 边界);
+  本部署已创建 test,完整验收统一用 `REQUIRE_USER=1 bash tests/e2e_auth_matrix.sh`,
+  使缺失 USER 行直接失败。矩阵只覆盖状态边界,不替代上述 default/test
+  私有读写隔离检查;USER 不可访问账户管理接口的断言对应 v0.5.2.1。
   矩阵的 `BASE` 仅允许 loopback HTTP URL,防止把 ROOT/ADMIN key 发往远端;
   curl 以 `-q` 禁用用户 curlrc。完整矩阵、发现(F1–F4)与复测方法见
   `docs/testing/2026-10-26-openviking-functional-test.md`。

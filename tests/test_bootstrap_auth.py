@@ -959,6 +959,24 @@ def test_health_requires_explicit_url(monkeypatch, sandbox):
     ) == "invalid"
 
 
+def test_health_default_legacy_config_uses_documented_default_url(
+    monkeypatch, sandbox
+):
+    sandbox.cli_cfg.write_text(json.dumps({"api_key": USER_KEY, "root_api_key": ROOT_KEY}))
+    monkeypatch.setattr(ba, "_run_ov", lambda *args: subprocess.CompletedProcess(
+        ["ov", "health"], 0,
+        stdout=json.dumps({"ok": True, "result": {
+            "healthy": True, "account_id": "default", "user_id": "default", "role": "admin",
+        }}).encode(),
+    ))
+    assert ba._ov_health_ok(
+        "ov", str(sandbox.cli_cfg), ROOT_KEY, USER_KEY, {},
+        base_url=ba.DEFAULT_BASE_URL, expected_account="default",
+        expected_user="default", expected_role="admin", require_root_key=True,
+        saved_profile_path=None,
+    ) == "ok"
+
+
 def test_main_provision_user_subcommand(sandbox, ovserver, monkeypatch):
     key_path = sandbox.state / "secrets" / "test_user_api_key"
     monkeypatch.setenv(ba.ROOT_KEY_ENV, ROOT_KEY)

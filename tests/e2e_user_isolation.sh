@@ -45,18 +45,18 @@ write_fixture() { # write_fixture <key> <uri> <A|B>
   printf -v body '{"uri":"%s","content":"identity isolation %s %s","mode":"replace","wait":true,"processing_mode":"vectors_only"}' \
     "$uri" "$marker" "$SUFFIX"
   code_auth "X-API-Key: $key" -X POST -H 'Content-Type: application/json' \
-    --data "$body" "$BASE/api/v1/fs/write"
+    --data "$body" "$BASE/api/v1/content/write"
 }
 
 read_fixture() { # read_fixture <key> <uri>
   code_auth "X-API-Key: $1" --get --data-urlencode "uri=$2" \
-    "$BASE/api/v1/fs/read"
+    "$BASE/api/v1/content/read"
 }
 
 delete_fixture() { # delete_fixture <key> <uri>
   code_auth "X-API-Key: $1" -X DELETE --get \
     --data-urlencode "uri=$2" --data-urlencode 'recursive=true' \
-    --data-urlencode 'wait=true' "$BASE/api/v1/fs"
+    --data-urlencode 'wait=true' -m 300 "$BASE/api/v1/fs"
 }
 
 cleanup() {
