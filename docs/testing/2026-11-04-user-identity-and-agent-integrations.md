@@ -79,7 +79,26 @@ meteor key 通过宿主 JSON 的 process substitution 进入隔离脚本,未新�
 为支持这一无副本路径,隔离脚本的 key 输入门禁由“普通文件且非空”修正为
 “来源可读且读取后非空”,新增 `/dev/fd` 离线回归测试。
 
-## 6. Claude Code 与 OpenCode 2.x 接入结果
+## 6. Claude Code 与 OpenCode 2.x 安装基线
 
-后续任务完成后在此追加实际安装、MCP、数据闭环、跨工具召回与清理结果;未执行
-或未通过的项目不得写成完成。
+| 项目 | 实际结果 |
+|---|---|
+| 安装范围 | 单次 `--harness claude,opencode`,未附加 cli/其他 Agent,未启用 statusline |
+| 安装器 | bootstrap 5297 字节,SHA-256 `951b42cf83f83c5912c46609324fba1b2d2d526a67ca6a1779c4628061ca958e`,与 2026-11-02 审查副本一致 |
+| 安装摘要 | exit=0,NOT_DONE=0,error/failed=0 |
+| Claude Code | host 2.1.316;`openviking-memory@openviking` 0.7.21,user scope,enabled |
+| Claude marketplace | OpenViking URL marketplace;`extraKnownMarketplaces.openviking.autoUpdate=true` |
+| OpenCode | host v2.2.5;`@openviking/opencode-plugin` 0.5.24;plugin 与 MCP server 均已注册 |
+| meteor 凭据边界 | ovcli.conf 保持 600、default/meteor、无 root_api_key;未通过 argv 传 key |
+| 配置变更边界 | Claude settings 仅新增 OpenViking enabledPlugin 与 marketplace 配置,无无关路径变化 |
+| 备份权限 | ovcli/opencode 备份均为 600;OpenCode 备份初始为 664,发现后已收紧 |
+
+目录聚合指纹(排序后的相对路径与文件内容):
+- `~/.openviking/memory-plugin-marketplace`:429 文件,SHA-256 `f515928a16b8feac99fb2b5c8369298a04b3764732f0a71957b2fd1c8051f900`。
+- `~/.config/opencode/plugins/openviking`:54 文件,SHA-256 `5ffbf1c2fc964145e770cb5fa082cb2e3f621a5be120da7b393cbbbe5c87244e`。
+
+以上只证明安装与加载前静态/CLI 状态,不代替真实 MCP 与数据面验收。
+
+## 7. MCP、数据闭环与跨工具召回验收
+
+待沙箱功能验收完成后追加;未执行或未通过的项目不得写成完成。
