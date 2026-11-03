@@ -162,7 +162,7 @@ def identity_server():
     fake.close()
 
 
-def run_isolation(server, tmp_path):
+def run_isolation(server, tmp_path, stream_a=False):
     secrets = tmp_path / "secrets"
     secrets.mkdir()
     key_a = secrets / "alpha"
@@ -173,8 +173,14 @@ def run_isolation(server, tmp_path):
     env.update({
         "USER_A": "alpha", "USER_B": "beta",
         "USER_A_KEY_FILE": str(key_a), "USER_B_KEY_FILE": str(key_b),
-        "BASE": server.url,
+        "BASE": server.url, "FAKE_USER_KEY": USER_A_KEY,
     })
+    if stream_a:
+        return subprocess.run(
+            ["bash", "-c", 'USER_A_KEY_FILE=<(printf "%s" "$FAKE_USER_KEY") bash "$1"',
+             "bash", str(REPO / "tests" / "e2e_user_isolation.sh")],
+            env=env, capture_output=True, text=True, check=False,
+        )
     return subprocess.run(
         ["bash", str(REPO / "tests" / "e2e_user_isolation.sh")],
         env=env, capture_output=True, text=True, check=False,
@@ -191,6 +197,13 @@ def test_isolation_script_enforces_cross_denial_and_cleans(identity_server, tmp_
     combined = proc.stdout + proc.stderr
     assert USER_A_KEY not in combined and USER_B_KEY not in combined
     assert "PASS" in combined
+
+
+def test_isolation_accepts_process_substitution_key(identity_server, tmp_path):
+    """生产缺陷:用 -s 拒绝 /dev/fd 会迫使 meteor 额外落一份裸 key。"""
+    proc = run_isolation(identity_server, tmp_path, stream_a=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert identity_server.resources == {}
 
 
 def test_isolation_script_cleans_when_cross_read_was_allowed(tmp_path):

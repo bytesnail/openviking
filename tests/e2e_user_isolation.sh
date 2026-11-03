@@ -19,12 +19,16 @@ if [[ ! "$BASE" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
   echo "FAIL-SETUP: BASE 仅允许无路径的 http loopback URL" >&2
   exit 1
 fi
-if [ ! -s "$USER_A_KEY_FILE" ] || [ ! -s "$USER_B_KEY_FILE" ]; then
-  echo "FAIL-SETUP: 两个 USER key 文件必须存在且非空" >&2
+if [ ! -r "$USER_A_KEY_FILE" ] || [ ! -r "$USER_B_KEY_FILE" ]; then
+  echo "FAIL-SETUP: 两个 USER key 来源必须可读(支持 /dev/fd)" >&2
   exit 1
 fi
 USER_A_KEY=$(cat "$USER_A_KEY_FILE")
 USER_B_KEY=$(cat "$USER_B_KEY_FILE")
+if [ -z "$USER_A_KEY" ] || [ -z "$USER_B_KEY" ]; then
+  echo "FAIL-SETUP: 两个 USER key 均须非空" >&2
+  exit 1
+fi
 SUFFIX="$(date +%s)-$$-${RANDOM}"
 URI_A="viking://user/${USER_A}/resources/identity-isolation-${SUFFIX}-a.md"
 URI_B="viking://user/${USER_B}/resources/identity-isolation-${SUFFIX}-b.md"

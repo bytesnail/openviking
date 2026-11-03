@@ -59,7 +59,27 @@
 的管理面间接访问、共享区写入、服务端与备份中的明文 key 副本,以及账户级
 模型/token/向量库/任务队列残留。不得据此宣称测试对任何身份“零影响”。
 
-## 5. meteor 与两工具接入结果
+## 5. meteor 身份验收结果
 
-后续任务完成后在此追加实际身份、安装、MCP、数据闭环、跨工具召回与清理结果;
-未执行或未通过的项目不得写成完成。
+| 检查 | 实际结果 |
+|---|---|
+| 宿主前置门禁 | 原 `~/.openviking/ovcli.conf` 不存在,无旧 root 字段迁移问题 |
+| 创建 meteor | Admin API 创建 `meteor`,role=user;未重复创建 |
+| 宿主配置 | 直接写入 `~/.openviking/ovcli.conf`,权限 600,显式 URL,无 root_api_key |
+| repo 副本 | 未在 `state/secrets/` 或其他 repo 路径保存 meteor 裸 key |
+| meteor 健康检查 | `default/meteor/user`,healthy=true |
+| meteor 临时容器配置 | 经 stdin 写入 `/tmp`,仅含 meteor USER key;验证后删除并复核 |
+| meteor/test 自有写入与读取 | 双方均 200 / 200 |
+| meteor 读取 test 私有夹具 | 403,按不可见通过 |
+| test 读取 meteor 私有夹具 | 403,按不可见通过 |
+| 双方夹具清理 | DELETE 均 200,删除后 read 均 404 |
+| 共享区复核 | resources/agent 均与初始基线一致 |
+
+meteor key 通过宿主 JSON 的 process substitution 进入隔离脚本,未新增持久副本。
+为支持这一无副本路径,隔离脚本的 key 输入门禁由“普通文件且非空”修正为
+“来源可读且读取后非空”,新增 `/dev/fd` 离线回归测试。
+
+## 6. Claude Code 与 OpenCode 2.x 接入结果
+
+后续任务完成后在此追加实际安装、MCP、数据闭环、跨工具召回与清理结果;未执行
+或未通过的项目不得写成完成。
