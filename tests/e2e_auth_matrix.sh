@@ -24,6 +24,8 @@
 # 用法:bash tests/e2e_auth_matrix.sh(在仓库根目录)
 set -u
 cd "$(dirname "$0")/.." || { echo "FAIL-SETUP: 无法进入仓库根目录" >&2; exit 1; }
+# 只 source 不加载任何密钥的纯函数库;不得 source 可执行矩阵自身。
+source tests/curl_auth.sh
 
 ENV_TOOL=scripts/env_file.py
 [ -f "$ENV_TOOL" ] || { echo "FAIL-SETUP: 缺少 $ENV_TOOL" >&2; exit 1; }
@@ -41,17 +43,6 @@ fi
 # --noproxy '*':BASE 虽限 loopback,但设了 http_proxy/ALL_PROXY 的环境会把
 # 请求(连 ROOT/ADMIN key 头)送经代理;与 bootstrap/adapter 的禁代理纪律一致。
 code() { curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 15 "$@"; }
-code_auth() { # code_auth <header 行> <curl 参数...>;header 经 stdin 传入,不进 argv
-  local header=$1
-  shift
-  # curl 配置双引号串内只有 \" 与 \\ 是字面量;密钥值含引号/反斜杠时,
-  # 按原样 printf 会提前终结引号串,余下词被 curl 当作额外配置选项解析
-  # (任意选项注入),必须先转义(2026-11-03 检视)。
-  local esc=${header//\\/\\\\}
-  esc=${esc//\"/\\\"}
-  printf 'header = "%s"\n' "$esc" \
-    | curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 15 -K - "$@"
-}
 fails=0
 
 expect() { # expect <描述> <实际> <允许的期望值,如 401 或 401|403>
