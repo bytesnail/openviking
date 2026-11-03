@@ -13,6 +13,9 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 ## 边界
 
 - 一切服务只监听 `127.0.0.1`(API 1933、适配器 18353),无 `ports` 映射、无反向代理。
+- 适配器 healthcheck 探 `/health`,liveness 只量测适配器进程自身;`/ready`
+  含上游(model-serving)探活,仅用于验收命令与人工诊断——上游停滞时重启
+  适配器无意义,不得把上游故障转化为适配器重启循环(2026-11-03 检视决策)。
 - 认证为 `api_key` 模式:root key 管理账户,User key 访问数据;两者分离。
   **但 v0.5.2.1 的 default user 是 ADMIN,可用 `GET /api/v1/admin/accounts/default/users`
   (默认 `include_credentials=true`)取得本账户所有 user 的明文 key,并可轮换

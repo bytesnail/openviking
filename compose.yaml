@@ -26,6 +26,11 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
+      # liveness 只量测适配器进程自身(/health):/ready 含上游探活,若用作
+      # healthcheck,model-serving(18351)停滞时会把适配器拖进无意义的重启
+      # 循环——重启救不了上游。上游可用性由验收命令(doctor/smoke/e2e 探针)
+      # 与 /ready 人工诊断承担;depends_on 的启动门禁因此只保证适配器在位
+      # (2026-11-03 检视决策,用户批准)。
       test:
         - CMD
         - curl
@@ -34,7 +39,7 @@ services:
         - "4"
         - -o
         - /dev/null
-        - http://127.0.0.1:18353/ready
+        - http://127.0.0.1:18353/health
       interval: 10s
       timeout: 5s
       retries: 6
