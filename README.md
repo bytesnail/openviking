@@ -131,6 +131,33 @@ USER_A=default USER_B=test \
 配置。上述隔离验收只证明普通数据面私有读写,不构成对 ADMIN/ROOT 或同 UID
 进程的安全边界。
 
+## Agent 接入(仅 Claude Code 与 OpenCode 2.x)
+
+正式 Agent 共用宿主 `~/.openviking/ovcli.conf` 中的 meteor USER key,沿用官方按
+仓库派生 peer 的机制;不逐工具创建 user/key/peer,也不把 default/root key 放进
+Agent。当前验收基线为 Claude Code 2.1.316 + plugin 0.7.21、OpenCode v2.2.5 +
+`@openviking/opencode-plugin` 0.5.24。版本升级后须重新验收。
+
+```bash
+install_dir=$(mktemp -d)
+curl -fsSL https://openviking.ai/install -o "$install_dir/bootstrap.sh" &&
+  bash "$install_dir/bootstrap.sh" \
+    --yes --lang zh --harness claude,opencode --no-statusline
+```
+
+安装器从既有 meteor 配置读 key,不要增加 `--api-key`。Claude 的 OpenViking URL
+marketplace 当前启用 autoUpdate;OpenCode 重跑安装器会更新插件。安装后分别核对
+`claude plugin list` 与 OpenCode MCP 配置,并以真实 MCP tools list 和专用 test
+URI 完成 write/read/find/forget 闭环。自动捕获/召回实验默认在沙箱 HOME 中使用
+test 身份,不使用 meteor 的真实个人数据。经用户明确许可在真实宿主目录验收时,
+也必须通过进程环境覆盖为 test key 和独立 peer;OpenCode 使用 `--standalone`,
+因为 managed 服务不会继承 CLI 的身份覆盖环境,同时显式关闭 stdin 并选择已配置的
+模型,避免等待输入或默认免费模型限额。
+
+慢语义请求可在测试进程显式设置 `OPENVIKING_TIMEOUT_MS=300000`;默认 15 秒可能
+在服务端仍处理时超时,必须检查并清理部分写入。完整实测结果见
+[身份与 Agent 接入验收](docs/testing/2026-11-04-user-identity-and-agent-integrations.md)。
+
 ## 验收
 
 ```bash

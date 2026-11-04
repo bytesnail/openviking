@@ -101,4 +101,65 @@ meteor key 通过宿主 JSON 的 process substitution 进入隔离脚本,未新�
 
 ## 7. MCP、数据闭环与跨工具召回验收
 
-待沙箱功能验收完成后追加;未执行或未通过的项目不得写成完成。
+### 7.1 两个官方 MCP proxy(已完成)
+
+两个 artifact 均在沙箱 HOME、专用 git 工作区和 `default/test` 配置下完成真实
+initialize → notifications/initialized → tools/list handshake。当次 serverInfo 为
+`openviking/1.27.0`,双方均返回 24 个工具:
+
+`list_users,list_groups,get_acl,set_acl,privacy_tree,privacy_resolve,privacy_upsert,find,search,read,download,list,tree,remember,write,edit,add_resource,add_skill,list_watches,cancel_watch,grep,glob,forget,health`。
+
+| MCP tools/call 闭环 | Claude plugin 0.7.21 | OpenCode plugin 0.5.24 |
+|---|---|---|
+| write 专用 test 私有 URI | PASS | PASS |
+| read 读回唯一 marker | PASS | PASS |
+| find 检索唯一 marker | PASS | PASS |
+| forget 删除专用 URI | PASS | PASS |
+| 删除后 read | 按预期拒绝 | 按预期拒绝 |
+
+首次 write 遇到官方 proxy 默认 `15000ms` 超时(-32004),服务端出现部分写入;
+两次部分资源均已用 direct API DELETE 200 清理且删后 read 404。随后按插件文档将
+沙箱 `OPENVIKING_TIMEOUT_MS=300000`,上述最终闭环通过。MCP 的通用删除工具名为
+`forget`,验收未使用共享区。
+
+### 7.2 真实宿主 Agent 会话(用户指定目录)
+
+用户明确允许不等待沙箱登录,直接在 `/mnt/usr/project/learn/learn_leetcode` 使用真实
+宿主 Claude Code/OpenCode 会话。OpenViking 仍通过进程环境强制 test key、独立
+`agent-e2e-host-*` peer 和临时 OPENVIKING_HOME;未修改项目文件或 git 配置。
+
+- **Claude Code**:真实会话 `5527bda9-7179-47e0-b716-c9a7e45ed206` 返回 OK,
+  加载 24 个 OpenViking MCP 工具,服务端会话前缀为 `cc-`,写入 test。另一真实
+  会话依次调用 write → read → find → forget,无工具错误,最终回复包含唯一
+  marker;专用 URI 删除后 direct read=404。
+- **OpenCode 初始探针**:未关闭 stdin 时进程持续等待;关闭后默认免费模型返回
+  429 free-limit。改用已配置的 `zhipuai-coding-plan/glm-5.3-flash` 后真实会话
+  返回 OK。managed 服务不会继承 CLI 的 test 环境,两个初始探针会话因此写入
+  meteor;已仅针对这两个 `oc-` 会话执行 DELETE 200 并复核 read 404,未产生测试
+  peer 或记忆。后续全部使用 standalone,会话 `ses_e5945a238ffeBU38vy0b2TpMCv`
+  已确认以 `oc-` 前缀写入 test。
+
+- **OpenCode standalone 数据闭环**:真实 Agent 调用 openviking_write 时出现 4 次
+  error(首次超时及后续 resource busy 重试),但 read 确认内容、find 命中、forget
+  删除成功,最终回复 DONE;direct read=404。报告不将这些重试写成“无工具错误”。
+- **主动跨工具检索**:OpenCode 的 find 命中 Claude 自动捕获的
+  `OpenViking隔离测试执行完成.md`;Claude 的 find 命中 OpenCode 自动捕获的
+  `OpenViking工具链测试通过.md` 与 `OpenViking首次写入超时.md`,URI 均位于本次
+  test peer 下。
+- **无工具自动召回**:OpenCode 只读 plan agent 未调用任何工具,能根据启动上下文
+  回答 Claude 测试标记与结论;Claude plan mode 同样无工具调用,能回答 OpenCode
+  测试标记与结论。主动 find 与自动上下文注入两条路径均已验收。
+- **会话前缀与提交**:真实 Claude/OpenCode 会话分别以 `cc-`、`oc-` 写入 test,
+  退出后生成的记忆可由另一工具检索,证明 capture/commit 已发生。
+
+### 7.3 清理与残留边界
+
+- 本次 test peer 与 5 个 `cc-`、3 个 `oc-` 会话 URI 均 DELETE 200、read 404;
+  两个 managed 探针误写的 meteor 会话也已 DELETE 200、read 404。
+- test 根中不再包含本次两个 DATA marker、测试 peer 或 real-agent 资源;meteor 中
+  无残留 `oc-ses_` 会话。共享 resources/agent 与初始基线一致。
+- 插件实际 state 目录无 pending queue 文件;临时沙箱、敏感配置快照和安装器目录
+  均已删除。
+- 用户允许真实宿主会话,因此 Claude Code/OpenCode 自身的本地历史、数据库或缓存
+  可能仍保留本次测试记录;本次清理范围是 OpenViking 服务端测试数据与临时目录,
+  未对宿主工具的全部内部状态做不可逆清理。
