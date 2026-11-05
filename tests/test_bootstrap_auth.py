@@ -802,6 +802,33 @@ def test_provision_existing_local_key_does_not_create(sandbox, ovserver):
     assert ovserver.users_calls == 0
 
 
+def test_provision_existing_local_key_tightens_permissions(sandbox, ovserver):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    key_path.parent.mkdir()
+    key_path.write_text(TEST_KEY)
+    key_path.chmod(0o644)
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", user_key_path=str(key_path),
+    ) == ba.RC_OK
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert ovserver.users_calls == 0
+
+
+def test_provision_existing_cli_config_tightens_permissions(sandbox, ovserver):
+    config = sandbox.home / ".openviking" / "ovcli.conf"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor",
+    }))
+    config.chmod(0o644)
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert ovserver.users_calls == 0
+
+
 def test_provision_conflict_requires_rotation_without_recreating(sandbox, ovserver):
     ovserver.users["test"] = "server-only-key"
     key_path = sandbox.state / "secrets" / "test_user_api_key"

@@ -226,6 +226,7 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
             with open(user_key_path, encoding="utf-8") as fh:
                 if not fh.read().strip():
                     raise ValueError("empty user key")
+            os.chmod(user_key_path, 0o600)
             return RC_OK
         if cli_config_path:
             cfg = _cli_config_for_output(cli_config_path)
@@ -236,6 +237,7 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
                     and cfg.get("user") == user_id
                 ):
                     raise ValueError("CLI config belongs to another identity")
+                os.chmod(cli_config_path, 0o600)
                 return RC_OK
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"错误:本地凭据输出不可安全复用({type(exc).__name__})", file=sys.stderr)
