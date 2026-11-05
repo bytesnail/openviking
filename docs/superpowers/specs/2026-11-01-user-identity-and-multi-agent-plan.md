@@ -7,9 +7,14 @@
 > `docs/superpowers/plans/2026-11-04-user-identity-and-two-agents.md`。
 > 本次 Agent 范围仅 Claude Code 与 OpenCode 2.x;原"待批准、禁止执行"状态
 > 已由该当次授权解除,不代表允许超出上述计划的操作。**
+>
+> **2026-11-06 后续:OpenCode 已由用户手动迁移到 package 插件
+> `@openviking/opencode-plugin` 2026.11.5-1,并完成 MCP、commit、跨 peer 自动召回与
+> 清理复验。此前本地目录 + wrapper 的重复 ID 问题及逐实例健康检查要求见
+> `docs/testing/2026-11-06-opencode-package-plugin-verification.md`。**
 
 日期:2026-11-01
-最近修订:2026-11-02(官方 agent 接入角色、key 权限与安装器复核)
+最近修订:2026-11-06(OpenCode package 迁移、逐实例健康与派生数据清理复核)
 背景:OpenViking v0.5.2.1 从零重建完成(提交 f4c833a)后,围绕"未来多个 agent
 工具如何接入"与"本项目测试验证如何与真实数据隔离"的讨论定稿。
 
@@ -326,7 +331,11 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
    write/delete 数据面闭环;自动召回/捕获在 test 身份或独立测试账户的专用
    peer/私有 URI 中验证并清理,不用 meteor 个人偏好做实验。安装器 "Server check
    passed"、插件出现在列表及 `ov health` 身份正确均只是诊断,不能替代这些能力
-   验收。**若 §4 的 hashing 未启用/未确认,服务端 users.json 仍会保存 meteor
+   验收。**还必须逐实例核对运行时插件状态:同一插件只能有一个预期来源且 active,
+   MCP connected 不得用来掩盖另一同名实例 failed;同时记录实际 proxy 路径,防止
+   升级后仍执行旧本地副本。清理除专用 URI 外,必须覆盖 peer 记忆、session 目录与
+   自动 `.abstract/.overview`,并重新检索测试 marker。**
+   **若 §4 的 hashing 未启用/未确认,服务端 users.json 仍会保存 meteor
    key 的明文副本(§4),因此"只写入宿主"不成立;备份/迁移 `state/` 即包含它。**
 
 任一 user 创建成功但 key 本地落盘失败时,不得重复创建 user;用 root key 调
@@ -375,3 +384,8 @@ CLI saved profile,不是手工副本)、test 的 key 文件;test 默认不再维
 - 2026-11-04 用户批准并完成实施:test/meteor 身份与双向隔离、Claude Code 和
   OpenCode 2.x 官方接入、真实 MCP/数据闭环及双向召回均已验收;实际结果与
   managed/standalone 边界见 `docs/testing/2026-11-04-user-identity-and-agent-integrations.md`。
+- 2026-11-06 OpenCode 安装方式修正:确认本地目录与 wrapper 会产生一个 active、
+  一个 `Duplicate plugin ID` failed 的同名实例,说明功能 PASS 不能替代逐实例健康
+  检查。用户将两个本地入口移至 `plugins_bak/` 并改用 package;新版本
+  `2026.11.5-1` 的 read schema、commit、跨 peer 自动召回和五项目标清理均重新验收,
+  详见 `docs/testing/2026-11-06-opencode-package-plugin-verification.md`。

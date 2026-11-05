@@ -5,6 +5,14 @@
 授权:用户当次明确指示开始执行,并审阅实施计划后选择本会话直接执行。  
 凭据纪律:本报告不含任何 key/token;命令输出仅保留身份、状态码、版本和非敏感路径。
 
+> **2026-11-06 后续修正:**本报告中的 OpenCode 0.5.24 本地文件安装基线已被
+> package 迁移取代。后续发现 OpenCode 2.2.5 同时扫描 `plugins/openviking/` 与
+> `plugins/openviking.js`,目录实例 active、wrapper 实例因 `Duplicate plugin ID`
+> failed;本报告当时的功能通过只证明正常实例的能力,未覆盖逐实例健康检查。
+> 当前 `@openviking/opencode-plugin` 2026.11.5-1 的 package 配置、重新验收与清理见
+> `docs/testing/2026-11-06-opencode-package-plugin-verification.md`。§6–§7 的
+> OpenCode 本地安装与版本信息仅作历史记录。
+
 ## 1. 环境基线与恢复点
 
 - OpenViking Server:v0.5.2.1,镜像 digest `sha256:7c26f9777c7632fd4b771be77471634bffb6ec8d6338b39f53deb2da1b1d34b3`。

@@ -1,5 +1,12 @@
 # OpenViking 多身份与 Claude Code/OpenCode 接入实施计划
 
+> **2026-11-06 后续修正:**Task 5 的 OpenCode 本地文件安装结果在 OpenCode 2.2.5
+> 同时产生目录与 wrapper 两个插件入口,后者因 `Duplicate plugin ID` failed;
+> 当时 Task 6 未逐实例检查 `/api/plugin`,因此功能验收未能发现该状态。用户已将
+> OpenCode 迁移到 `@openviking/opencode-plugin` 2026.11.5-1 package 并重新验收。
+> 本计划的 OpenCode 安装/版本步骤仅作历史记录,当前操作以
+> `docs/testing/2026-11-06-opencode-package-plugin-verification.md` 和 README 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在不破坏 default 运维身份的前提下落地 test/meteor 两个 USER 身份、验证双向私有隔离，并只接入和验收 Claude Code 与 OpenCode 2.x。
