@@ -82,6 +82,26 @@ def _atomic_write_secret(path, content):
         raise
 
 
+def _exclusive_write_secret(path, content):
+    """只创建不存在的 secret;绝不覆盖或清理调用者已有文件。"""
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError:
+        raise
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(content)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
 def _post_json(url, body, root_key, timeout=30):
     """POST JSON with root key; return (status:int, payload:dict|None); status=0 on connection failure."""
     try:
@@ -249,8 +269,16 @@ def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
         print("错误:rotate-user 需要 root key、user 且恰好一个输出路径", file=sys.stderr)
         return RC_BAD_ENV
     try:
-        if cli_config_path:
-            _cli_config_for_output(cli_config_path)
+        if cli_config_path and os.path.exists(cli_config_path):
+            cfg = _cli_config_for_output(cli_config_path)
+            configured_url = cfg.get("url")
+            if not (
+                isinstance(configured_url, str)
+                and configured_url.rstrip("/") == base_url.rstrip("/")
+                and cfg.get("account") == "default"
+                and cfg.get("user") == user_id
+            ):
+                raise ValueError("CLI config identity does not match rotation target")
     except (OSError, ValueError) as exc:
         print(f"错误:轮换输出配置不可安全复用({type(exc).__name__})", file=sys.stderr)
         return RC_MANUAL_RECOVERY
@@ -730,6 +758,12 @@ def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
     """用只含 USER key 的临时配置验证身份,并尽力保证退出后无副本。"""
     if not base_url or not user_id or role == "root":
         return RC_BAD_ENV
+    if os.path.abspath(cli_config_path) == os.path.abspath(user_key_path):
+        print("错误:临时配置路径不得与 key 文件相同", file=sys.stderr)
+        return RC_MANUAL_RECOVERY
+    if os.path.lexists(cli_config_path):
+        print("错误:临时配置路径已存在;拒绝覆盖或删除,请先人工核对", file=sys.stderr)
+        return RC_MANUAL_RECOVERY
     env = dict(os.environ if env is None else env)
     env.pop(ROOT_KEY_ENV, None)
     try:
@@ -737,13 +771,11 @@ def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
             user_key = fh.read().strip()
         if not user_key:
             raise ValueError("empty user key")
-        if os.path.lexists(cli_config_path):
-            os.unlink(cli_config_path)
         cfg = {
             "url": base_url, "api_key": user_key,
             "account": account_id, "user": user_id,
         }
-        _atomic_write_secret(Path(cli_config_path), json.dumps(cfg))
+        _exclusive_write_secret(Path(cli_config_path), json.dumps(cfg))
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"错误:无法准备临时身份配置({type(exc).__name__})", file=sys.stderr)
         return RC_MANUAL_RECOVERY

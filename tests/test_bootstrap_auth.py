@@ -993,3 +993,42 @@ def test_main_provision_user_subcommand(sandbox, ovserver, monkeypatch):
     assert exc.value.code == 0
     assert key_path.read_text() == TEST_KEY
     assert ovserver.last_user_id == "test"
+
+
+def test_check_user_refuses_existing_config_without_deleting(sandbox, ovserver):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    key_path.parent.mkdir()
+    key_path.write_text(TEST_KEY)
+    sandbox.cli_cfg.write_text("formal-config-must-survive")
+    assert ba.check_user(
+        sandbox.ov_bin, ovserver.url, str(sandbox.cli_cfg), str(key_path), {},
+        account_id="default", user_id="test", role="user",
+    ) == ba.RC_MANUAL_RECOVERY
+    assert sandbox.cli_cfg.read_text() == "formal-config-must-survive"
+    assert key_path.read_text() == TEST_KEY
+
+
+def test_check_user_rejects_same_key_and_config_path(sandbox, ovserver):
+    key_path = sandbox.state / "secrets" / "test_user_api_key"
+    key_path.parent.mkdir()
+    key_path.write_text(TEST_KEY)
+    assert ba.check_user(
+        sandbox.ov_bin, ovserver.url, str(key_path), str(key_path), {},
+        account_id="default", user_id="test", role="user",
+    ) == ba.RC_MANUAL_RECOVERY
+    assert key_path.read_text() == TEST_KEY
+
+
+def test_rotate_cli_config_rejects_other_identity_without_remote_change(
+    sandbox, ovserver
+):
+    sandbox.cli_cfg.write_text(json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor",
+    }))
+    before = sandbox.cli_cfg.read_bytes()
+    assert ba.rotate_user(
+        ROOT_KEY, ovserver.url, "test", cli_config_path=str(sandbox.cli_cfg),
+    ) == ba.RC_MANUAL_RECOVERY
+    assert sandbox.cli_cfg.read_bytes() == before
+    assert ovserver.rotation_calls == 0
