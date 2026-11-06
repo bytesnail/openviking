@@ -43,10 +43,6 @@ PROXY_ENV_VARS = (
 )
 # 本地管理请求必须直连;默认 urllib opener 会继承 http_proxy,可能把
 # root Authorization 或本机数据交给外部代理。
-# _NoRedirect/_DIRECT_OPENER 在三份 -I 脚本各持一份同型拷贝(有意不共享:
-# 保持 -I 下零 sys.path 操作、脚本自包含;显式 sys.path.insert 本可共享,
-# 先例 tests/e2e_adapter_probe.py)。任何加固必须同步三份,
-# tests/test_env_file.py 有行为一致性断言。
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """禁止跟随重定向。
 
@@ -63,9 +59,12 @@ _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
 # 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
-# scripts/embedding_adapter.py 各有一份(有意不共享:保持 -I 下零
-# sys.path 操作、脚本自包含;显式 sys.path.insert 本可共享,先例
-# tests/e2e_adapter_probe.py)。对此处的任何加固必须同步另外两份,
+# scripts/embedding_adapter.py 各有一份:保持 -I 下零 sys.path 操作、脚本
+# 自包含是有意设计(显式 sys.path.insert 本可共享,先例
+# tests/e2e_adapter_probe.py)。共享化已定为触发式(2026-11-07 用户决策):
+# 下次 opener/传输层加固时建 scripts/_direct_http.py 单一来源(并收编散于
+# 本文件与 smoke_models 的有限数谓词),触发器→范围映射见项目卡"统一
+# 视角"。在此之前,对此处的任何加固必须同步另外两份,
 # tests/test_env_file.py 有行为一致性断言。
 
 

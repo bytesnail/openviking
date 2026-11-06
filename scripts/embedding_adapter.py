@@ -43,9 +43,11 @@ _DIRECT_OPENER = urllib.request.build_opener(
 )
 # 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
 # scripts/bootstrap_auth.py 各有一份:保持 -I 下零 sys.path 操作、脚本自包含
-# 是有意设计(显式 sys.path.insert 本可共享,先例 tests/e2e_adapter_probe.py;
-# 共享化与端口常量、测试脚手架捆绑决策,未定)。对此处的任何加固必须同步
-# 另外两份,tests/test_env_file.py 有行为一致性断言。
+# 是有意设计(显式 sys.path.insert 本可共享,先例 tests/e2e_adapter_probe.py)。
+# 共享化已定为触发式(2026-11-07 用户决策):下次 opener/传输层加固时建
+# scripts/_direct_http.py 单一来源(并收编散于本文件与 smoke_models 的
+# 有限数谓词),触发器→范围映射见项目卡"统一视角"。在此之前,对此处的
+# 任何加固必须同步另外两份,tests/test_env_file.py 有行为一致性断言。
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18353
