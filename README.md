@@ -25,6 +25,25 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 - 真实凭据的完整清单、位置与权限见下节"认证凭据位置";`ov.conf` 仅保存
   `${VAR}` 引用。
 
+### 适配器环境变量(默认值见 scripts/embedding_adapter.py)
+
+- `EMBEDDING_ADAPTER_HOST`(默认 127.0.0.1)/`EMBEDDING_ADAPTER_PORT`
+  (默认 18353):host 仅接受 IPv4 回环,`::1` 等以明确配置错误退出。
+- `EMBEDDING_UPSTREAM_URL`(默认 `http://127.0.0.1:18351/v1/embeddings`):
+  启动时回环校验,防止请求体(用户文本+base64 图像)外发到非回环主机。
+- `EMBEDDING_UPSTREAM_TIMEOUT_SECONDS`(默认 120):上游转发超时;与单请求
+  总 deadline、空闲读超时共同限定单连接最长占用。
+- `EMBEDDING_MAX_BODY_BYTES` / `EMBEDDING_MAX_RESPONSE_BODY_BYTES`
+  (默认各 64 MiB):入站请求与上游 200 响应的大小上限。
+- `EMBEDDING_MAX_CONCURRENT`(默认 2,compose 显式设 2):并发上游转发上限。
+- `EMBEDDING_MAX_CONNECTIONS`(默认 16,compose 未覆盖):并发连接硬上限。
+  额度在 accept 主循环获取,慢 header 连接同样计入;满额时新连接完成握手后
+  滞留内核 backlog,等任一额度释放才被接受——持续饱和期间 `/health` 同样
+  排不上队,healthcheck 会将适配器标为 unhealthy(诚实信号;本部署不按
+  unhealthy 自动重启,2026-11-06 决策,见 compose.yaml 注释)。行为由
+  `tests/test_embedding_adapter.py::test_connection_handler_threads_are_bounded`
+  钉死,是有意的背压设计而非缺陷。
+
 ## 前提
 
 - 宿主需有 `bash`、`python3`(`prepare.sh` 的 secrets/config 校验与密钥生成)、
