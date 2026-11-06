@@ -40,6 +40,7 @@ class FakeOvServer(_http_fakes.FakeServer):
         self.rotation_calls = 0
         self.drop_user_key = False  # 模拟 trusted 模式缺 user_key 字段
         self.success_status = 200
+        self.ok_envelope = True  # False:200+非 ok 信封(RC 阶梯回归用)
         self.users = {}
         self.last_user_id = None
         self.last_role = None
@@ -118,7 +119,10 @@ class FakeOvServer(_http_fakes.FakeServer):
                     server.users[uid] = key
                     if uid == "default":
                         server.accepted_user_key = key
-                self._json(server.success_status, {"status": "ok", "result": result})
+                self._json(server.success_status, {
+                    "status": "ok" if server.ok_envelope else "error",
+                    "result": result,
+                })
 
             def do_GET(self):
                 if self.path != "/health":
@@ -542,6 +546,24 @@ def test_non_200_success_is_not_treated_as_completed(sandbox, ovserver):
     rc = run_bootstrap(sandbox, ovserver)
     assert rc == ba.RC_UPSTREAM
     assert not sandbox.user_key.exists()
+
+
+def test_first_init_non_ok_envelope_is_no_user_key(sandbox, ovserver, capsys):
+    """200+非 ok 信封与公共解析器同一映射:RC_NO_USER_KEY,不断言"已存在"。
+
+    RC 阶梯统一(2026-11-07 用户决策):此路径原映射 RC_MANUAL_RECOVERY 且文案
+    断言 default 账户/user 已存在——信封异常不是"已存在"的证据。"""
+    ovserver.ok_envelope = False
+    rc = run_bootstrap(sandbox, ovserver)
+
+    captured = capsys.readouterr()
+    assert rc == ba.RC_NO_USER_KEY
+    assert not sandbox.user_key.exists()
+    assert ovserver.users_calls == 1  # 只注册一次,无重试循环
+    assert "信封非 ok" in captured.err
+    assert "已存在" not in captured.err
+    assert ROOT_KEY not in captured.out + captured.err
+    assert USER_KEY not in captured.out + captured.err
 
 
 def test_truncated_admin_response_is_controlled_failure(monkeypatch):

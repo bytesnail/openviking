@@ -77,6 +77,20 @@ docker compose exec -T openviking python -I -B /opt/openviking/scripts/bootstrap
 与 `OPENVIKING_USER_KEY_FILE` 后才有意义;另可用 `OPENVIKING_BOOTSTRAP_URL`
 与 `OV_BIN` 覆盖服务地址与 CLI 可执行名(2026-11-03 检视补记)。
 
+退出码(全部子命令统一;200+非 ok 信封在首次初始化与 provision/rotate 间
+同映射 RC 7,2026-11-07 统一):
+
+| RC | 含义 | 典型场景 |
+|---|---|---|
+| 0 | 成功 | 初始化完成或幂等确认已初始化 |
+| 2 | 参数/环境不合法 | provision 未指定恰一个输出;env 覆盖冲突 |
+| 4 | 需人工恢复(现场已保留) | 账户/user 已存在而本地 key 缺失;key 落盘失败;saved profile 与目标不一致 |
+| 5 | 服务端故障 | admin API 非 200/不可达/超时;凭据未受质疑,恢复后重跑 |
+| 6 | root key 被拒 | 401/403(无效或已轮换) |
+| 7 | 响应缺 user key/信封非 ok | 服务端回归或协议漂移;所有子命令同一映射 |
+| 8 | CLI 配置写回失败 | timeout=300 无法确保;`ov config add` 失败 |
+| 9 | 验收失败 | check-user 的 health/身份核对不达 |
+
 ### 三身份与认证凭据位置(敏感,勿粘贴到任何对话/issue)
 
 | 身份 | user_id / role | 用途 | 持久凭据位置 |

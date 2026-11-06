@@ -607,15 +607,21 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
     if status == 401 or status == 403:
         print("错误:root key 被服务端拒绝(无效或已轮换)", file=sys.stderr)
         return RC_INVALID_ROOT_KEY
-    if status == 409 or (
-        status == 200 and isinstance(payload, dict) and payload.get("status") != "ok"
-    ):
+    if status == 409:
         print(
             "错误:default 账户/user 已存在但本地 user key 缺失,需人工恢复/轮换"
             "(可调 POST /api/v1/admin/accounts/default/users/default/key 轮换)",
             file=sys.stderr,
         )
         return RC_MANUAL_RECOVERY
+    if status == 200 and (
+        not isinstance(payload, dict) or payload.get("status") != "ok"
+    ):
+        # 与 _response_user_key 同一映射(RC 阶梯统一,2026-11-07 用户决策):
+        # 非 ok 信封是响应形状异常,不是"user 已存在"的证据,不得断言恢复动作,
+        # 按缺 key 拒绝继续;200+非 dict 载荷同归此处,不再滑向缺字段文案。
+        print("错误:账户初始化响应信封非 ok,拒绝继续", file=sys.stderr)
+        return RC_NO_USER_KEY
     if status != 200:
         print(f"错误:账户初始化失败(admin API status={status})", file=sys.stderr)
         return RC_UPSTREAM
