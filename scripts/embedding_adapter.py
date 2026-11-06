@@ -42,8 +42,10 @@ _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
 # 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
-# scripts/bootstrap_auth.py 各有一份(python -I 隔离运行,无法共享 import);
-# 对此处的任何加固必须同步另外两份,tests/test_env_file.py 有行为一致性断言。
+# scripts/bootstrap_auth.py 各有一份:保持 -I 下零 sys.path 操作、脚本自包含
+# 是有意设计(显式 sys.path.insert 本可共享,先例 tests/e2e_adapter_probe.py;
+# 共享化与端口常量、测试脚手架捆绑决策,未定)。对此处的任何加固必须同步
+# 另外两份,tests/test_env_file.py 有行为一致性断言。
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18353

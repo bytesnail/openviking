@@ -43,6 +43,10 @@ PROXY_ENV_VARS = (
 )
 # 本地管理请求必须直连;默认 urllib opener 会继承 http_proxy,可能把
 # root Authorization 或本机数据交给外部代理。
+# _NoRedirect/_DIRECT_OPENER 在三份 -I 脚本各持一份同型拷贝(有意不共享:
+# 保持 -I 下零 sys.path 操作、脚本自包含;显式 sys.path.insert 本可共享,
+# 先例 tests/e2e_adapter_probe.py)。任何加固必须同步三份,
+# tests/test_env_file.py 有行为一致性断言。
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """禁止跟随重定向。
 
@@ -59,8 +63,10 @@ _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
 # 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
-# scripts/embedding_adapter.py 各有一份(python -I 隔离运行,无法共享 import);
-# 对此处的任何加固必须同步另外两份,tests/test_env_file.py 有行为一致性断言。
+# scripts/embedding_adapter.py 各有一份(有意不共享:保持 -I 下零
+# sys.path 操作、脚本自包含;显式 sys.path.insert 本可共享,先例
+# tests/e2e_adapter_probe.py)。对此处的任何加固必须同步另外两份,
+# tests/test_env_file.py 有行为一致性断言。
 
 
 def _direct_urlopen(request, timeout):

@@ -145,10 +145,11 @@ def test_get_rejects_extra_arguments(tmp_path):
 
 def test_direct_openers_stay_consistent_across_scripts(monkeypatch):
     """三份 -I 脚本各自持有的 _DIRECT_OPENER 必须行为一致:禁代理 +
-    禁重定向。无法共享 import 是 -I 隔离的代价;本断言防止安全加固只落到
-    一份(2026-11-03 检视)。语义化检查:任何携带代理表的 handler 代理表
-    必须为空(空表 = 无 *_open 钩子 = 绝不走代理),禁重定向 handler 对
-    301 必须返回 None。"""
+    禁重定向。三份拷贝是有意不共享——保持 -I 下脚本自包含(显式
+    sys.path.insert 本可共享,先例 tests/e2e_adapter_probe.py);本断言防止
+    安全加固只落到一份(2026-11-03 检视)。语义化检查:任何携带代理表的
+    handler 代理表必须为空(空表 = 无 *_open 钩子 = 绝不走代理),
+    禁重定向 handler 对 301 必须返回 None。"""
     import bootstrap_auth as ba
     import embedding_adapter as ea
 
