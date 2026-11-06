@@ -25,6 +25,23 @@ v0.5.2 升级并从零重建,过程与验收见 git 历史)复用
 - 真实凭据的完整清单、位置与权限见下节"认证凭据位置";`ov.conf` 仅保存
   `${VAR}` 引用。
 
+### 端口拓扑与同步点(权威表)
+
+model-serving 属 `/mnt/usr/tools/model-serving` 仓库,本仓库是其消费者。任一
+端口变更须同步表中"本仓库落点"全部位置;漏改后果不一:compose/prepare 为
+硬失败,`scripts/env_file.py` 漂移检查与 e2e 兜底为静默降级,`config/ov.conf`
+为运行时报错。
+
+| 端口 | 服务 | 谁消费 | 本仓库落点 |
+|---|---|---|---|
+| 1933 | OpenViking API(`openviking` 服务) | CLI/插件/bootstrap/全部验收 | `compose.yaml OPENVIKING_SERVER_PORT`、`scripts/prepare.sh` 空闲门禁 |
+| 18351 | model-serving embedding(`embeddinggemma-2`) | 适配器上游;漂移检查;e2e 探针 | `compose.yaml EMBEDDING_UPSTREAM_URL`、`scripts/embedding_adapter.py DEFAULT_UPSTREAM`、`scripts/env_file.py check_model_drift`、`scripts/prepare.sh` loopback 门禁、`tests/e2e_adapter_probe.py` 兜底默认 |
+| 18352 | model-serving rerank(`qwen3-reranker-0.6b`,纯文本) | OpenViking 服务器直连(不经适配器);漂移检查 | `config/ov.conf` rerank `api_base`、`scripts/env_file.py`、`scripts/prepare.sh` |
+| 18353 | 多模态 embedding 适配器(`embedding-adapter` 服务) | OpenViking 服务器、healthcheck、e2e 探针 | `compose.yaml EMBEDDING_ADAPTER_PORT`、`scripts/embedding_adapter.py DEFAULT_PORT` |
+
+两层层级为有意设计:ov.conf 的 embedding `api_base` 指向 18353(适配器)而
+非 18351;rerank 纯文本直连 18352。
+
 ### 适配器环境变量(默认值见 scripts/embedding_adapter.py)
 
 - `EMBEDDING_ADAPTER_HOST`(默认 127.0.0.1)/`EMBEDDING_ADAPTER_PORT`

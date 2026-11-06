@@ -66,6 +66,7 @@ loopback_only_listener() {
   done <<< "$listeners"
   [ "$ipv4_seen" = 1 ]
 }
+# 端口拓扑权威表与变更同步点清单见 README;两个循环即其中 prepare.sh 落点。
 for p in 1933 18353; do
   if port_listening "$p"; then
     fail "端口 $p 无法确认空闲(被占用或 ss 探测失败;应为 OpenViking 部署保留);不杀既有进程,请先排查"

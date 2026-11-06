@@ -12,6 +12,7 @@ services:
     environment:
       EMBEDDING_ADAPTER_HOST: "127.0.0.1"
       EMBEDDING_ADAPTER_PORT: "18353"
+      # 端口拓扑权威表与变更同步点清单见 README;改端口须同步全部落点。
       EMBEDDING_UPSTREAM_URL: "http://127.0.0.1:18351/v1/embeddings"
       EMBEDDING_UPSTREAM_TIMEOUT_SECONDS: "120"
       EMBEDDING_MAX_BODY_BYTES: "67108864"

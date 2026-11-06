@@ -236,6 +236,7 @@ def check_model_drift(cfg):
     embedding = cfg.get("embedding")
     dense = embedding.get("dense") if isinstance(embedding, dict) else None
     rerank = cfg.get("rerank")
+    # 探测目标为 model-serving 直连端口(有意绕过适配器);拓扑权威表见 README。
     checks = [
         ("embedding", "18351", dense.get("model", "") if isinstance(dense, dict) else ""),
         ("rerank", "18352", rerank.get("model", "") if isinstance(rerank, dict) else ""),

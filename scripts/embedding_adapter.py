@@ -47,6 +47,7 @@ _DIRECT_OPENER = urllib.request.build_opener(
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18353
+# 端口落点之一;拓扑权威表与变更同步点清单见 README"端口拓扑与同步点"。
 DEFAULT_UPSTREAM = "http://127.0.0.1:18351/v1/embeddings"
 DEFAULT_TIMEOUT = 120
 DEFAULT_MAX_BODY = 67108864  # 64 MiB

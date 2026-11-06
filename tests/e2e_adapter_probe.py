@@ -38,6 +38,7 @@ from env_file import (  # noqa: E402
     validate_config,
 )
 
+# 兜底默认为拓扑落点之一;权威表与变更同步点见 README"端口拓扑与同步点"。
 ADAPTER = os.environ.get("OPENVIKING_ADAPTER_URL", "http://127.0.0.1:18353").rstrip("/")
 UPSTREAM = os.environ.get(
     "OPENVIKING_EMBEDDING_UPSTREAM_URL", "http://127.0.0.1:18351"
