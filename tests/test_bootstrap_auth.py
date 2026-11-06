@@ -863,9 +863,11 @@ def test_provision_meteor_writes_root_free_cli_config(sandbox, ovserver):
         ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
     ) == ba.RC_OK
     cfg = json.loads(config.read_text())
+    # provision 与 run()/_configure_cli 同一 timeout 契约(README:CLI 60s
+    # 默认会让 `ov add-resource --wait` 在慢任务上 DEADLINE_EXCEEDED)。
     assert cfg == {
         "url": ovserver.url, "api_key": TEST_KEY,
-        "account": "default", "user": "meteor",
+        "account": "default", "user": "meteor", "timeout": 300,
     }
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
 
@@ -1059,3 +1061,78 @@ def test_rotate_cli_config_rejects_other_identity_without_remote_change(
     ) == ba.RC_MANUAL_RECOVERY
     assert sandbox.cli_cfg.read_bytes() == before
     assert ovserver.rotation_calls == 0
+
+
+def test_run_rejects_same_key_and_config_path(sandbox):
+    """run() 与 check_user 同一防线:key 文件与 CLI 配置同路径会在 config add
+    时被 JSON 原地覆盖,凭据静默损坏,必须在任何写入前拒绝(2026-11-06 检视)。"""
+    shared = sandbox.state / "same-path"
+    rc = ba.run(ROOT_KEY, "http://127.0.0.1:1933", str(shared), str(shared),
+                ov_bin=sandbox.ov_bin, env=dict(os.environ))
+    assert rc == ba.RC_BAD_ENV
+    assert not shared.exists()
+
+
+def test_run_strips_proxy_env_from_ov_children(sandbox):
+    """ov 子进程携带 root/user key 的 Authorization,不得继承宿主代理设置;
+    与 _DIRECT_OPENER/e2e curl --noproxy 同一纪律(2026-11-06 检视)。"""
+    env = {"http_proxy": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9",
+           "PATH": os.environ["PATH"]}
+    proc = ba._run_ov("/usr/bin/env", [], str(sandbox.cli_cfg), None, None, env)
+    assert proc.returncode == 0
+    assert b"http_proxy" not in proc.stdout
+    assert b"HTTPS_PROXY" not in proc.stdout
+
+
+def test_response_user_key_rejects_non_string_key(monkeypatch, sandbox):
+    """服务端回归导致 user_key 为 dict/int 时必须走 RC_NO_USER_KEY 受控路径,
+    不得流到 fh.write 处抛 TypeError 逃出受控错误(2026-11-06 检视)。"""
+    monkeypatch.setattr(ba, "_register_user", lambda *args: (
+        200, {"status": "ok", "result": {"user_key": {"evil": 1}}},
+    ))
+    key_path = sandbox.state / "secrets" / "bad_type_key"
+    rc = ba.provision_user(
+        ROOT_KEY, "http://127.0.0.1:1933", "bad", "user",
+        user_key_path=str(key_path),
+    )
+    assert rc == ba.RC_NO_USER_KEY
+    assert not key_path.exists()
+
+
+def test_provision_rejects_root_role(sandbox):
+    """provision-user 不得产出第二个 root 身份(与 check_user/_ov_health_ok
+    同一 role 矩阵防线;2026-11-06 检视)。"""
+    key_path = sandbox.state / "secrets" / "root_role_key"
+    assert ba.provision_user(
+        ROOT_KEY, "http://127.0.0.1:1933", "svc", "root",
+        user_key_path=str(key_path),
+    ) == ba.RC_BAD_ENV
+    assert not key_path.exists()
+
+
+def test_provision_null_url_config_enters_manual_recovery(sandbox):
+    """ovcli.conf 的 url 为 JSON null 时,旧实现 None.rstrip 抛 AttributeError
+    逃出受控错误路径;现在必须按身份不符走人工恢复(2026-11-06 检视)。"""
+    config = sandbox.state / "ovcli-null-url.conf"
+    config.write_text(json.dumps({
+        "url": None, "api_key": TEST_KEY,
+        "account": "default", "user": "test",
+    }))
+    assert ba.provision_user(
+        ROOT_KEY, "http://127.0.0.1:1933", "test", "user",
+        cli_config_path=str(config),
+    ) == ba.RC_MANUAL_RECOVERY
+
+
+def test_provision_ensures_timeout_on_cli_config(sandbox, ovserver):
+    """provision/rotate 的 --cli-config 输出与 run() 同一 timeout 契约;
+    缺 timeout 的配置会在 `ov add-resource --wait` 处超时(2026-11-06 检视)。"""
+    config = sandbox.state / "ovcli-timeout.conf"
+    config.write_text(json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "test",
+    }))
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "test", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    assert json.loads(config.read_text())["timeout"] == 300

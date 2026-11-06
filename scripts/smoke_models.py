@@ -23,6 +23,9 @@ _NEGATION = re.compile(
 _IMAGE_NEGATION = re.compile(_NEGATION.pattern + r"|不红|不紅|非红|非紅|无红|无紅")
 _MULTI_DIGIT = re.compile(r"\d{2,}")
 _STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
+# 独立 ASCII 数字:用于拒绝含"非 2 的其他数字"的回答("2+2=4"/"2 或 3"
+# 都是对"1+1=?"的错误应答,不能因子串含 "2" 放行)。
+_STANDALONE_DIGIT = re.compile(r"(?<!\d)(\d)(?!\d)")
 _ENGLISH_TWO = re.compile(r"(?<![a-z-])two(?![a-z-])")
 # 中文"二/兩/两"必须独立出现:前后紧邻其他中文数字(或点)说明是别的数
 # (十二/二十/二零二五/二点五),不得因子串含"二"误判为正确答案
@@ -41,7 +44,9 @@ def _normalize_answer(text):
 
 
 def _text_answer_ok(text):
-    """接受 correct 的 2/二/two 及自然短语;拒绝 2025/12/否定句。"""
+    """接受 correct 的 2/二/two 及自然短语;拒绝 2025/12/否定句。
+    还须拒绝含其他独立数字的回答:"2+2=4"、"2 或 3"、"3个2" 同样是对
+    "1 加 1 等于几" 的错误应答;等式形态只认以 "=2" 结尾(如 "1+1=2")。"""
     normalized = _normalize_answer(text)
     if not normalized:
         return False
@@ -49,12 +54,14 @@ def _text_answer_ok(text):
         return True
     if _NEGATION.search(normalized) or _MULTI_DIGIT.search(normalized):
         return False
-    # 允许 "答案是2/二/two" 与 "1+1=2" 等自然回答,但排除多位数和否定句。
-    return (
+    if not (
         _STANDALONE_TWO.search(normalized) is not None
         or _ENGLISH_TWO.search(normalized) is not None
         or _STANDALONE_CN_TWO.search(normalized) is not None
-    )
+    ):
+        return False
+    digits = _STANDALONE_DIGIT.findall(normalized)
+    return normalized.endswith("=2") or all(d == "2" for d in digits)
 
 
 def _image_answer_ok(text):

@@ -979,3 +979,94 @@ def test_keepalive_restores_header_timeout_after_body_read(adapter, upstream, mo
         resp.read()
     finally:
         conn.close()
+
+
+def test_keepalive_drain_uses_current_request_body_length(adapter, monkeypatch):
+    """同一 keep-alive 连接上 200 之后再来一个未读体的 404:排水必须按当前
+    请求声明的长度完整执行。逐请求状态(_body_bytes_read)残留上一请求的
+    已读字节数会把 remaining 压成 0 而跳过排水,内核以 RST 收尾,已写出的
+    4xx 可能被客户端整包丢弃(2026-11-06 检视)。"""
+    drained = []
+    original = ea.AdapterHandler._drain_unread_body
+
+    def spy(self):
+        headers = self.headers.get_all("Content-Length") or [""]
+        drained.append((int(headers[0]), self._body_bytes_read))
+        return original(self)
+
+    monkeypatch.setattr(ea.AdapterHandler, "_drain_unread_body", spy)
+    conn = http.client.HTTPConnection(
+        "127.0.0.1", adapter.server_address[1], timeout=10
+    )
+    try:
+        big = json.dumps({"model": "m", "input": "x" * 3000}).encode()
+        conn.request("POST", "/v1/embeddings", body=big,
+                     headers={"Content-Type": "application/json"})
+        r1 = conn.getresponse()
+        assert r1.status == 200
+        r1.read()
+        body2 = b"y" * 500
+        conn.request("POST", "/v1/other", body=body2,
+                     headers={"Content-Type": "application/json"})
+        r2 = conn.getresponse()
+        assert r2.status == 404
+        r2.read()
+    finally:
+        conn.close()
+    # 当前请求声明 500 字节、本次已读 0 字节(修复前残留为上一请求的 >3000)
+    assert drained == [(500, 0)]
+
+
+def test_drain_reads_via_rfile_not_raw_socket():
+    """排水必须经 rfile.read1(先吐用户态缓冲存量)而不是裸 connection.recv:
+    小请求的头+体常已被读头的缓冲读整体吞进 rfile,裸 recv 对空内核队列会
+    空等满 1s 超时且取不到任何字节(修复前实测恰好 1.00s;2026-11-06 检视)。
+    端到端时序断言在满载下不稳定,这里用确定性单元替身验证读取路径。"""
+    pulled = []
+
+    class FakeRFile:
+        def read1(self, n):
+            pulled.append(n)
+            return b"x" * 40  # 一次读齐,模拟缓冲存量立即可用
+
+    class FakeConn:
+        def settimeout(self, seconds):
+            pass
+
+        def recv(self, n):  # 旧实现会走到这里:fail loudly
+            raise AssertionError("排水不得使用裸 socket recv")
+
+    class FakeHeaders:
+        def get_all(self, name):
+            return ["40"]
+
+    handler = ea.AdapterHandler.__new__(ea.AdapterHandler)  # 跳过 __init__
+    handler.headers = FakeHeaders()
+    handler._body_bytes_read = 0
+    handler.rfile = FakeRFile()
+    handler.connection = FakeConn()
+
+    ea.AdapterHandler._drain_unread_body(handler)
+
+    assert pulled == [40]  # 恰好一次 read1,取齐声明的 40 字节后即止
+
+
+def test_empty_wrapped_content_rejected_locally():
+    """空 content 与裸空 parts 列表同一语义:就地 400,不浪费上游推理。"""
+    with pytest.raises(ea.RequestError):
+        ea.transform_body({"input": [{"content": []}]})
+
+
+def test_loopback_config_guards_fail_loud():
+    """监听与上游都必须显式 IPv4 loopback;::1 在 AF_INET 服务上不可绑,
+    接受它只会产出裸 gaierror 而非受控配置错误(2026-11-06 检视)。"""
+    assert ea._loopback_host("localhost") == "127.0.0.1"
+    assert ea._loopback_host("127.0.0.1") == "127.0.0.1"
+    with pytest.raises(SystemExit):
+        ea._loopback_host("::1")
+    with pytest.raises(SystemExit):
+        ea._loopback_host("0.0.0.0")
+    url = "http://127.0.0.1:18351/v1/embeddings"
+    assert ea._loopback_upstream_url(url) == url
+    with pytest.raises(SystemExit):
+        ea._loopback_upstream_url("http://example.com/v1/embeddings")

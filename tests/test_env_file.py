@@ -290,3 +290,17 @@ def test_model_name_matches_tolerates_path_and_quant_suffix_forms():
     # 不同路径下的同名文件:basename 相同即匹配
     other_dir = {"/data/models/embeddinggemma-2.gguf"}
     assert ef.model_name_matches("embeddinggemma-2", other_dir)
+
+
+def test_parse_rejects_dollar_interpolation(tmp_path):
+    """'$' 一律拒绝:实测 Compose v5.6.1 对 env_file 值做 $VAR/$$ 插值
+    (单双引号内都不豁免),本解析器按字面读取会"校验通过而容器注入不同值",
+    与反斜杠/未闭合引号守卫同一 fail-open 类别(2026-11-06 检视)。"""
+    for line in (
+        "A=abc$NOPEdef\n",
+        'B="dq$NOPE"\n',
+        "C='sq$NOPE'\n",
+        "D=ab$$NOPE\n",
+    ):
+        with pytest.raises(ef.EnvFileError):
+            ef.parse_env_file(write(tmp_path, line, name="s.env"))

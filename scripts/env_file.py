@@ -6,7 +6,9 @@
 - 双/单引号、行内注释(` #` 起;`VALUE#literal` 与紧跟 `=` 的 `#literal` 保留;
   `KEY=   # comment` 的注释不算值,解析为空);
 - 不实现 `$`/`${}` 插值与双引号转义(本项目密钥为 hex,不含这些字符;
-  双引号值内出现反斜杠转义时直接报错,防止"校验通过但 Compose 注入不同值")。
+  双引号值内出现反斜杠转义时直接报错,防止"校验通过但 Compose 注入不同值";
+  值含 `$` 时同样直接报错——Compose 对 env_file 值做 $VAR/$$ 插值,引号内
+  不豁免,字面读取会与容器注入值静默不一致)。
 
 用法:
   env_file.py get <secrets.env> <NAME>          输出 NAME 的值(调用方捕获,不打印)
@@ -53,6 +55,7 @@ class EnvFileError(Exception):
 
 
 def parse_env_value(value):
+    parsed = None
     quoted = (
         re.fullmatch(r'\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?', value)
         or re.fullmatch(r"\s*('[^']*')\s*(?:#.*)?", value)
@@ -65,18 +68,28 @@ def parse_env_value(value):
             raise EnvFileError(
                 "双引号值内含反斜杠转义,本解析器不支持;请改用不含转义的值"
             )
-        return token[1:-1]
-    if value.lstrip().startswith(('"', "'")):
+        parsed = token[1:-1]
+    elif value.lstrip().startswith(('"', "'")):
         # 引号开头却未整段匹配成合法引号值 = 引号未闭合,或转义吃掉了收尾
         # 引号;原样走非引号路径放行会造成"本解析器值 ≠ Compose 注入值"
         # 的静默分歧,必须显式报错(2026-11-03 检视)。
         raise EnvFileError(
             "引号值未闭合或含不支持的转义(双引号内不支持反斜杠转义)"
         )
-    # Compose:非引号值的行内注释以"空白 + #"开始,VALUE#literal 不算。
-    # 必须在未 strip 的原文上切,保留"# 前是否有空白"的信息:先 strip 会把
-    # `KEY=   # note` 变成值 "# note",而 compose 解析为空值。
-    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+    else:
+        # Compose:非引号值的行内注释以"空白 + #"开始,VALUE#literal 不算。
+        # 必须在未 strip 的原文上切,保留"# 前是否有空白"的信息:先 strip 会把
+        # `KEY=   # note` 变成值 "# note",而 compose 解析为空值。
+        parsed = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+    # '$' 一律拒绝(实测 Compose v5.6.1 对 env_file 值做 $VAR/$$ 插值,
+    # 单双引号内都不豁免):本解析器按字面读取,两侧值会静默不一致——
+    # 校验通过而容器注入不同值,正是反斜杠守卫要堵的同一类分歧。
+    if "$" in parsed:
+        raise EnvFileError(
+            "值含 '$':Compose 会对 $VAR/$$ 做插值而本解析器按字面读取,"
+            "两侧值会静默不一致;请改用不含 '$' 的值"
+        )
+    return parsed
 
 
 def parse_env_file(path):

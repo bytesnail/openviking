@@ -34,6 +34,13 @@ RC_MANUAL_RECOVERY = 4
 
 USER_KEY_ENV = "OPENVIKING_USER_API_KEY"
 ROOT_KEY_ENV = "OPENVIKING_ROOT_API_KEY"
+# ov CLI 子进程同样必须直连:它会把 root/user key 放进 Authorization 发往
+# base_url,继承宿主 http_proxy 等变量就会把密钥送经外部代理(与下方
+# _DIRECT_OPENER 同一纪律;e2e 脚本对 curl 亦以 --noproxy '*' 对齐)。
+PROXY_ENV_VARS = (
+    "http_proxy", "https_proxy", "all_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+)
 # 本地管理请求必须直连;默认 urllib opener 会继承 http_proxy,可能把
 # root Authorization 或本机数据交给外部代理。
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -87,10 +94,8 @@ def _exclusive_write_secret(path, content):
     if not path.parent.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except OSError:
-        raise
+    # O_CREAT|O_EXCL 失败(EEXIST 等)按原样上抛,由调用方走人工恢复。
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(content)
@@ -189,7 +194,10 @@ def _write_user_output(user_key, base_url, user_id, user_key_path, cli_config_pa
         "account": "default",
         "user": user_id,
     })
-    _atomic_write_secret(Path(cli_config_path), json.dumps(cfg))
+    # allow_nan=False:JSON 的 NaN/Infinity 字面量不合 RFC 8259,严格解析器
+    # (jq、非 Python 工具链)读不动;解析侧容忍是为修复 timeout,写回侧必须
+    # 拒绝把非法字面量再写回凭据配置(ValueError 由调用方走人工恢复)。
+    _atomic_write_secret(Path(cli_config_path), json.dumps(cfg, allow_nan=False))
 
 
 def _response_user_key(status, payload):
@@ -207,19 +215,35 @@ def _response_user_key(status, payload):
         return RC_NO_USER_KEY, None
     result = payload.get("result")
     user_key = result.get("user_key") if isinstance(result, dict) else None
-    if not user_key:
+    # 必须是字符串:非字符串真值(服务端回归/升级漂移)若放行,会在落盘
+    # fh.write 处抛 TypeError 逃出受控错误路径,而不是走"拒绝继续"。
+    if not isinstance(user_key, str) or not user_key:
         print("错误:响应缺少 result.user_key,拒绝继续", file=sys.stderr)
         return RC_NO_USER_KEY, None
     return RC_OK, user_key
 
 
+def _cli_config_identity_ok(cfg, base_url, user_id):
+    """CLI 配置身份(url/account/user)与目标一致;url 非字符串一律不算一致
+    (JSON null 会令 .rstrip 抛 AttributeError 逃出受控错误路径,必须先判型)。"""
+    configured_url = cfg.get("url")
+    return (
+        isinstance(configured_url, str)
+        and configured_url.rstrip("/") == base_url.rstrip("/")
+        and cfg.get("account") == "default"
+        and cfg.get("user") == user_id
+    )
+
+
 def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
                    cli_config_path=None, timeout=30):
     """创建单个 user 并安全落盘;已有本地凭据时不再次创建。"""
-    if not root_key or not user_id or not role or (
+    if not root_key or not user_id or not role or role == "root" or (
         bool(user_key_path) == bool(cli_config_path)
     ):
-        print("错误:provision-user 需要 root key、user/role 且恰好一个输出路径", file=sys.stderr)
+        # role="root" 与 check_user/_ov_health_ok 同一防线:本工具不得再产出
+        # 第二个 root 身份,role 矩阵只允许 ROOT key + default/admin。
+        print("错误:provision-user 需要 root key、非 root 的 user/role 且恰好一个输出路径", file=sys.stderr)
         return RC_BAD_ENV
     try:
         if user_key_path and os.path.exists(user_key_path):
@@ -231,13 +255,14 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
         if cli_config_path:
             cfg = _cli_config_for_output(cli_config_path)
             if cfg.get("api_key"):
-                if not (
-                    cfg.get("url", "").rstrip("/") == base_url.rstrip("/")
-                    and cfg.get("account") == "default"
-                    and cfg.get("user") == user_id
-                ):
+                if not _cli_config_identity_ok(cfg, base_url, user_id):
                     raise ValueError("CLI config belongs to another identity")
                 os.chmod(cli_config_path, 0o600)
+                # 复用路径同样补齐 timeout 契约(README:CLI 60s 默认会让
+                # `ov add-resource --wait` 在慢任务上 DEADLINE_EXCEEDED)。
+                if not _ensure_timeout_file(cli_config_path):
+                    print("错误:无法确保输出 CLI 配置的 timeout=300", file=sys.stderr)
+                    return RC_CLI_CONFIG
                 return RC_OK
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"错误:本地凭据输出不可安全复用({type(exc).__name__})", file=sys.stderr)
@@ -258,6 +283,11 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
             file=sys.stderr,
         )
         return RC_MANUAL_RECOVERY
+    if cli_config_path and not _ensure_timeout_file(cli_config_path):
+        # 新写/复写的 CLI 配置与 run()/_configure_cli 同一契约:必须带
+        # timeout,否则后续 `ov add-resource --wait` 会超时失败。
+        print("错误:无法确保输出 CLI 配置的 timeout=300", file=sys.stderr)
+        return RC_CLI_CONFIG
     print(f"已创建 user={user_id} 并写入凭据(600)")
     return RC_OK
 
@@ -273,13 +303,7 @@ def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
     try:
         if cli_config_path and os.path.exists(cli_config_path):
             cfg = _cli_config_for_output(cli_config_path)
-            configured_url = cfg.get("url")
-            if not (
-                isinstance(configured_url, str)
-                and configured_url.rstrip("/") == base_url.rstrip("/")
-                and cfg.get("account") == "default"
-                and cfg.get("user") == user_id
-            ):
+            if not _cli_config_identity_ok(cfg, base_url, user_id):
                 raise ValueError("CLI config identity does not match rotation target")
     except (OSError, ValueError) as exc:
         print(f"错误:轮换输出配置不可安全复用({type(exc).__name__})", file=sys.stderr)
@@ -299,6 +323,10 @@ def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
             file=sys.stderr,
         )
         return RC_MANUAL_RECOVERY
+    if cli_config_path and not _ensure_timeout_file(cli_config_path):
+        # 与 provision/run 同一 timeout 契约(见 provision_user)。
+        print("错误:无法确保输出 CLI 配置的 timeout=300", file=sys.stderr)
+        return RC_CLI_CONFIG
     print(f"已轮换 user={user_id} 并更新凭据(600)")
     return RC_OK
 
@@ -325,6 +353,10 @@ def _run_ov(ov_bin, args, cli_config_path, root_key, user_key, env, timeout=90):
     超时不抛异常:折叠为 returncode=124,保持"失败只报步骤与退出码"的契约。
     """
     child_env = dict(env)
+    # 密钥经环境注入的子进程不得继承宿主代理设置:ov 会携带 root/user key
+    # 的 Authorization 访问 base_url,经外部代理转发即构成密钥外泄通道。
+    for proxy_var in PROXY_ENV_VARS:
+        child_env.pop(proxy_var, None)
     if root_key is None:
         child_env.pop(ROOT_KEY_ENV, None)
     else:
@@ -452,6 +484,12 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
     env = dict(os.environ if env is None else env)
     user_key_path = os.path.abspath(user_key_path)
     cli_config_path = os.path.abspath(cli_config_path)
+    # 与 check_user 同一防线:key 文件与 CLI 配置同路径时,ov config add 会
+    # 用 JSON 配置原地覆盖裸 key 文件,"成功"后凭据实际已损坏(check_user
+    # 已拒绝同路径;run 首启路径此前漏了同一守卫)。
+    if user_key_path == cli_config_path:
+        print("错误:user_api_key 与 ovcli.conf 为同一路径;需分别指定", file=sys.stderr)
+        return RC_BAD_ENV
 
     if not root_key:
         print("错误:环境缺少 OPENVIKING_ROOT_API_KEY(或为空)", file=sys.stderr)
@@ -484,10 +522,12 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
         if _cfg_matches(saved_cfg, base_url, root_key, stored_key) \
                 and not _cli_config_matches(cli_config_path, base_url, root_key, stored_key):
             try:
-                _atomic_write_secret(Path(cli_config_path), json.dumps(saved_cfg))
+                _atomic_write_secret(
+                    Path(cli_config_path), json.dumps(saved_cfg, allow_nan=False)
+                )
                 cli_cfg_exists = True
                 print("已从匹配的 saved profile 原子恢复 ovcli.conf")
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 print(
                     f"错误:从 saved profile 恢复 ovcli.conf 失败({type(exc).__name__})",
                     file=sys.stderr,
@@ -582,7 +622,8 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
 
     result = (payload or {}).get("result") if isinstance(payload, dict) else None
     user_key = result.get("user_key") if isinstance(result, dict) else None
-    if not user_key:
+    # 与 _response_user_key 同一判型:非字符串真值不得进入落盘路径。
+    if not isinstance(user_key, str) or not user_key:
         print("错误:响应缺少 result.user_key,拒绝继续", file=sys.stderr)
         return RC_NO_USER_KEY
 
@@ -669,8 +710,8 @@ def _ensure_timeout_file(path, timeout=300):
     # 缺失、非数值或小于 300 的 timeout 都视为不足;写成 300。
     cfg["timeout"] = timeout
     try:
-        _atomic_write_secret(Path(path), json.dumps(cfg))
-    except OSError as exc:
+        _atomic_write_secret(Path(path), json.dumps(cfg, allow_nan=False))
+    except (OSError, ValueError) as exc:
         print(
             f"错误:原子写入 {name} 失败({type(exc).__name__}),无法确保 timeout",
             file=sys.stderr,
@@ -777,7 +818,7 @@ def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
             "url": base_url, "api_key": user_key,
             "account": account_id, "user": user_id,
         }
-        _exclusive_write_secret(Path(cli_config_path), json.dumps(cfg))
+        _exclusive_write_secret(Path(cli_config_path), json.dumps(cfg, allow_nan=False))
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"错误:无法准备临时身份配置({type(exc).__name__})", file=sys.stderr)
         return RC_MANUAL_RECOVERY

@@ -27,6 +27,9 @@ fail() { echo "prepare 失败:$*" >&2; exit 1; }
 [ -f "$COMPOSE_FILE" ] || fail "缺少 $COMPOSE_FILE"
 [ -f "$CONFIG_FILE" ] || fail "缺少 $CONFIG_FILE(必须是常规文件,不能是目录)"
 [ -f "$SECRETS_FILE" ] || fail "缺少 $SECRETS_FILE"
+# 与 state 同一沙盒纪律:符号链接会让后面的 chmod/追加写穿透到链接目标,
+# 把生成的 root key 写出本仓库沙盒;拒绝前绝不写 key。
+[ ! -L "$SECRETS_FILE" ] || fail "$SECRETS_FILE 是符号链接;写入会穿透到链接目标逃出本仓库沙盒,请先备份并人工确认"
 [ -f "$ENV_TOOL" ] || fail "缺少 $ENV_TOOL"
 
 # ---------- 宿主 UID/GID 与 Compose 一致性 ----------
@@ -88,6 +91,10 @@ else
   [ ! -e "$STATE_DIR" ] || [ -d "$STATE_DIR" ] \
     || fail "state 路径存在但不是目录"
   if [ -d "$STATE_DIR" ]; then
+    # 目录本身不可读时,通配符不展开、循环零条目,会把未知内容误判为空而
+    # 在写 key 后才失败——与 secrets 条目同一 fail-open,先确认可读可进。
+    [ -r "$STATE_DIR" ] && [ -x "$STATE_DIR" ] \
+      || fail "state 目录不可读/不可遍历,无法确认内容是否未知;请先备份并人工确认"
     for entry in "$STATE_DIR"/* "$STATE_DIR"/.[!.]* "$STATE_DIR"/..?*; do
       [ -e "$entry" ] || [ -L "$entry" ] || continue
       case "$(basename "$entry")" in
@@ -95,9 +102,11 @@ else
           # 仅允许上次失败后留下的空目录;任何已有内容都属于未知状态。
           # find 对不可遍历目录的 stdout 为空,必须先确认可读可进,否则
           # "不可读"会被 -z 误判为"空"而在写 key 之后才失败(2026-11-03 检视)。
-          [ -d "$entry" ] && [ -r "$entry" ] && [ -x "$entry" ] \
+          # 符号链接会被 -d/-r/-x 跟随而蒙混过关,必须显式拒绝(与
+          # ensure_dir_700 同一防线,且必须在生成 key 之前拒绝)。
+          [ ! -L "$entry" ] && [ -d "$entry" ] && [ -r "$entry" ] && [ -x "$entry" ] \
             && [ -z "$(find "$entry" -mindepth 1 -print -quit)" ] \
-            || fail "state/secrets 含非本方案验证的数据或不可读取;请先备份并人工确认"
+            || fail "state/secrets 含非本方案验证的数据、符号链接或不可读取;请先备份并人工确认"
           ;;
         *) fail "state 目录含非本方案创建的数据($(basename "$entry"));请先备份并人工确认,本脚本不清空、不接管" ;;
       esac

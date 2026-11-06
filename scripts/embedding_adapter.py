@@ -167,6 +167,14 @@ def transform_body(body):
                 "unsupported_input",
                 "wrapped input must contain exactly one item",
             )
+        # 空 content 与裸空 parts 列表同一语义:就地 400 拒绝,不浪费一次
+        # 上游推理再把它 502 掉(与上方空列表拒绝对称)。
+        if not inp[0].get("content"):
+            raise RequestError(
+                400,
+                "unsupported_input",
+                "wrapped input content must not be empty",
+            )
         return body, True
     if all(_is_text_part(x) or _is_image_part(x) for x in inp):
         return {**body, "input": [{"content": inp}]}, True
@@ -266,14 +274,22 @@ class AdapterHandler(BaseHTTPRequestHandler):
     def handle(self):
         try:
             super().handle()
-        except (TimeoutError, BrokenPipeError, ConnectionResetError,
+        except (TimeoutError, socket.timeout, BrokenPipeError, ConnectionResetError,
                 ConnectionAbortedError):
+            # socket.timeout 在 3.10+ 即 TimeoutError 的别名;显式并列以与
+            # _read_request_body/_call_upstream 的防御写法一致,不依赖镜像
+            # Python 版本。
             # 超时/错误响应后客户端可立即断开;残留字节或后续写响应(含对已
             # 关闭 socket 的写超时)不应让 socketserver 打 traceback,也不
             # 影响其他连接。
             self.close_connection = True
 
     def do_GET(self):
+        # 同一 handler 实例服务一条 keep-alive 连接上的所有请求;逐请求状态
+        # 必须在入口重置,否则上一请求的已读字节数/响应开始标记会污染下一
+        # 请求的排水计算与错误兜底分类。
+        self._body_bytes_read = 0
+        self._response_started = False
         # GET 也可能带体;成功响应前不读体,因此统一禁止连接复用
         # (close=True 向客户端显式声明,防复用撞上单方面关闭)。
         self.close_connection = True
@@ -294,6 +310,9 @@ class AdapterHandler(BaseHTTPRequestHandler):
         self._send_error_json(404, "not_found", "unknown path")
 
     def do_POST(self):
+        # 逐请求状态重置(见 do_GET):上一请求残留会污染排水与兜底分类。
+        self._body_bytes_read = 0
+        self._response_started = False
         if self.path != "/v1/embeddings":
             self.close_connection = True  # 不读未知路径的请求体,关闭连接防止 keep-alive 错位
             self._send_error_json(404, "not_found", "unknown path")
@@ -430,7 +449,10 @@ class AdapterHandler(BaseHTTPRequestHandler):
             deadline = time.monotonic() + 1.0
             self.connection.settimeout(1.0)
             while cap > 0 and time.monotonic() < deadline:
-                chunk = self.connection.recv(min(65536, cap))
+                # 经 rfile 排水而非裸 socket:小请求的头+体常已被读头的
+                # 缓冲读整体吞进 rfile 用户态缓冲,裸 recv 会扑空并空等满
+                # 1s 超时;rfile.read1 先吐缓冲存量,真正无数据才等超时。
+                chunk = self.rfile.read1(min(65536, cap))
                 if not chunk:
                     break
                 cap -= len(chunk)
@@ -460,7 +482,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise RequestError(400, "invalid_request", "invalid Content-Length")
         length = int(length_header)
-        if length < 0 or length > self.server.max_body_bytes:
+        # isascii+isdigit 已排除负号,无需再判 length < 0。
+        if length > self.server.max_body_bytes:
             self.close_connection = True
             raise RequestError(413, "payload_too_large", "request body exceeds limit")
         return length
@@ -538,16 +561,36 @@ def _env_int(name, default, minimum=1):
 
 
 def _loopback_host(host):
-    """宿主地址必须显式是 loopback:模块安全约束是"只监听 loopback",
+    """宿主地址必须显式是 IPv4 loopback:模块安全约束是"只监听 loopback",
     容器为 host 网络且适配器无认证,误绑 0.0.0.0 会把无鉴权代理暴露到局域网,
-    必须 fail loud 而非静默照绑。"""
+    必须 fail loud 而非静默照绑。不支持 ::1:ThreadingHTTPServer 默认
+    AF_INET,接受 ::1 只会在 bind 处抛裸 gaierror,而非受控配置错误。"""
     resolved = {"localhost": "127.0.0.1"}.get(host, host)
-    if resolved not in ("127.0.0.1", "::1"):
+    if resolved not in ("127.0.0.1",):
         raise SystemExit(
-            f"配置错误:EMBEDDING_ADAPTER_HOST={host} 不是 loopback;"
-            "本适配器只允许绑定 127.0.0.1/::1/localhost"
+            f"配置错误:EMBEDDING_ADAPTER_HOST={host} 不是 IPv4 loopback;"
+            "本适配器只允许绑定 127.0.0.1/localhost(不支持 ::1)"
         )
     return resolved
+
+
+def _loopback_upstream_url(url):
+    """上游也必须显式是 loopback:请求正文(用户文本/图片)绝不允许被一次
+    环境变量误配(EMBEDDING_UPSTREAM_URL 指到远端)静默带出本机,必须
+    与监听地址同一防线,启动即 fail loud。"""
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        raise SystemExit(
+            f"配置错误:EMBEDDING_UPSTREAM_URL={url} 无法解析"
+        ) from None
+    resolved = {"localhost": "127.0.0.1"}.get(host, host)
+    if resolved not in ("127.0.0.1",):
+        raise SystemExit(
+            f"配置错误:EMBEDDING_UPSTREAM_URL={url} 的主机不是 IPv4 loopback;"
+            "上游只允许 127.0.0.1/localhost"
+        )
+    return url
 
 
 def main():
@@ -559,7 +602,9 @@ def main():
     server = make_server(
         host=_loopback_host(os.environ.get("EMBEDDING_ADAPTER_HOST", DEFAULT_HOST)),
         port=_env_int("EMBEDDING_ADAPTER_PORT", DEFAULT_PORT),
-        upstream_url=os.environ.get("EMBEDDING_UPSTREAM_URL", DEFAULT_UPSTREAM),
+        upstream_url=_loopback_upstream_url(
+            os.environ.get("EMBEDDING_UPSTREAM_URL", DEFAULT_UPSTREAM)
+        ),
         upstream_timeout_seconds=_env_int(
             "EMBEDDING_UPSTREAM_TIMEOUT_SECONDS", DEFAULT_TIMEOUT
         ),
