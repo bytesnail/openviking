@@ -63,6 +63,16 @@ services:
       - ./config/ov.conf:/app/.openviking/ov.conf:ro
       - ./scripts:/opt/openviking/scripts:ro
       - ./tests/fixtures:/opt/openviking/fixtures:ro
+    # 与 embedding-adapter 对齐的降权基线(2026-11-07 用户批准):uid 1000 直接
+    # exec 使 CapEff/CapPrm 本就为空,此处清空能力包围集并封 setuid/file-caps
+    # 提权路径;/tmp 加 noexec,nosuid 与容量上限,亦为将来 read_only 留前置。
+    # read_only 因 entrypoint 未知写路径暂缓,待实证后再启用。
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       embedding-adapter:
         condition: service_healthy
@@ -72,4 +82,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+    # restart-on-unhealthy 有意保持现状(2026-11-06 用户决策):Docker/Compose
+    # 原生无按健康状态重启;autoheal 需挂 docker.sock(root 等价权限),对收紧的
+    # loopback 单机部署得不偿失。挂死(unhealthy running)由巡检/验收发现,
+    # 人工 docker compose down 后恢复。
     restart: unless-stopped
