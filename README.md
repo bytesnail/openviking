@@ -358,11 +358,20 @@ docker compose up -d --wait --wait-timeout 180   # 再次启动
   minified JSON ~2.08、base64 ≳2.75(后两类在现行 4096 下即失败,非提
   预算所引入;上游 #5895 的低估因子来自其他 tokenizer,不适用本栈)。
   记忆卡语料核查:126 张中仅 15 张含 fenced 块,最大单块 est 2234——
-  "记忆卡整段引用代码"在真实语料中不成立。4096 现状下 meteor 名下 5 张
-  大卡各 22–29% 内容向量不可见,全库估算最大 5790;**6144 可覆盖现存全部
-  卡(生产函数直证,整卡实际 5925–6570 均在 slot 8448 内)且对真实代码
-  类安全;仅紧凑配置类 est>~6078 顶部刀锋越界,失败为适配器可见 502**。
-  是否调整待批。
+  "记忆卡整段引用代码"在真实语料中不成立。**已落地 6000(2026-11-08,
+  取"全库最大卡 est 5790 全覆盖"与"YAML 因子 1.39 安全线 6078"的交集;
+  restart 后加载值核实,随对 `viking://user/meteor` 执行 `ov reindex
+  --mode vectors_only --force` 重建 154 条、0 失败)**;仅紧凑配置类
+  est>~6078 顶部刀锋越界,失败为适配器可见 502。验收时注意**文档级向量
+  语义稀释**:尾部"段落级主题"召回改善,标识符级细节查询(write_done 类
+  探针)在 4096/6000 下均难命中——该类需求属 sparse 职责,本地仍不可用;
+  卡的 abstract 标量(VLM 全卡压缩、不截断)是既有 L1 补偿通道。
+- **reindex 须以目标空间属主身份执行**:0.5.x 起 root key 被拒于租户
+  数据面("ROOT API keys cannot access tenant-scoped data APIs"),
+  default(admin) 亦无他人空间读权;`ov` CLI 配置文件会压住
+  `OPENVIKING_API_KEY` 等 env 传入。做法:容器 /tmp 建 600 临时 CLI 配置
+  (身份=目标 user,key 经 env 中转、不经 argv)→ `OPENVIKING_CLI_CONFIG_FILE`
+  指向它执行 → 用后即删(与 check_user 同款模式,2026-11-08 实测)。
 - 上游未修锚点(2026-11-07):#3101(关机 flush 失败,索引中断源)、
   #5895/#5760/#6418(截断估算类)、sparse 本地 dense-only(#6109 收敛
   方向未合并、#7162 hybrid 损坏未修)。
