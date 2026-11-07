@@ -38,11 +38,11 @@
 | 纯中文合成 @4096 | 4097 | 3144 | **0.768(高估=保守)** |
 | 纯中文合成 @6144 | 6145 | 4714 | 0.767 |
 
-- **#5895 的 CJK 1.4–1.7× 低估因子不可迁移到本栈**:embeddinggemma-2 中文 ~1.3 字/token,估算器在纯中文上高估(安全方向);溢出 8192 需混合内容因子 >1.333,实测最坏 1.113,余量大。
+- **#5895 的 CJK 1.4–1.7× 低估因子不可迁移到本栈**:embeddinggemma-2 中文 ~1.3 字/token,估算器在纯中文上高估(安全方向)。
 - 4096 现状的代价:meteor 名下 **5 张卡**(review_fixes_applied 5790、openviking 5736、归档核查 5627、review_findings_reported 5238、invariant_audit_report 5236)各 **22–29% 内容向量不可见**;全库估算最大 5790。
-- **结论:6144 在本栈安全,且使现存全部卡完整进向量**(5790<6144);延迟 0.2–0.7s/次,成本可忽略。
-- 阶段 2(待批,未执行):ov.conf `embedding.max_input_tokens` 4096→6144 → `docker compose restart openviking` → `ov`/API `content reindex mode=vectors_only`(对已入库文件按当前配置重算向量,reindex_executor.py:1589;skill 类即使 md5 未变也强制重建)→ deployment-smoke 冒烟 + 大卡尾部内容召回对照。
-- 边缘保留:估算恰好 6144 的纯 ASCII/代码密集卡理论因子可至 ~1.33(4→3 字符/token),落点在窗口边缘;现库无此类卡,若将来出现按 `usage.prompt_tokens` 复测。
+- **内容类别决定安全边界(2026-11-08 补测收窄)**:硬边界为服务端 slot_ctx **8448**(实测 CJK 实际 8437 通过、≥8979 失败;超限为适配器 **502 "embedding upstream failed"**,即时可见、非静默截断;model card 的 8192 是质量窗口,服务端执行的是 8448)。实测因子分档:code/符号密集 **1.83**(est 3072→5628、4096→7498、4608→8440 刀锋通过、4800→502)、中文 markdown 卡 1.07–1.11、纯中文 0.77、英文散文 0.59。
+- **结论(2026-11-08 收窄后)**:**"6144 覆盖现存全部卡"成立且为生产函数直证**(容器内 `truncate_embedding_input(卡, 6144)` 对 5 张大卡全部原样返回 True,全库 est 最大 5790<6144);对现存内容与中文/散文类安全。**但 6144 对 code/ASCII 密集文本不安全**:预算决定截断点,全文 est>~4600 的此类文件截断到 6144 后实际 ~11284 仍越界 → 502;而 4096 现状下同类内容截断后 7496<8448 反而安全——即提高预算会**新引入**这一可见失败类(现实触发面:导入源码/日志类文本资源;现库无此类内容)。session 命名空间明确跳过索引(embedding_utils.py:776-777),messages.jsonl/tool-results 不参与向量化,无此风险。任意内容型的无条件安全预算 ≈4300–4400(8448/1.83);4608 为刀锋值(余 8 token)。
+- 阶段 2(待批,未执行)选项随之更新:**6144**(现存卡全可见;接受"code 密集文本资源 est>~4600 向量化 502"这一可见失败类)/ **~4400**(任意内容安全,但 5 张大卡尾部仍部分不可见)/ **维持 4096 + 拆卡**。若执行:ov.conf `embedding.max_input_tokens` → 值 → `docker compose restart openviking` → `content reindex mode=vectors_only`(对已入库文件按当前配置重算向量,reindex_executor.py:1589;skill 类即使 md5 未变也强制重建)→ deployment-smoke 冒烟 + 大卡尾部内容召回对照。
 
 ## 4. vectordb 恢复要点(0.5.2.1 源码核实;操作化版本见 README"备份与恢复")
 
