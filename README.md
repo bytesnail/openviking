@@ -323,6 +323,44 @@ docker compose up -d --wait --wait-timeout 180   # 再次启动
   含密钥;自定义脚本(适配器/bootstrap/smoke)已按"零密钥输出"编写。
 - 不运行容器内 `env`/`printenv`,不输出完整 `docker inspect`。
 
+## 检索与 VLM 链路事实(2026-11-07 核查)
+
+逐项证据与实测数据见
+[归档仓结论核查与 embedding 截断标定](docs/research/2026-11-07-archive-conclusion-verification.md);
+此处只留运维必需结论。
+
+- **query expansion 成功时日志静默**:状态只在检索响应体 `query_expansion`
+  字段;失败才落 `Query expansion failed` WARNING。验收判据用"带
+  `session_id` 的 context 检索无该 WARNING"——**不存在"日志变 used"这个
+  信号**。expansion 仅在请求带 `session_id` 且会话有内容时尝试,不带
+  session 的检索静默跳过。
+- **query_planner 段整段替换 vlm**:该段一旦有配置,未配字段不继承 vlm
+  而走自身默认(timeout 600s、max_concurrent 32);`max_tokens` 未配则
+  不发该参数(由 z.ai 端默认决定)。当前 ov.conf 显式只配
+  provider/model/api_base/api_key/extra_request_body。
+- **`${VAR}` 展开静默残留**:`expandvars` 对未设置变量保留字面 `${VAR}`
+  且容器照常 healthy;变量名拼错表现为对应后端静默 401,只能靠
+  doctor/真实调用发现,启动日志无信号。
+- **ov.conf 无热加载,`docker compose restart openviking` 即生效**:单文件
+  bind 在容器重启时重新解析 inode(2026-11-07 实测:重启后容器内挂载
+  md5 与宿主一致、新配置已加载)。旧归档仓"restart 无效须 down/up"
+  说法不实,勿再引用;真实坑仅是"编辑后不重启"。
+- **z.ai/glm-5.3-flash**:thinking 与 content 共享输出预算(日志实证
+  `finish_reason=length` 且 content 空);coding 端点实测接受
+  `thinking.type=disabled`(与 z.ai 文档页矛盾,以实测为准,thinking 是否
+  真被关闭未能从外侧证实);vlm 段无法真正关思考,靠 `vlm.max_tokens`
+  容纳。`vlm.max_tokens=65536`(2026-11-07 22:25 起)的验收判据:会话
+  结束的 Phase 2 记忆提取不再出现 `output cap=` 截断 ERROR。
+- **embedding 截断标定**(2026-11-07,生产路径实测 `usage.prompt_tokens`):
+  估算器按 CJK 1 字=1 token、ASCII 4 字符=1 token;本栈真实卡实际/估算
+  1.07–1.11,纯中文 0.77(估算高估=保守方向;上游 #5895 的低估因子来自
+  其他 tokenizer,不适用本栈)。4096 现状下 meteor 名下 5 张大卡各
+  22–29% 内容向量不可见,全库估算最大 5790;6144 经标定安全且可覆盖
+  现存全部卡,是否调整待批。
+- 上游未修锚点(2026-11-07):#3101(关机 flush 失败,索引中断源)、
+  #5895/#5760/#6418(截断估算类)、sparse 本地 dense-only(#6109 收敛
+  方向未合并、#7162 hybrid 损坏未修)。
+
 ## 备份与恢复
 
 ```bash
@@ -343,6 +381,31 @@ docker compose up -d --wait --wait-timeout 180
 恢复,必须另行显式改写 Compose、ov.conf、active/saved CLI URL 及全部探针端点,
 不能只改两个监听端口。
 
+### vectordb 索引损坏恢复(v0.5.2.1 源码核实)
+
+症状:容器 crash loop(引擎层 meta 加载失败异常直接传播),常见诱因是
+异常中断(断电/OOM/`docker kill`)留下 0 字节
+`state/data/vectordb/context/index/default/versions/<纳秒ts>/manager_meta.json`;
+上游 #3101(SIGTERM 时 flush/close 失败)仍是现存中断源。恢复要点
+(与 0.4.x 时代的关键差异:**不依赖未损坏旧快照**):
+
+1. 停栈并先备份:`cp -a state/data/vectordb/context <临时备份目录>`(或走
+   上节全量备份);任何 vectordb 状态改动前必做。
+2. 定位损坏版本:
+   `find state/data/vectordb/context/index/default/versions -name manager_meta.json -size 0`。
+3. 删除损坏版本目录及对应 `<ts>.write_done` 标记;**必须保留
+   `index/default/index_meta.json`**——它缺失时启动会跳过 recovery。
+4. 重启:启动路径 `_recover()` 从 LevelDB store(`context/store/`)全量
+   重建并重放 delta(日志特征 `Index 'default': replaying delta records
+   lazily` → `replay complete`),数据本体(store/)不受索引损坏影响。
+5. 验收:doctor + 冒烟检索命中;必要时 `content reindex`(`mode=
+   vectors_only`,0.5.2.1 下真重建向量)兜底重算。
+
+注意:正常 `close()` 只保留最新一个版本快照,**多版本快照不是安全网,
+`backups/` 才是**;"删整个 index/ 指望重建"与"reindex 不生成向量"均为
+0.4.x 旧说,0.5.2.1 已不成立(详证见
+[归档仓结论核查](docs/research/2026-11-07-archive-conclusion-verification.md) §4)。
+
 ## 升级与回滚
 
 1. 先备份(同上)。
@@ -352,7 +415,10 @@ docker compose up -d --wait --wait-timeout 180
 
 回滚:停止并保留异常状态 → 恢复与旧镜像匹配的配置与状态备份 → 旧
 tag+digest 启动 → 重跑验收;不只回滚镜像而保留可能不兼容的新状态。
-Embedding 模型或维度变化必须走官方迁移/reindex 或新建空工作区。
+Embedding 模型或维度变化必须走官方迁移/reindex 或新建空工作区;同维度
+换模型/端点可配 `embedding.allow_metadata_override` 保留已索引数据
+(改写 collection 元数据并告警,v0.5.2.1 schema),仅维度变化必须重建
+(`collection_meta.json` 存 Dim 并严格校验)。
 
 ## 目录
 
