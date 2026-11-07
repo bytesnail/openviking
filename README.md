@@ -34,10 +34,10 @@ model-serving 属 `/mnt/usr/tools/model-serving` 仓库,本仓库是其消费者
 
 | 端口 | 服务 | 谁消费 | 本仓库落点 |
 |---|---|---|---|
-| 1933 | OpenViking API(`openviking` 服务) | CLI/插件/bootstrap/全部验收 | `compose.yaml OPENVIKING_SERVER_PORT`、`scripts/prepare.sh` 空闲门禁 |
+| 1933 | OpenViking API(`openviking` 服务) | CLI/插件/bootstrap/全部验收 | `compose.yaml OPENVIKING_SERVER_PORT`、`scripts/prepare.sh` 空闲门禁、`scripts/bootstrap_auth.py DEFAULT_BASE_URL`、`tests/e2e_auth_matrix.sh` 与 `tests/e2e_user_isolation.sh` 的 `BASE` 兜底默认 |
 | 18351 | model-serving embedding(`embeddinggemma-2`) | 适配器上游;漂移检查;e2e 探针 | `compose.yaml EMBEDDING_UPSTREAM_URL`、`scripts/embedding_adapter.py DEFAULT_UPSTREAM`、`scripts/env_file.py check_model_drift`、`scripts/prepare.sh` loopback 门禁、`tests/e2e_adapter_probe.py` 兜底默认 |
 | 18352 | model-serving rerank(`qwen3-reranker-0.6b`,纯文本) | OpenViking 服务器直连(不经适配器);漂移检查 | `config/ov.conf` rerank `api_base`、`scripts/env_file.py`、`scripts/prepare.sh` |
-| 18353 | 多模态 embedding 适配器(`embedding-adapter` 服务) | OpenViking 服务器、healthcheck、e2e 探针 | `compose.yaml EMBEDDING_ADAPTER_PORT`、`scripts/embedding_adapter.py DEFAULT_PORT` |
+| 18353 | 多模态 embedding 适配器(`embedding-adapter` 服务) | OpenViking 服务器、healthcheck、e2e 探针 | `compose.yaml EMBEDDING_ADAPTER_PORT`、`compose.yaml` healthcheck(`http://127.0.0.1:18353/health`)、`scripts/embedding_adapter.py DEFAULT_PORT`、`scripts/prepare.sh` 空闲门禁、`tests/e2e_adapter_probe.py` 兜底默认 |
 
 两层层级为有意设计:ov.conf 的 embedding `api_base` 指向 18353(适配器)而
 非 18351;rerank 纯文本直连 18352。
@@ -177,8 +177,11 @@ USER_A=default USER_B=test \
   bash tests/e2e_user_isolation.sh
 ```
 
-容器 `/tmp` 当前是 overlay 可写层,restart 不会清除;不得依赖重启清理临时
-配置。上述隔离验收只证明普通数据面私有读写,不构成对 ADMIN/ROOT 或同 UID
+容器 `/tmp` 按 `compose.yaml` 为 tmpfs(`rw,noexec,nosuid`:openviking 256m、
+embedding-adapter 16m;当前运行中的容器早于该加固,下次 `docker compose up
+-d` 重建容器后生效):tmpfs 数据随容器停止清空、计入容器内存且有容量上限,
+check-user 的临时身份配置因此不跨重启残留,但也不得把 `/tmp` 当持久存储。
+上述隔离验收只证明普通数据面私有读写,不构成对 ADMIN/ROOT 或同 UID
 进程的安全边界。
 
 ## Agent 接入(仅 Claude Code 与 OpenCode 2.x)

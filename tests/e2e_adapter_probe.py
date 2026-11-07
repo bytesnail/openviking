@@ -144,54 +144,60 @@ def check_loaded_model():
 def main():
     check_loaded_model()
 
-    # 1. 纯文本:适配器与直连上游向量一致性
-    q = "红色方块的图片"
-    va = embed(ADAPTER, q)
-    vu = embed(UPSTREAM, q)
-    # 维度不齐时 cosine 会按较短向量静默截断,得到无意义数值误导排障;
-    # 详情里只在维度一致时才计算 cosine。
-    c_parity = cosine(va, vu) if len(va) == len(vu) else float("nan")
-    check("text-parity", len(va) == 768 and len(vu) == 768 and c_parity > 0.999,
-          f"dim_adapter={len(va)} dim_upstream={len(vu)} cosine={c_parity:.6f}")
+    # 步骤 1-4 依赖向量探针可用;embed 失败抛 SystemExit 时记录失败项并
+    # 继续步骤 5(/health、/ready 不依赖向量),SUMMARY 汇总行始终输出,
+    # 失败模式下运维仍能拿到适配器存活状态的诊断(2026-11-07 检视)。
+    try:
+        # 1. 纯文本:适配器与直连上游向量一致性
+        q = "红色方块的图片"
+        va = embed(ADAPTER, q)
+        vu = embed(UPSTREAM, q)
+        # 维度不齐时 cosine 会按较短向量静默截断,得到无意义数值误导排障;
+        # 详情里只在维度一致时才计算 cosine。
+        c_parity = cosine(va, vu) if len(va) == len(vu) else float("nan")
+        check("text-parity", len(va) == 768 and len(vu) == 768 and c_parity > 0.999,
+              f"dim_adapter={len(va)} dim_upstream={len(vu)} cosine={c_parity:.6f}")
 
-    # 2. OpenViking 裸 parts 多模态形态 → 恰好一个 768 维向量
-    # (同一 red.png 只读取/编码一次,步骤 2 与 2b 复用)
-    red_data_url = data_url(FIXTURES / "red.png")
-    red_parts = [
-        {"type": "text", "text": "describe this image"},
-        {"type": "image_url", "image_url": {"url": red_data_url}},
-    ]
-    status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": red_parts})
-    vecs = body.get("data", []) if isinstance(body, dict) else []
-    v_red = single_vector(body) if status == 200 else None
-    check("multimodal-shape", v_red is not None and len(v_red) == 768,
-          f"http={status} n_vectors={len(vecs)}")
-    # 留存步骤 2 的 red 向量供步骤 3 复用(2b 会覆盖 vecs/status)
+        # 2. OpenViking 裸 parts 多模态形态 → 恰好一个 768 维向量
+        # (同一 red.png 只读取/编码一次,步骤 2 与 2b 复用)
+        red_data_url = data_url(FIXTURES / "red.png")
+        red_parts = [
+            {"type": "text", "text": "describe this image"},
+            {"type": "image_url", "image_url": {"url": red_data_url}},
+        ]
+        status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": red_parts})
+        vecs = body.get("data", []) if isinstance(body, dict) else []
+        v_red = single_vector(body) if status == 200 else None
+        check("multimodal-shape", v_red is not None and len(v_red) == 768,
+              f"http={status} n_vectors={len(vecs)}")
+        # 留存步骤 2 的 red 向量供步骤 3 复用(2b 会覆盖 vecs/status)
 
-    # 2b. 纯图 parts(无 text part)同样包装且可用(2026-10-26 补测)
-    img_only = [{"type": "image_url", "image_url": {"url": red_data_url}}]
-    status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": img_only})
-    vecs = body.get("data", []) if isinstance(body, dict) else []
-    image_only_vector = single_vector(body) if status == 200 else None
-    check("image-only-parts", image_only_vector is not None and len(image_only_vector) == 768,
-          f"http={status} n_vectors={len(vecs)}")
+        # 2b. 纯图 parts(无 text part)同样包装且可用(2026-10-26 补测)
+        img_only = [{"type": "image_url", "image_url": {"url": red_data_url}}]
+        status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": img_only})
+        vecs = body.get("data", []) if isinstance(body, dict) else []
+        image_only_vector = single_vector(body) if status == 200 else None
+        check("image-only-parts", image_only_vector is not None and len(image_only_vector) == 768,
+              f"http={status} n_vectors={len(vecs)}")
 
-    # 3. 红蓝语义:red 图向量与查询相似度高于 blue
-    # (步骤 2 已对同一 red_parts 得到向量,直接复用,不再重复推理)
-    if v_red is None:
-        v_red = embed(ADAPTER, red_parts)
-    blue_parts = [
-        {"type": "text", "text": "describe this image"},
-        {"type": "image_url", "image_url": {"url": data_url(FIXTURES / "blue.png")}},
-    ]
-    v_blue = embed(ADAPTER, blue_parts)
-    c_red, c_blue = cosine(v_red, va), cosine(v_blue, va)
-    check("red-blue-semantics", c_red > c_blue, f"cosine_red={c_red:.4f} cosine_blue={c_blue:.4f}")
+        # 3. 红蓝语义:red 图向量与查询相似度高于 blue
+        # (步骤 2 已对同一 red_parts 得到向量,直接复用,不再重复推理)
+        if v_red is None:
+            v_red = embed(ADAPTER, red_parts)
+        blue_parts = [
+            {"type": "text", "text": "describe this image"},
+            {"type": "image_url", "image_url": {"url": data_url(FIXTURES / "blue.png")}},
+        ]
+        v_blue = embed(ADAPTER, blue_parts)
+        c_red, c_blue = cosine(v_red, va), cosine(v_blue, va)
+        check("red-blue-semantics", c_red > c_blue, f"cosine_red={c_red:.4f} cosine_blue={c_blue:.4f}")
 
-    # 4. 负例:不支持 part 类型 → 4xx
-    bad = [{"type": "video_url", "video_url": {"url": "x"}}]
-    status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": bad})
-    check("bad-part-rejected", 400 <= status < 500, f"http={status}")
+        # 4. 负例:不支持 part 类型 → 4xx
+        bad = [{"type": "video_url", "video_url": {"url": "x"}}]
+        status, body = post(ADAPTER + "/v1/embeddings", {"model": MODEL, "input": bad})
+        check("bad-part-rejected", 400 <= status < 500, f"http={status}")
+    except SystemExit as exc:
+        check("embed-dependency", False, str(exc))
 
     # 5. 适配器 health/ready
     for path in ("/health", "/ready"):

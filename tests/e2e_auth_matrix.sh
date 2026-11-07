@@ -36,24 +36,14 @@ ROOT_KEY=$(python3 -I -B "$ENV_TOOL" get secrets.env OPENVIKING_ROOT_API_KEY) \
 ADMIN_KEY=$(cat state/secrets/user_api_key)  # default 用户的 key,role=admin
 BASE=${BASE:-http://127.0.0.1:1933}
 # 本地 ROOT/ADMIN key 只能发往 loopback;BASE 用于恢复/替代端口,不能指向远端。
-if [[ ! "$BASE" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
-  echo "FAIL-SETUP: BASE 仅允许无路径的 http loopback URL" >&2
-  exit 1
-fi
+require_loopback_base "$BASE" || exit 1
 # --noproxy '*':BASE 虽限 loopback,但设了 http_proxy/ALL_PROXY 的环境会把
 # 请求(连 ROOT/ADMIN key 头)送经代理;与 bootstrap/adapter 的禁代理纪律一致。
 code() { curl -q -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 15 "$@"; }
+# expect/require_loopback_base 收编自共享纯函数库(2026-11-07 检视);
+# EXPECT_WIDTH=30 保持矩阵原有的列宽输出。
+EXPECT_WIDTH=30
 fails=0
-
-expect() { # expect <描述> <实际> <允许的期望值,如 401 或 401|403>
-  local desc=$1 got=$2 want=$3
-  if [[ "$got" =~ ^(${want})$ ]]; then
-    printf 'PASS  %-30s %s (want %s)\n' "$desc" "$got" "$want"
-  else
-    printf 'FAIL  %-30s %s (want %s)\n' "$desc" "$got" "$want"
-    fails=$((fails+1))
-  fi
-}
 
 expect "no-key  -> fs/ls"        "$(code "$BASE/api/v1/fs/ls?uri=viking://resources")"                 401
 expect "bad-key -> fs/ls"        "$(code -H 'X-API-Key: invalid-test-key' "$BASE/api/v1/fs/ls?uri=viking://resources")" 401
@@ -85,4 +75,5 @@ else
 fi
 
 unset ROOT_KEY ADMIN_KEY USER_KEY_FILE
+fails=$((fails + EXPECT_FAILS))
 if [ "$fails" -eq 0 ]; then echo "SUMMARY: all executed checks passed"; exit 0; else echo "SUMMARY: $fails failed"; exit 1; fi

@@ -93,6 +93,14 @@ def parse_env_value(value):
             "值含 '$':Compose 会对 $VAR/$$ 做插值而本解析器按字面读取,"
             "两侧值会静默不一致;请改用不含 '$' 的值"
         )
+    # 文件以 errors="replace" 读入:非法 UTF-8 字节变成 U+FFFD,而 Compose
+    # 注入原始字节,两侧值静默不一致(2026-11-07 sweep,同一 fail-open 类别;
+    # 注释里的替换字符无害,进入值就必须拒绝)。
+    if "�" in parsed:
+        raise EnvFileError(
+            "值含无法解码的字节(读入时被替换为 U+FFFD):Compose 会注入原始"
+            "字节而本解析器读到的值不同;请改用合法 UTF-8 值"
+        )
     return parsed
 
 
@@ -104,7 +112,11 @@ def parse_env_file(path):
     except OSError as exc:
         raise EnvFileError(f"读取 {path} 失败({type(exc).__name__})") from None
     env = {}
-    for raw_line in text.splitlines():
+    # Compose 只按 \n 切行(\r\n 的 \r 随值侧 strip 吸收);str.splitlines
+    # 会额外在 \v、\f、U+0085、U+2028、U+2029 等处断行,把一条 KEY=value
+    # 拆成两条,解析值与容器注入值静默不一致(2026-11-07 sweep,与 '$'/
+    # 反斜杠守卫同一 fail-open 类别)。
+    for raw_line in text.split("\n"):
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -269,34 +281,27 @@ def check_model_drift(cfg):
 def main(argv):
     # 子命令一律严格等元数:get 多带参数(误写成 validate 形态)会被静默
     # 忽略并照常输出密钥值,必须与 precheck/validate 同纪律直接拒绝
-    # (2026-11-03 检视)。
-    if len(argv) == 4 and argv[1] == "get":
-        try:
+    # (2026-11-03 检视)。受控失败唯一通道是 EnvFileError:单个 try 包住
+    # 整个分派,一个 except 收口 PREPARE_FAIL 路由(2026-11-07 检视;
+    # 原先三个分支各复制一份同样的 try/except 样板)。
+    try:
+        if len(argv) == 4 and argv[1] == "get":
             env = parse_env_file(argv[2])
-        except EnvFileError as exc:
-            print(f"PREPARE_FAIL: {exc}", file=sys.stderr)
-            return 1
-        sys.stdout.write(env.get(argv[3], ""))
-        return 0
-    if len(argv) == 3 and argv[1] == "precheck":
-        try:
+            sys.stdout.write(env.get(argv[3], ""))
+            return 0
+        if len(argv) == 3 and argv[1] == "precheck":
             env = parse_env_file(argv[2])
-            action = precheck_env(env)
-        except EnvFileError as exc:
-            print(f"PREPARE_FAIL: {exc}", file=sys.stderr)
-            return 1
-        print(action)
-        return 0
-    if len(argv) == 4 and argv[1] == "validate":
-        try:
+            print(precheck_env(env))
+            return 0
+        if len(argv) == 4 and argv[1] == "validate":
             env = parse_env_file(argv[2])
             cfg = validate_config(env, argv[3])
-        except EnvFileError as exc:
-            print(f"PREPARE_FAIL: {exc}", file=sys.stderr)
-            return 1
-        print("ov.conf 展开+JSON 校验通过")
-        check_model_drift(cfg)
-        return 0
+            print("ov.conf 展开+JSON 校验通过")
+            check_model_drift(cfg)
+            return 0
+    except EnvFileError as exc:
+        print(f"PREPARE_FAIL: {exc}", file=sys.stderr)
+        return 1
     print(
         "用法: env_file.py get <secrets.env> <NAME> | "
         "precheck <secrets.env> | validate <secrets.env> <ov.conf>",

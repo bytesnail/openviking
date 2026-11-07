@@ -42,6 +42,34 @@ def test_text_probe_accepts_expected_answer(answer):
     assert failures == []
 
 
+@pytest.mark.parametrize("answer", [
+    "1加1等于2", "1 加 1 等于 2。", "1+1 = 2", "1加1等于二", "答案是 1 加 1 等于 2",
+])
+def test_text_probe_accepts_natural_equation_answers(answer):
+    """回显题面的自然正确回答("等于2/等于二"、带空格的 "= 2")不得误判 FAIL
+    (2026-11-07 检视:旧判据只认 "=2" 结尾,健康 VLM 会被 smoke 误报故障)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == []
+
+
+@pytest.mark.parametrize("answer", ["1加1等于二十", "1加1等于2.5", "不等于2"])
+def test_text_probe_rejects_equation_lookalikes(answer):
+    """等式判据的前瞻排除:"等于二十/等于2.5" 是其他数,"不等于2" 是否定式。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == ["vlm-text"]
+
+
+@pytest.mark.parametrize("answer", ["1加1=2万", "1+1=2两"])
+def test_text_probe_rejects_ascii_equation_cn_suffix(answer):
+    """'=2' 分支的前瞻与中文分支对称排除中文数字:"2万/2两" 是其他数,
+    不得因子串含 "2" 放行(2026-11-07 sweep)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == ["vlm-text"]
+
+
 @pytest.mark.parametrize("answer", ["十二", "二十", "二零二五", "二点五", "三百二十"])
 def test_text_probe_rejects_wrong_chinese_numerals(answer):
     """含"二/兩/两"的其他数字(12/20/2025/2.5/320)不得因子串含"二"被
@@ -61,6 +89,17 @@ def test_image_probe_rejects_nonempty_wrong_color(monkeypatch, answer):
     )
     failures = []
     sm.smoke_vlm_image(DummyVLM(image=answer), failures)
+    assert failures == ["vlm-image"]
+
+
+def test_image_probe_rejects_hyphenated_negation(monkeypatch):
+    """"non-red" 不含可被 \\bno\\b 命中的否定词,却含 \\bred\\b 的子串:
+    否定防线必须覆盖连字符形态(2026-11-07 sweep)。"""
+    monkeypatch.setattr(
+        sm, "FIXTURES", str(Path(__file__).resolve().parent / "fixtures")
+    )
+    failures = []
+    sm.smoke_vlm_image(DummyVLM(image="The image is non-red"), failures)
     assert failures == ["vlm-image"]
 
 

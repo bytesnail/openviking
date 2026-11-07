@@ -15,10 +15,7 @@ if [[ ! "$USER_A" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
   echo "FAIL-SETUP: USER_A/USER_B 须为两个不同的安全 user_id" >&2
   exit 1
 fi
-if [[ ! "$BASE" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
-  echo "FAIL-SETUP: BASE 仅允许无路径的 http loopback URL" >&2
-  exit 1
-fi
+require_loopback_base "$BASE" || exit 1
 if [ ! -r "$USER_A_KEY_FILE" ] || [ ! -r "$USER_B_KEY_FILE" ]; then
   echo "FAIL-SETUP: 两个 USER key 来源必须可读(支持 /dev/fd)" >&2
   exit 1
@@ -32,24 +29,18 @@ fi
 SUFFIX="$(date +%s)-$$-${RANDOM}"
 URI_A="viking://user/${USER_A}/resources/identity-isolation-${SUFFIX}-a.md"
 URI_B="viking://user/${USER_B}/resources/identity-isolation-${SUFFIX}-b.md"
-fails=0
-
-expect() { # expect <描述> <实际> <允许状态>
-  local desc=$1 got=$2 want=$3
-  if [[ "$got" =~ ^(${want})$ ]]; then
-    printf 'PASS  %-34s %s (want %s)\n' "$desc" "$got" "$want"
-  else
-    printf 'FAIL  %-34s %s (want %s)\n' "$desc" "$got" "$want"
-    fails=$((fails+1))
-  fi
-}
+# expect/require_loopback_base 来自共享纯函数库(2026-11-07 检视收编);
+# 默认列宽 34 与本脚本原输出一致,计票在全局 EXPECT_FAILS。
 
 write_fixture() { # write_fixture <key> <uri> <A|B>
   local key=$1 uri=$2 marker=$3 body
   printf -v body '{"uri":"%s","content":"identity isolation %s %s","mode":"replace","wait":true,"processing_mode":"vectors_only"}' \
     "$uri" "$marker" "$SUFFIX"
+  # wait:true 的写与 delete_fixture 同一超时预算(-m 300):code_auth 固化的
+  # -m 15 是读接口预算,向量化写在管道繁忙时会超过它,把隔离验收误判为 FAIL
+  # (2026-11-07 检视;后置 -m 覆盖 code_auth 的前置 -m,curl 取最后一值)。
   code_auth "X-API-Key: $key" -X POST -H 'Content-Type: application/json' \
-    --data "$body" "$BASE/api/v1/content/write"
+    --data "$body" -m 300 "$BASE/api/v1/content/write"
 }
 
 read_fixture() { # read_fixture <key> <uri>
@@ -81,10 +72,10 @@ expect "B cannot read A private fixture" "$(read_fixture "$USER_B_KEY" "$URI_A")
 
 cleanup
 unset USER_A_KEY USER_B_KEY
-if [ "$fails" -eq 0 ]; then
+if [ "$EXPECT_FAILS" -eq 0 ]; then
   echo "SUMMARY: bidirectional private isolation and cleanup passed"
   exit 0
 else
-  echo "SUMMARY: $fails isolation/cleanup checks failed"
+  echo "SUMMARY: $EXPECT_FAILS isolation/cleanup checks failed"
   exit 1
 fi

@@ -91,20 +91,13 @@ def upstream():
 
 @pytest.fixture()
 def adapter(upstream):
-    server = ea.make_server(
-        host="127.0.0.1",
-        port=0,
-        upstream_url=upstream.url,
-        upstream_timeout_seconds=5,
-        max_body_bytes=4096,
-        max_concurrent=2,
-    )
-    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
-    thread.start()
-    server.base_url = f"http://127.0.0.1:{server.server_address[1]}"
-    yield server
-    server.shutdown()
-    server.server_close()
+    # 生命周期样板复用 standalone_server(2026-11-07 检视:原先此处是
+    # 与其完全相同的第九份手写拷贝);仅 timeout=5 与默认不同。
+    with standalone_server(
+        upstream_url=upstream.url, upstream_timeout_seconds=5
+    ) as server:
+        server.base_url = base_url(server)
+        yield server
 
 
 # 测试客户端与生产同纪律:直连(禁代理)opener,防 http_proxy 环境把 loopback

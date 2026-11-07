@@ -107,7 +107,8 @@ def single_vector(body):
     if not isinstance(vector, list) or not vector:
         return None
     # 同型"有限数值"判定在 scripts/smoke_models.py(_valid_rerank_scores)与
-    # scripts/bootstrap_auth.py(_ensure_timeout_file)各有一份(-I 隔离运行);
+    # scripts/bootstrap_auth.py(_clamp_cfg_timeout,经 _ensure_timeout_file
+    # 作用于磁盘文件)各有一份(-I 隔离运行);
     # 修改溢出/布尔排除等语义须三处同步。
     try:
         finite = all(
@@ -289,12 +290,21 @@ class AdapterHandler(BaseHTTPRequestHandler):
             # 影响其他连接。
             self.close_connection = True
 
-    def do_GET(self):
-        # 同一 handler 实例服务一条 keep-alive 连接上的所有请求;逐请求状态
-        # 必须在入口重置,否则上一请求的已读字节数/响应开始标记会污染下一
-        # 请求的排水计算与错误兜底分类。
+    def handle_one_request(self):
+        # 逐请求状态在框架的每请求入口重置,而不是在 do_GET/do_POST:框架级
+        # 拒绝路径(坏请求行 400、414、501 未知方法、505、417 Expect)不经
+        # 任何 do_*,直接 send_error 后 finish();重置放这里,排水计算
+        # (_drain_unread_body)才能拿到当前请求的干净计数,不会拿上一请求
+        # 的 _body_bytes_read 把 remaining 压成 0 而跳过排水,以 RST 收尾丢掉
+        # 已写出的错误响应(2026-11-07 检视;此前仅 do_* 入口重置,实测
+        # 501 路径沿用上一请求计数)。代价:请求行都未到达的空闲超时关闭会
+        # 以陈旧 headers 算出正 remaining,空等排水至多 1s——有界且仅收尾
+        # 阶段,可接受。
         self._body_bytes_read = 0
         self._response_started = False
+        super().handle_one_request()
+
+    def do_GET(self):
         # GET 也可能带体;成功响应前不读体,因此统一禁止连接复用
         # (close=True 向客户端显式声明,防复用撞上单方面关闭)。
         self.close_connection = True
@@ -315,11 +325,9 @@ class AdapterHandler(BaseHTTPRequestHandler):
         self._send_error_json(404, "not_found", "unknown path")
 
     def do_POST(self):
-        # 逐请求状态重置(见 do_GET):上一请求残留会污染排水与兜底分类。
-        self._body_bytes_read = 0
-        self._response_started = False
         if self.path != "/v1/embeddings":
-            self.close_connection = True  # 不读未知路径的请求体,关闭连接防止 keep-alive 错位
+            # 未知路径不读请求体;关连接由 _send_error_json 统一声明,
+            # 防止 keep-alive 复用撞上单方面关闭。
             self._send_error_json(404, "not_found", "unknown path")
             return
         try:
@@ -345,7 +353,7 @@ class AdapterHandler(BaseHTTPRequestHandler):
         # 总内存(而非仅转发数),超限请求不读体直接拒绝,不排无界队列
         length = self._content_length()
         if not self._acquire_slot():
-            self.close_connection = True  # 正文未读,关闭连接防止 keep-alive 错位
+            # 正文未读;关连接由 _send_error_json 统一声明
             raise RequestError(503, "overloaded", "adapter concurrency limit reached")
         try:
             raw = self._read_request_body(length)
@@ -468,28 +476,27 @@ class AdapterHandler(BaseHTTPRequestHandler):
         return self.server.forward_slots.acquire(timeout=self.server.forward_wait_seconds)
 
     def _content_length(self):
-        """只校验 Content-Length 头并返回长度;任何拒绝路径都标记关闭连接
-        (此刻请求体尚未读,留着会在 keep-alive 连接上错位下一个请求)。"""
+        """只校验 Content-Length 头并返回长度。
+
+        各拒绝路径此刻请求体尚未读,留着会在 keep-alive 连接上错位下一个
+        请求;关闭连接统一由 RequestError→_send_error_json 一处声明,此处
+        不再散置 close_connection(2026-11-07 检视)。
+        """
         if self.headers.get("Transfer-Encoding") is not None:
-            self.close_connection = True
             raise RequestError(400, "invalid_request", "Transfer-Encoding is not supported")
         length_headers = self.headers.get_all("Content-Length") or []
         if not length_headers:
-            self.close_connection = True
             raise RequestError(411, "length_required", "Content-Length is required")
         if len(length_headers) != 1:
-            self.close_connection = True
             raise RequestError(400, "invalid_request", "exactly one Content-Length is required")
         length_header = length_headers[0]
         # RFC 9110 只允许纯 ASCII 数字;int() 还会接受 "+5"/" 5"/Unicode
         # 十进制数字/下划线分组,必须收紧到与严格头语法一致(2026-11-03 检视)。
         if not (length_header.isascii() and length_header.isdigit()):
-            self.close_connection = True
             raise RequestError(400, "invalid_request", "invalid Content-Length")
         length = int(length_header)
         # isascii+isdigit 已排除负号,无需再判 length < 0。
         if length > self.server.max_body_bytes:
-            self.close_connection = True
             raise RequestError(413, "payload_too_large", "request body exceeds limit")
         return length
 

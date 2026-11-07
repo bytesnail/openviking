@@ -16,6 +16,7 @@ import http.client
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -199,18 +200,34 @@ def _write_user_output(user_key, base_url, user_id, user_key_path, cli_config_pa
         "account": "default",
         "user": user_id,
     })
+    # timeout=300 契约在写出前就落进 cfg(与 _ensure_timeout_file 同一判定,
+    # 经 _clamp_cfg_timeout):写出的文件自带 timeout,调用方无需再对刚写出
+    # 的文件补跑"读回-重写"(2026-11-07 检视)。
+    _clamp_cfg_timeout(cfg)
     # allow_nan=False:JSON 的 NaN/Infinity 字面量不合 RFC 8259,严格解析器
     # (jq、非 Python 工具链)读不动;解析侧容忍是为修复 timeout,写回侧必须
     # 拒绝把非法字面量再写回凭据配置(ValueError 由调用方走人工恢复)。
     _atomic_write_secret(Path(cli_config_path), json.dumps(cfg, allow_nan=False))
 
 
-def _response_user_key(status, payload):
+def _response_user_key(status, payload, *, first_init=False):
+    """admin user 管理响应的统一 RC 阶梯(所有子命令同一映射)。
+
+    first_init:run() 首启路径的 409 文案含 default 账户语境与轮换端点
+    提示,其余子命令用通用文案;RC 映射完全一致。
+    """
     if status == 401 or status == 403:
         print("错误:root key 被服务端拒绝", file=sys.stderr)
         return RC_INVALID_ROOT_KEY, None
     if status == 409:
-        print("错误:user 已存在但本地凭据缺失;禁止重复创建,请修复输出后轮换", file=sys.stderr)
+        if first_init:
+            print(
+                "错误:default 账户/user 已存在但本地 user key 缺失,需人工恢复/轮换"
+                "(可调 POST /api/v1/admin/accounts/default/users/default/key 轮换)",
+                file=sys.stderr,
+            )
+        else:
+            print("错误:user 已存在但本地凭据缺失;禁止重复创建,请修复输出后轮换", file=sys.stderr)
         return RC_MANUAL_RECOVERY, None
     if status != 200:
         print(f"错误:user 管理请求失败(admin API status={status})", file=sys.stderr)
@@ -288,11 +305,8 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
             file=sys.stderr,
         )
         return RC_MANUAL_RECOVERY
-    if cli_config_path and not _ensure_timeout_file(cli_config_path):
-        # 新写/复写的 CLI 配置与 run()/_configure_cli 同一契约:必须带
-        # timeout,否则后续 `ov add-resource --wait` 会超时失败。
-        print("错误:无法确保输出 CLI 配置的 timeout=300", file=sys.stderr)
-        return RC_CLI_CONFIG
+    # 新写/复写的 CLI 配置在 _write_user_output 序列化前已含 timeout
+    # (经 _clamp_cfg_timeout),无需写后再读回补写。
     print(f"已创建 user={user_id} 并写入凭据(600)")
     return RC_OK
 
@@ -328,10 +342,7 @@ def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
             file=sys.stderr,
         )
         return RC_MANUAL_RECOVERY
-    if cli_config_path and not _ensure_timeout_file(cli_config_path):
-        # 与 provision/run 同一 timeout 契约(见 provision_user)。
-        print("错误:无法确保输出 CLI 配置的 timeout=300", file=sys.stderr)
-        return RC_CLI_CONFIG
+    # 与 provision_user 同一契约:timeout 已在 _write_user_output 写出前落盘。
     print(f"已轮换 user={user_id} 并更新凭据(600)")
     return RC_OK
 
@@ -435,15 +446,17 @@ def _ov_health_ok(ov_bin, cli_config_path, root_key, user_key, env,
                   base_url=DEFAULT_BASE_URL, *, expected_account,
                   expected_user, expected_role, require_root_key,
                   saved_profile_path) -> str:
-    """三态判定:"ok" / "invalid"(凭据或配置不符)/ "timeout"(ov 超时)。
+    """三态判定:"ok" / "invalid"(凭据或配置不符)/ "timeout"(子进程未完成)。
 
-    超时(_run_ov 折叠为 returncode 124)不等于凭据无效,调用方必须区别
-    处理,不得把有效密钥推向人工轮换(2026-11-03 检视)。
+    "timeout" 泛指"健康探测子进程因非凭据原因未完成":超时(_run_ov 折叠为
+    returncode 124)与 ov 无法启动(127,折叠时已在 stderr 报明无法启动)。
+    两者都不等于凭据无效,调用方必须按可重试处理,不得把有效密钥推向人工
+    轮换(2026-11-03 检视;127 并入同一类别:2026-11-07 检视)。
     """
     proc = _run_ov(
         ov_bin, ["health", "-o", "json"], cli_config_path, root_key, user_key, env
     )
-    if proc.returncode == 124:
+    if proc.returncode in (124, 127):
         return "timeout"
     if proc.returncode != 0:
         return "invalid"
@@ -552,7 +565,7 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
                 base_url=base_url, expected_account="default",
                 expected_user="default", expected_role="admin",
                 require_root_key=True,
-                saved_profile_path=_saved_profile_path(cli_config_path),
+                saved_profile_path=saved_path,
             )
             if health == "timeout":
                 print(
@@ -609,40 +622,22 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
         # v0.5.2 服务端首启自动创建无 user 的空壳 default 账户:
         # 回退为在既有账户下注册 admin user(响应同样含 user_key)
         status, payload = _register_default_user(base_url, root_key, timeout)
-    if status == 401 or status == 403:
-        print("错误:root key 被服务端拒绝(无效或已轮换)", file=sys.stderr)
-        return RC_INVALID_ROOT_KEY
-    if status == 409:
-        print(
-            "错误:default 账户/user 已存在但本地 user key 缺失,需人工恢复/轮换"
-            "(可调 POST /api/v1/admin/accounts/default/users/default/key 轮换)",
-            file=sys.stderr,
-        )
-        return RC_MANUAL_RECOVERY
-    if status == 200 and (
-        not isinstance(payload, dict) or payload.get("status") != "ok"
-    ):
-        # 与 _response_user_key 同一映射(RC 阶梯统一,2026-11-07 用户决策):
-        # 非 ok 信封是响应形状异常,不是"user 已存在"的证据,不得断言恢复动作,
-        # 按缺 key 拒绝继续;200+非 dict 载荷同归此处,不再滑向缺字段文案。
-        print("错误:账户初始化响应信封非 ok,拒绝继续", file=sys.stderr)
-        return RC_NO_USER_KEY
-    if status != 200:
-        print(f"错误:账户初始化失败(admin API status={status})", file=sys.stderr)
-        return RC_UPSTREAM
-
-    result = (payload or {}).get("result") if isinstance(payload, dict) else None
-    user_key = result.get("user_key") if isinstance(result, dict) else None
-    # 与 _response_user_key 同一判型:非字符串真值不得进入落盘路径。
-    if not isinstance(user_key, str) or not user_key:
-        print("错误:响应缺少 result.user_key,拒绝继续", file=sys.stderr)
-        return RC_NO_USER_KEY
+    # 与 provision/rotate 同一映射:分类只存 _response_user_key 一份
+    # (RC 阶梯统一,2026-11-07 用户决策;此前此处内联复制整条阶梯,
+    # 一致性仅靠注释维系)。first_init 只切换 409 文案(轮换端点提示),
+    # RC 映射与通用路径逐位一致。
+    rc, user_key = _response_user_key(status, payload, first_init=True)
+    if rc != RC_OK:
+        return rc
 
     try:
         _atomic_write_secret(Path(user_key_path), user_key)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         # user 已创建且 key 已从响应取得,此时丢失 key 不得重跑创建流程
         # (会走到 409/人工恢复),必须提示用 Admin API 轮换取新 key。
+        # ValueError 家族:服务端漂移返回含孤立代理字符的 user_key 时,
+        # fh.write 抛 UnicodeEncodeError(与上方 _response_user_key 判型
+        # 注释要防的是同一类受控路径逃逸;provision/rotate 已同此覆盖)。
         print(
             f"错误:user key 落盘失败({type(exc).__name__});default 账户/user 已创建,"
             "禁止重复创建;请用 root key 调 POST "
@@ -659,11 +654,18 @@ def _ensure_cli_language(ov_bin, env):
     """真实 CLI 首跑要求显示语言;尽力设置,返回 CompletedProcess(或 None)。
 
     env 由调用方保证已含 OPENVIKING_CLI_CONFIG_FILE。已有设置时幂等。
+    与 _run_ov 同一防线:密钥经环境注入的 ov 子进程一律不得继承宿主代理
+    设置,也不携带 root key(language 只写本地设置,两者都用不上;
+    2026-11-07 检视补齐,覆盖 run/_configure_cli/check_user 三个调用点)。
     """
+    child_env = dict(env)
+    for proxy_var in PROXY_ENV_VARS:
+        child_env.pop(proxy_var, None)
+    child_env.pop(ROOT_KEY_ENV, None)
     try:
         return subprocess.run(
             [ov_bin, "language", "zh-CN"],
-            env=env,
+            env=child_env,
             capture_output=True,
             timeout=30,
             check=False,
@@ -684,6 +686,28 @@ def _warn_if_language_setup_failed(proc):
         )
 
 
+def _clamp_cfg_timeout(cfg, timeout=300):
+    """内存中 cfg 的 timeout 判定与钳制(timeout 契约的唯一判定谓词)。
+
+    已设置有限且 >= timeout 的值不覆盖;缺失、布尔、非数值、超 float 范围
+    (JSON 可表达任意精度整数,OverflowError)或小于 timeout 的值一律重写为
+    timeout。读侧(_ensure_timeout_file 对磁盘文件)与写侧(_write_user_output
+    序列化前)共用本函数,防止两处判定语义各自漂移(2026-11-07 检视)。
+    """
+    current = cfg.get("timeout")
+    try:
+        valid = (
+            isinstance(current, (int, float))
+            and not isinstance(current, bool)
+            and math.isfinite(current)
+            and current >= timeout
+        )
+    except OverflowError:
+        valid = False
+    if not valid:
+        cfg["timeout"] = timeout
+
+
 def _ensure_timeout_file(path, timeout=300):
     """确保单个 CLI 配置顶层有 "timeout";已设置时不覆盖。
 
@@ -697,18 +721,9 @@ def _ensure_timeout_file(path, timeout=300):
     if cfg is None:
         print(f"错误:读取/解析 {name} 失败,无法确保 timeout", file=sys.stderr)
         return False
-    current = cfg.get("timeout")
-    try:
-        valid = (
-            isinstance(current, (int, float))
-            and not isinstance(current, bool)
-            and math.isfinite(current)
-            and current >= timeout
-        )
-    except OverflowError:
-        # JSON 可表达任意精度整数;超出 float 范围按"非法值"重写为 300,不崩溃。
-        valid = False
-    if valid:
+    original = cfg.get("timeout")
+    _clamp_cfg_timeout(cfg, timeout)
+    if cfg.get("timeout") == original:
         try:
             os.chmod(path, 0o600)
         except OSError as exc:
@@ -718,8 +733,6 @@ def _ensure_timeout_file(path, timeout=300):
             )
             return False
         return True
-    # 缺失、非数值或小于 300 的 timeout 都视为不足;写成 300。
-    cfg["timeout"] = timeout
     try:
         _atomic_write_secret(Path(path), json.dumps(cfg, allow_nan=False))
     except (OSError, ValueError) as exc:
@@ -813,8 +826,10 @@ def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
     if not base_url or not user_id or role == "root":
         return RC_BAD_ENV
     if os.path.abspath(cli_config_path) == os.path.abspath(user_key_path):
+        # 与 run() 同一守卫、同一 RC:同路径是纯参数错误,尚未写任何文件、
+        # 无现场可恢复,按 RC_BAD_ENV 而非人工恢复(2026-11-07 检视统一)。
         print("错误:临时配置路径不得与 key 文件相同", file=sys.stderr)
-        return RC_MANUAL_RECOVERY
+        return RC_BAD_ENV
     if os.path.lexists(cli_config_path):
         print("错误:临时配置路径已存在;拒绝覆盖或删除,请先人工核对", file=sys.stderr)
         return RC_MANUAL_RECOVERY
@@ -862,7 +877,21 @@ def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
     return rc
 
 
+# --user-id 会进入 admin API URL 路径(_register_user/_rotate_user_key 的
+# f-string)与 check-user 的默认临时配置路径(main() 内拼 /tmp/ovcli.<id>.conf,
+# _exclusive_write_secret 会递归建父目录):'/'/'?'/#' 等字符可改写请求路径
+# 或令临时配置落出预期目录。与 tests/e2e_user_isolation.sh 对同一字段的
+# 白名单一致(2026-11-07 sweep)。
+_USER_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
 def main():
+    # ov CLI 子进程会以自身 umask 先落盘含 root/user 双明文 key 的
+    # ovcli.conf 与 saved profile,bootstrap 事后才 chmod;先收紧进程
+    # umask,消除"宽权限文件先落盘"的窗口(prepare.sh 对 secrets.env
+    # 同一纪律,2026-11-07 检视)。显式 600 的写入路径(_atomic_write_secret
+    # /exclusive)不受影响,ov 子进程则继承此 umask。
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description="OpenViking 用户认证初始化与检查")
     sub = parser.add_subparsers(dest="command")
     provision = sub.add_parser("provision-user")
@@ -883,6 +912,14 @@ def main():
     check.add_argument("--key-file", required=True)
     check.add_argument("--config-file")
     args = parser.parse_args()
+
+    if args.command in ("provision-user", "rotate-user", "check-user") \
+            and not _USER_ID_RE.fullmatch(args.user_id):
+        print(
+            "错误:--user-id 仅允许字母数字开头,后接字母/数字/下划线/连字符",
+            file=sys.stderr,
+        )
+        sys.exit(RC_BAD_ENV)
 
     root_key = os.environ.get(ROOT_KEY_ENV, "")
     base_url = os.environ.get("OPENVIKING_BOOTSTRAP_URL", DEFAULT_BASE_URL)

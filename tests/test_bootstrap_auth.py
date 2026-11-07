@@ -1046,6 +1046,23 @@ def test_main_provision_user_subcommand(sandbox, ovserver, monkeypatch):
     assert ovserver.last_user_id == "test"
 
 
+@pytest.mark.parametrize("bad_id", ["../evil", "default?include_credentials=true#", "a/b", ""])
+def test_main_rejects_unsafe_user_id(sandbox, ovserver, monkeypatch, bad_id):
+    """--user-id 进入 admin API URL 路径与 check-user 临时配置路径:与
+    e2e_user_isolation.sh 同一白名单,路径/查询改写字符一律 RC_BAD_ENV,
+    且不发起任何网络调用(2026-11-07 sweep)。"""
+    monkeypatch.setenv(ba.ROOT_KEY_ENV, ROOT_KEY)
+    monkeypatch.setenv("OPENVIKING_BOOTSTRAP_URL", ovserver.url)
+    monkeypatch.setattr(sys, "argv", [
+        "bootstrap_auth.py", "rotate-user", "--user-id", bad_id,
+        "--key-file", str(sandbox.state / "x"),
+    ])
+    with pytest.raises(SystemExit) as exc:
+        ba.main()
+    assert exc.value.code == ba.RC_BAD_ENV
+    assert ovserver.rotation_calls == 0
+
+
 def test_check_user_refuses_existing_config_without_deleting(sandbox, ovserver):
     key_path = sandbox.state / "secrets" / "test_user_api_key"
     key_path.parent.mkdir()
@@ -1060,13 +1077,15 @@ def test_check_user_refuses_existing_config_without_deleting(sandbox, ovserver):
 
 
 def test_check_user_rejects_same_key_and_config_path(sandbox, ovserver):
+    """同路径是纯参数错误(与 run() 同一守卫、同一 RC_BAD_ENV;2026-11-07
+    检视:原 RC_MANUAL_RECOVERY 会误导操作者走人工恢复流程)。"""
     key_path = sandbox.state / "secrets" / "test_user_api_key"
     key_path.parent.mkdir()
     key_path.write_text(TEST_KEY)
     assert ba.check_user(
         sandbox.ov_bin, ovserver.url, str(key_path), str(key_path), {},
         account_id="default", user_id="test", role="user",
-    ) == ba.RC_MANUAL_RECOVERY
+    ) == ba.RC_BAD_ENV
     assert key_path.read_text() == TEST_KEY
 
 
@@ -1119,6 +1138,25 @@ def test_response_user_key_rejects_non_string_key(monkeypatch, sandbox):
     )
     assert rc == ba.RC_NO_USER_KEY
     assert not key_path.exists()
+
+
+def test_first_init_surrogate_key_write_enters_manual_recovery(
+    sandbox, ovserver, monkeypatch, capsys
+):
+    """服务端漂移返回含孤立代理字符的 user_key(字符串、过判型)时,落盘
+    fh.write 抛 UnicodeEncodeError(ValueError 家族):run() 首启路径必须与
+    provision/rotate 同一覆盖,走受控人工恢复而非 traceback 逃逸
+    (2026-11-07 检视;原 except OSError 漏掉该类)。"""
+    surrogate_key = json.loads('"\\ud800bad"')
+    monkeypatch.setattr(ba, "_register_default_user", lambda *args, **kwargs: (
+        200, {"status": "ok", "result": {"user_key": surrogate_key}},
+    ))
+    rc = run_bootstrap(sandbox, ovserver)
+    captured = capsys.readouterr()
+    assert rc == ba.RC_MANUAL_RECOVERY
+    assert "Traceback" not in captured.err
+    assert "落盘失败" in captured.err
+    assert not sandbox.user_key.exists()
 
 
 def test_provision_rejects_root_role(sandbox):

@@ -99,6 +99,25 @@ def test_parse_non_utf8_comment_does_not_crash(tmp_path):
     assert ef.parse_env_file(path)["Z_AI_API_KEY"] == "goodkey123"
 
 
+def test_parse_splits_only_on_lf_like_compose(tmp_path):
+    """str.splitlines 会额外在 \\v、\\f、U+0085 等处断行,把一条 KEY=value 拆成
+    两条而 Compose 仍是一条,值静默分歧(2026-11-07 sweep):必须只按 \\n 切。"""
+    path = tmp_path / "secrets.env"
+    path.write_text("Z_AI_API_KEY=a\x85b\nc\vd\nK=v\n", encoding="utf-8")
+    env = ef.parse_env_file(path)
+    assert env["Z_AI_API_KEY"] == "a\x85b"
+    assert env["K"] == "v"
+
+
+def test_parse_rejects_undecodable_byte_in_value(tmp_path):
+    """errors="replace" 会把非法 UTF-8 字节变成 U+FFFD 而 Compose 注入原始
+    字节:进入值就必须拒绝,注释里的替换字符无害(2026-11-07 sweep)。"""
+    path = tmp_path / "secrets.env"
+    path.write_bytes(b"Z_AI_API_KEY=a\xffb\n")
+    with pytest.raises(ef.EnvFileError):
+        ef.parse_env_file(path)
+
+
 def test_precheck_accepts_good_keys_and_requests_generation(tmp_path):
     env = {"Z_AI_API_KEY": "goodkey123"}
     assert ef.precheck_env(env) == "GENERATE"

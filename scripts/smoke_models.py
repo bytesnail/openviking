@@ -20,7 +20,11 @@ _NEGATION = re.compile(
     r"\b(?:not|no|never|cannot|can't|isn't|aren't|wasn't|weren't)\b"
     r"|不是|并非|不知道|无法|没有|不含|不等于|不存在"
 )
-_IMAGE_NEGATION = re.compile(_NEGATION.pattern + r"|不红|不紅|非红|非紅|无红|无紅")
+# non-?red:\bno\b 匹配不到 "non-red"(no 后接词字符无边界),而 \bred\b
+# 恰好命中其子串 red,否定式错误回答会因子串放行(2026-11-07 sweep)。
+_IMAGE_NEGATION = re.compile(
+    _NEGATION.pattern + r"|不红|不紅|非红|非紅|无红|无紅|non-?red\b"
+)
 _MULTI_DIGIT = re.compile(r"\d{2,}")
 _STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
 # 独立 ASCII 数字:用于拒绝含"非 2 的其他数字"的回答("2+2=4"/"2 或 3"
@@ -35,6 +39,15 @@ _STANDALONE_CN_TWO = re.compile(
     f"(?<![{_CN_NUMERAL_CONTEXT}])[二兩两](?![{_CN_NUMERAL_CONTEXT}])"
 )
 _RED_WORD = re.compile(r"\bred\b")
+# 自然等式形态:"1+1 = 2"("= 2" 带空格)与"1加1等于2/等于二"都不以 "=2"
+# 结尾,却是对题面的自然正确回答(2026-11-07 检视:旧判据只认 "=2" 结尾,
+# 会把回显题面的正确回答误判 FAIL,smoke 对健康 VLM 误报故障)。两个分支
+# 的前瞻对称排除以 2 起头的其他数:"等于二十/2.5"与"1+1=2万/2两"
+# (2026-11-07 sweep 补齐 ASCII 分支的中文数字排除)。
+_EQUATION_TWO = re.compile(
+    r"=\s*2(?![\d.．二兩两三四五六七八九十百千万亿零〇点])"
+    r"|等[于於]\s*[二兩两2](?![点零〇\d.．二兩两三四五六七八九十百千万亿])"
+)
 
 
 def _normalize_answer(text):
@@ -46,7 +59,8 @@ def _normalize_answer(text):
 def _text_answer_ok(text):
     """接受 correct 的 2/二/two 及自然短语;拒绝 2025/12/否定句。
     还须拒绝含其他独立数字的回答:"2+2=4"、"2 或 3"、"3个2" 同样是对
-    "1 加 1 等于几" 的错误应答;等式形态只认以 "=2" 结尾(如 "1+1=2")。"""
+    "1 加 1 等于几" 的错误应答;等式形态认以 "=2" 结尾(如 "1+1=2")或
+    "等于2/等于二/等於…" 自然等式(前瞻排除 "二十/2.5" 类尾随数)。"""
     normalized = _normalize_answer(text)
     if not normalized:
         return False
@@ -61,7 +75,11 @@ def _text_answer_ok(text):
     ):
         return False
     digits = _STANDALONE_DIGIT.findall(normalized)
-    return normalized.endswith("=2") or all(d == "2" for d in digits)
+    return (
+        normalized.endswith("=2")
+        or _EQUATION_TWO.search(normalized) is not None
+        or all(d == "2" for d in digits)
+    )
 
 
 def _image_answer_ok(text):
@@ -85,7 +103,8 @@ def _valid_rerank_scores(scores):
     if not (isinstance(scores, (list, tuple)) and len(scores) == 2):
         return False
     # 同型"有限数值"判定在 scripts/embedding_adapter.py(single_vector)与
-    # scripts/bootstrap_auth.py(_ensure_timeout_file)各有一份(-I 隔离运行);
+    # scripts/bootstrap_auth.py(_clamp_cfg_timeout,经 _ensure_timeout_file
+    # 作用于磁盘文件)各有一份(-I 隔离运行);
     # 修改溢出/布尔排除等语义须三处同步。
     try:
         return all(
@@ -132,12 +151,11 @@ def smoke_vlm_image(vlm, failures):
         # 语义判据:拒绝 "not red"/"hundred"/blue 等 substring/否定假通过,
         # 但允许 "这张图片是红色" 这类自然正确回答。
         mentions_red = _image_answer_ok(text)
-        ok = mentions_red
         print(
-            f"[vlm-image]  {'OK' if ok else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} "
+            f"[vlm-image]  {'OK' if mentions_red else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} "
             f"mentions_red={mentions_red}"
         )
-        if not ok:
+        if not mentions_red:
             failures.append("vlm-image")
     except Exception as exc:
         print(f"[vlm-image]  FAIL error={type(exc).__name__}")
