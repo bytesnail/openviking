@@ -59,6 +59,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _DIRECT_OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _NoRedirect()
 )
+# 管理面响应体上限:admin API 信封都很小,16 MiB 已是宽裕上界;
+# 与 embedding_adapter 的 max_response_body_bytes 同一"响应必须有界"纪律。
+_MAX_ADMIN_RESPONSE_BYTES = 16 * 1024 * 1024
 # 同型 _NoRedirect/_DIRECT_OPENER 在 scripts/env_file.py 与
 # scripts/embedding_adapter.py 各有一份:保持 -I 下零 sys.path 操作、脚本
 # 自包含是有意设计(显式 sys.path.insert 本可共享,先例
@@ -124,12 +127,19 @@ def _post_json(url, body, root_key, timeout=30):
         )
         with _direct_urlopen(req, timeout=timeout) as resp:
             status = resp.status
-            raw = resp.read() or b"null"
+            # 与 embedding_adapter 同一有界读纪律:管理面响应体同样必须有界,
+            # 服务端回归吐出超大响应体时按"信封无效"处理而非无界占用内存。
+            raw = resp.read(_MAX_ADMIN_RESPONSE_BYTES + 1)
+            if len(raw) > _MAX_ADMIN_RESPONSE_BYTES:
+                return status, None
     except urllib.error.HTTPError as err:
         try:
-            raw = err.read() or b"null"
+            raw = err.read(_MAX_ADMIN_RESPONSE_BYTES + 1)
         except (http.client.HTTPException, OSError):
             return err.code, None
+        if len(raw) > _MAX_ADMIN_RESPONSE_BYTES:
+            return err.code, None
+        raw = raw or b"null"
         try:
             payload = json.loads(raw)
         except ValueError:
@@ -141,7 +151,7 @@ def _post_json(url, body, root_key, timeout=30):
         # 折叠为连接失败,保持"失败只报步骤与退出码"的契约。
         return 0, None
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw or b"null")
     except ValueError:
         payload = None  # 200 但响应体非 JSON:按缺 result 处理,走 RC_NO_USER_KEY
     return status, payload
@@ -180,11 +190,18 @@ def _rotate_user_key(base_url, root_key, user_id, timeout=30):
     )
 
 
+def _is_root_free(cfg):
+    """root-free 判定的单一来源:provision 域的输出与相邻 saved profile
+    都永不嵌 root key(_cli_config_for_output 写侧防线与复用路径的
+    saved profile 核查共用,防止两处语义各自漂移)。"""
+    return isinstance(cfg, dict) and "root_api_key" not in cfg
+
+
 def _cli_config_for_output(path):
     if not os.path.exists(path):
         return {}
     cfg = _load_cli_config(path)
-    if cfg is None or "root_api_key" in cfg:
+    if not _is_root_free(cfg):
         raise ValueError("CLI config is invalid or contains root_api_key")
     return cfg
 
@@ -245,16 +262,47 @@ def _response_user_key(status, payload, *, first_init=False):
     return RC_OK, user_key
 
 
-def _cli_config_identity_ok(cfg, base_url, user_id):
-    """CLI 配置身份(url/account/user)与目标一致;url 非字符串一律不算一致
-    (JSON null 会令 .rstrip 抛 AttributeError 逃出受控错误路径,必须先判型)。"""
-    configured_url = cfg.get("url")
+def _url_matches(cfg, base_url, configured_url=None):
+    """URL 身份判定(两处判定器共用):url 非字符串一律不算一致
+    (JSON null 会令 .rstrip 抛 AttributeError 逃出受控错误路径,必须先判型)。
+    configured_url 允许调用方传入已回退的值(legacy 配置缺 url 时用默认)。"""
+    if configured_url is None:
+        configured_url = cfg.get("url")
     return (
         isinstance(configured_url, str)
         and configured_url.rstrip("/") == base_url.rstrip("/")
+    )
+
+
+def _cli_config_identity_ok(cfg, base_url, user_id):
+    """CLI 配置身份(url/account/user)与目标一致。"""
+    return (
+        _url_matches(cfg, base_url)
         and cfg.get("account") == "default"
         and cfg.get("user") == user_id
     )
+
+
+def _deliver_user_key(user_key, base_url, user_id, *, user_key_path,
+                      cli_config_path, fail_context, fail_hint, success_msg):
+    """provision/rotate 共用尾部:原子落盘,失败进人工恢复并保留现场。
+
+    RC 阶梯与恢复语义只此一份,不再靠注释在两个调用方之间对齐;
+    timeout 契约由 _write_user_output 序列化前写入,此处无需读回补写。
+    """
+    try:
+        _write_user_output(
+            user_key, base_url, user_id, user_key_path, cli_config_path,
+        )
+    except (OSError, ValueError) as exc:
+        print(
+            f"错误:{fail_context}落盘失败({type(exc).__name__});"
+            f"{fail_hint}",
+            file=sys.stderr,
+        )
+        return RC_MANUAL_RECOVERY
+    print(success_msg)
+    return RC_OK
 
 
 def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
@@ -285,6 +333,9 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
                 if not _ensure_timeout_file(cli_config_path):
                     print("错误:无法确保输出 CLI 配置的 timeout=300", file=sys.stderr)
                     return RC_CLI_CONFIG
+                # 同目录 saved profile 先核查后同步:漂移保留现场并告警放行
+                if not _sync_saved_profile_timeout(cli_config_path, base_url, user_id):
+                    return RC_CLI_CONFIG
                 return RC_OK
     except (OSError, ValueError, UnicodeError) as exc:
         print(f"错误:本地凭据输出不可安全复用({type(exc).__name__})", file=sys.stderr)
@@ -294,21 +345,13 @@ def provision_user(root_key, base_url, user_id, role, *, user_key_path=None,
     rc, user_key = _response_user_key(status, payload)
     if rc != RC_OK:
         return rc
-    try:
-        _write_user_output(
-            user_key, base_url, user_id, user_key_path, cli_config_path,
-        )
-    except (OSError, ValueError) as exc:
-        print(
-            f"错误:user 已创建但 key 落盘失败({type(exc).__name__});"
-            "禁止重复创建,修复输出后使用 rotate-user",
-            file=sys.stderr,
-        )
-        return RC_MANUAL_RECOVERY
-    # 新写/复写的 CLI 配置在 _write_user_output 序列化前已含 timeout
-    # (经 _clamp_cfg_timeout),无需写后再读回补写。
-    print(f"已创建 user={user_id} 并写入凭据(600)")
-    return RC_OK
+    return _deliver_user_key(
+        user_key, base_url, user_id,
+        user_key_path=user_key_path, cli_config_path=cli_config_path,
+        fail_context="user 已创建但 key",
+        fail_hint="禁止重复创建,修复输出后使用 rotate-user",
+        success_msg=f"已创建 user={user_id} 并写入凭据(600)",
+    )
 
 
 def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
@@ -331,20 +374,13 @@ def rotate_user(root_key, base_url, user_id, *, user_key_path=None,
     rc, user_key = _response_user_key(status, payload)
     if rc != RC_OK:
         return rc
-    try:
-        _write_user_output(
-            user_key, base_url, user_id, user_key_path, cli_config_path,
-        )
-    except (OSError, ValueError) as exc:
-        print(
-            f"错误:新 key 落盘失败({type(exc).__name__});"
-            "禁止创建 user,修复输出后再次轮换",
-            file=sys.stderr,
-        )
-        return RC_MANUAL_RECOVERY
-    # 与 provision_user 同一契约:timeout 已在 _write_user_output 写出前落盘。
-    print(f"已轮换 user={user_id} 并更新凭据(600)")
-    return RC_OK
+    return _deliver_user_key(
+        user_key, base_url, user_id,
+        user_key_path=user_key_path, cli_config_path=cli_config_path,
+        fail_context="新 key",
+        fail_hint="禁止创建 user,修复输出后再次轮换",
+        success_msg=f"已轮换 user={user_id} 并更新凭据(600)",
+    )
 
 
 def _server_reachable(base_url, timeout=5):
@@ -429,8 +465,7 @@ def _cfg_matches(cfg, base_url, root_key, user_key, require_root_key=True):
         else "root_api_key" not in cfg
     )
     return (
-        isinstance(configured_url, str)
-        and configured_url.rstrip("/") == base_url.rstrip("/")
+        _url_matches(cfg, base_url, configured_url)
         and cfg.get("api_key") == user_key
         and root_matches
     )
@@ -556,7 +591,7 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
             # `ov health` 在发请求前退出。必须先尽力重建语言设置,否则会把
             # 有效凭据误报为"认证无效"。
             _warn_if_language_setup_failed(_ensure_cli_language(
-                ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
+                ov_bin, cli_config_path, env
             ))
             # 先做身份/漂移核查,再做任何写回(含 timeout 修补):漂移的
             # saved profile 必须原样保留现场,不得先追加字段后报错。
@@ -650,29 +685,16 @@ def run(root_key, base_url, cli_config_path, user_key_path, ov_bin="ov",
     return _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env)
 
 
-def _ensure_cli_language(ov_bin, env):
-    """真实 CLI 首跑要求显示语言;尽力设置,返回 CompletedProcess(或 None)。
+def _ensure_cli_language(ov_bin, cli_config_path, env):
+    """真实 CLI 首跑要求显示语言;尽力设置,返回 CompletedProcess。
 
-    env 由调用方保证已含 OPENVIKING_CLI_CONFIG_FILE。已有设置时幂等。
-    与 _run_ov 同一防线:密钥经环境注入的 ov 子进程一律不得继承宿主代理
-    设置,也不携带 root key(language 只写本地设置,两者都用不上;
-    2026-11-07 检视补齐,覆盖 run/_configure_cli/check_user 三个调用点)。
+    与其他 ov 子进程同一通道(_run_ov):代理剥离、root key 不下发、超时
+    折叠为返回码——language 只写本地设置,两个密钥都用不上。失败不阻断,
+    由 _warn_if_language_setup_failed 落警告(2026-11-08 简化:原先本函数
+    自行复制 _run_ov 的子进程样板,两份防线各自演化)。
     """
-    child_env = dict(env)
-    for proxy_var in PROXY_ENV_VARS:
-        child_env.pop(proxy_var, None)
-    child_env.pop(ROOT_KEY_ENV, None)
-    try:
-        return subprocess.run(
-            [ov_bin, "language", "zh-CN"],
-            env=child_env,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-    except Exception as exc:
-        print(f"警告:ov language 设置未能执行({type(exc).__name__})", file=sys.stderr)
-        return None
+    return _run_ov(ov_bin, ["language", "zh-CN"], cli_config_path, None, None, env,
+                   timeout=30)
 
 
 def _warn_if_language_setup_failed(proc):
@@ -759,10 +781,50 @@ def _ensure_cli_timeout(cli_config_path, timeout=300, profile_name=CLI_PROFILE_N
     return True
 
 
+def _sync_saved_profile_timeout(cli_config_path, base_url, user_id,
+                                timeout=300):
+    """复用路径对同目录 saved profile 的 timeout 同步(2026-11-08 设计决策)。
+
+    先离线核查身份(url/account/user 一致且不含 root_api_key),匹配才补
+    timeout;漂移、含 root key 或不可解析一律原样保留并告警放行(RC 不变)
+    ——漂移的 saved 不构成对已核查 active 输出的歧义,不得阻断幂等复用
+    (对照 run():其 active 与 saved 同属 bootstrap 写出的同一身份域,saved
+    漂移意味着 active 本身也可疑,故 fail-closed;此处不成立)。
+    api_key 新鲜度离线不可见(rotate 后 saved 会留旧 key):身份匹配只代表
+    url/account/user 一致,不代表凭据未陈旧,确认行不得声称凭据一致。
+    返回 False 仅当身份匹配但写回失败(交调用方与 active 同型硬失败)。
+    """
+    saved_path = _saved_profile_path(cli_config_path)
+    name = os.path.basename(saved_path)
+    if not os.path.exists(saved_path):
+        return True
+    cfg = _load_cli_config(saved_path)
+    if cfg is None:
+        reason = "无法解析"
+    elif not _is_root_free(cfg):
+        reason = "含 root_api_key"
+    elif not _cli_config_identity_ok(cfg, base_url, user_id):
+        reason = "身份(url/account/user)与目标不一致"
+    else:
+        reason = None
+    if reason is not None:
+        print(
+            f"警告:{name} {reason},未同步 timeout,已原样保留",
+            file=sys.stderr,
+        )
+        return True
+    if not _ensure_timeout_file(saved_path, timeout):
+        print(f"错误:无法确保 {name} 的 timeout=300", file=sys.stderr)
+        return False
+    print(f"已确认 {name} 的 timeout 契约(身份匹配 url/account/user;"
+          "api_key 未在线核验)")
+    return True
+
+
 def _configure_cli(ov_bin, base_url, cli_config_path, root_key, user_key, env,
                    profile_name=CLI_PROFILE_NAME):
     _warn_if_language_setup_failed(_ensure_cli_language(
-        ov_bin, {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
+        ov_bin, cli_config_path, env
     ))
     args = [
         "config", "add", "custom",
@@ -851,8 +913,9 @@ def check_user(ov_bin, base_url, cli_config_path, user_key_path, env=None, *,
 
     rc = RC_OK
     try:
-        child_env = {**env, "OPENVIKING_CLI_CONFIG_FILE": cli_config_path}
-        _warn_if_language_setup_failed(_ensure_cli_language(ov_bin, child_env))
+        _warn_if_language_setup_failed(_ensure_cli_language(
+            ov_bin, cli_config_path, env
+        ))
         health = _ov_health_ok(
             ov_bin, cli_config_path, None, user_key, env,
             base_url=base_url, expected_account=account_id,

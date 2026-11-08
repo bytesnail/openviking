@@ -26,17 +26,28 @@ _IMAGE_NEGATION = re.compile(
     _NEGATION.pattern + r"|不红|不紅|非红|非紅|无红|无紅|non-?red\b"
 )
 _MULTI_DIGIT = re.compile(r"\d{2,}")
-_STANDALONE_TWO = re.compile(r"(?<!\d)2(?!\d)")
 # 独立 ASCII 数字:用于拒绝含"非 2 的其他数字"的回答("2+2=4"/"2 或 3"
 # 都是对"1+1=?"的错误应答,不能因子串含 "2" 放行)。
 _STANDALONE_DIGIT = re.compile(r"(?<!\d)(\d)(?!\d)")
-_ENGLISH_TWO = re.compile(r"(?<![a-z-])two(?![a-z-])")
-# 中文"二/兩/两"必须独立出现:前后紧邻其他中文数字(或点)说明是别的数
-# (十二/二十/二零二五/二点五),不得因子串含"二"误判为正确答案
-# (2026-11-03 检视;_MULTI_DIGIT 只匹配 ASCII \d,管不住中文数字)。
+# 中文数字语境字符集:数字复合词判定与"其他独立中文数字"拒绝(决策 C)
+# 共用,语境语义只此一份。
 _CN_NUMERAL_CONTEXT = "零〇○一二兩两三四五六七八九十百千万亿点0-9"
-_STANDALONE_CN_TWO = re.compile(
-    f"(?<![{_CN_NUMERAL_CONTEXT}])[二兩两](?![{_CN_NUMERAL_CONTEXT}])"
+# 其他独立中文数字:不含一(题面"一加一"回显)与二/兩/两(答案本身);
+# 出现即是对"1 加 1"的错误应答("二或三"),与 ASCII 分支的
+# _STANDALONE_DIGIT+all 判定对称(2026-11-08 决策 C)。
+_OTHER_STANDALONE_CN_NUMERAL = re.compile(
+    f"(?<![{_CN_NUMERAL_CONTEXT}])[三四五六七八九十百千万亿零〇]"
+    f"(?![{_CN_NUMERAL_CONTEXT}])"
+)
+# 答案词(精确匹配与模板剥除后共用):与旧精确集合一致(含简繁"兩/两"),
+# 收紧后模板剥除分支与精确分支共用同一集合,语义只此一份。
+_ANSWER_WORDS = {"2", "二", "兩", "two", "两"}
+# 答案前缀模板(决策 B):剥除后剩余必须恰为答案词。模板是有限的答案
+# 框定词而非开放词表——多了会把借题发挥放行,少了会误报健康 VLM,
+# 调整须同步 tests/test_smoke_models.py 的 accepts/rejects 钉面。
+_ANSWER_PREFIX = re.compile(
+    r"^(?:the\s+answer\s+is|answer|答案|结果|(?:当然|应该|可能|一定|那|这)?就?是)"
+    r"[\s:=：为是]*"
 )
 _RED_WORD = re.compile(r"\bred\b")
 # 自然等式形态:"1+1 = 2"("= 2" 带空格)与"1加1等于2/等于二"都不以 "=2"
@@ -57,29 +68,31 @@ def _normalize_answer(text):
 
 
 def _text_answer_ok(text):
-    """接受 correct 的 2/二/two 及自然短语;拒绝 2025/12/否定句。
-    还须拒绝含其他独立数字的回答:"2+2=4"、"2 或 3"、"3个2" 同样是对
-    "1 加 1 等于几" 的错误应答;等式形态认以 "=2" 结尾(如 "1+1=2")或
-    "等于2/等于二/等於…" 自然等式(前瞻排除 "二十/2.5" 类尾随数)。"""
+    """接受 correct 的 2/二/两/two 的本质答案形态;拒绝 2025/12/否定句、
+    "二X"构词借题发挥(二氧化硫/二进制)与其他独立数字("二或三")。
+
+    形状白名单(2026-11-08 用户决策 B+C,取代旧"子串证据 + all([])
+    空真终检"——旧路径对"二氧化硫是一种气体"类"二X"构词与"二或三"
+    类混合数字假通过,实证 5 例):① 精确答案词;② 等式形态("=2" 结尾或"等于二"自然等式,
+    前瞻排除"二十/2.5"类尾随数);③ 答案前缀模板剥除后恰为答案词
+    ("答案是二"/"the answer is two"/"这是二")。非等式形态下,ASCII 或
+    中文的其他独立数字一律拒绝("2 或 3"/"二或三" 对称防线)。"""
     normalized = _normalize_answer(text)
     if not normalized:
         return False
-    if normalized in {"2", "二", "兩", "两", "two"}:
+    if normalized in _ANSWER_WORDS:
         return True
     if _NEGATION.search(normalized) or _MULTI_DIGIT.search(normalized):
         return False
-    if not (
-        _STANDALONE_TWO.search(normalized) is not None
-        or _ENGLISH_TWO.search(normalized) is not None
-        or _STANDALONE_CN_TWO.search(normalized) is not None
-    ):
-        return False
+    if normalized.endswith("=2") or _EQUATION_TWO.search(normalized) is not None:
+        return True
+    # 非等式形态:其他独立数字(ASCII/中文)即拒;剩余只认前缀模板形状
     digits = _STANDALONE_DIGIT.findall(normalized)
-    return (
-        normalized.endswith("=2")
-        or _EQUATION_TWO.search(normalized) is not None
-        or all(d == "2" for d in digits)
-    )
+    if not all(d == "2" for d in digits):
+        return False
+    if _OTHER_STANDALONE_CN_NUMERAL.search(normalized):
+        return False
+    return _ANSWER_PREFIX.sub("", normalized, count=1) in _ANSWER_WORDS
 
 
 def _image_answer_ok(text):
@@ -129,7 +142,8 @@ def smoke_vlm_text(vlm, failures):
     try:
         text = vlm.get_completion(prompt="用一个词回答:1 加 1 等于几?")
         # 语义判据:不接受 "2025"/"12"/否定句等含 "2" 的 substring 假通过,
-        # 但允许 "答案是2"/"1+1=2" 这类自然正确回答。
+        # 但允许 "答案是2"/"1+1=2" 这类自然正确回答;"二X"构词(二氧化硫/
+        # 二进制)与其他独立数字("二或三")同样拒绝(2026-11-08 B+C)。
         hint = _text_answer_ok(text)
         print(f"[vlm-text]   {'OK' if hint else 'FAIL'} chars={len(text) if isinstance(text, str) else 0} answer_correct={hint}")
         if not hint:

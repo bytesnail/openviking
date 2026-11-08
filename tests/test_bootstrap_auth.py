@@ -576,7 +576,7 @@ def test_truncated_admin_response_is_controlled_failure(monkeypatch):
         def __exit__(self, *args):
             return False
 
-        def read(self):
+        def read(self, *args):
             raise http.client.IncompleteRead(b"{}")
 
     monkeypatch.setattr(
@@ -848,6 +848,151 @@ def test_provision_existing_cli_config_tightens_permissions(sandbox, ovserver):
         ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
     ) == ba.RC_OK
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
+    assert ovserver.users_calls == 0
+
+
+def _write_provision_reuse_config(sandbox, ovserver, saved_content=None):
+    """provision --cli-config 复用路径的共同前置:身份匹配、自带 timeout 的
+    active(active 侧无需写回,隔离出 saved profile 的行为)+ 可选的
+    同目录 saved profile(ovcli.conf.local)内容。"""
+    config = sandbox.home / ".openviking" / "ovcli.conf"
+    config.parent.mkdir()
+    config.write_text(json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor", "timeout": 300,
+    }))
+    saved = config.parent / "ovcli.conf.local"
+    if saved_content is not None:
+        saved.write_text(saved_content)
+    return config, saved
+
+
+def test_provision_reuse_syncs_matching_saved_profile_timeout(
+    sandbox, ovserver, capsys
+):
+    config, saved = _write_provision_reuse_config(sandbox, ovserver, json.dumps({
+        "url": ovserver.url, "api_key": "USERKEY-stale-9999999999999999999999",
+        "account": "default", "user": "meteor",
+    }))
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    saved_cfg = json.loads(saved.read_text())
+    # 身份匹配即同步 timeout;陈旧 api_key 不阻止(离线不可见,措辞纪律:
+    # 确认行只声称身份匹配,不得暗示凭据一致)
+    assert saved_cfg["timeout"] == 300
+    assert saved_cfg["api_key"] == "USERKEY-stale-9999999999999999999999"
+    assert (
+        "已确认 ovcli.conf.local 的 timeout 契约"
+        "(身份匹配 url/account/user;api_key 未在线核验)" in capsys.readouterr().out
+    )
+    assert ovserver.users_calls == 0
+
+
+def test_provision_reuse_saved_sufficient_timeout_confirmed_not_clobbered(
+    sandbox, ovserver, capsys
+):
+    config, saved = _write_provision_reuse_config(sandbox, ovserver, json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor", "timeout": 600,
+    }))
+    before = saved.read_bytes()
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    # 已有充分 timeout 不覆盖(与 active 同一 _clamp_cfg_timeout 谓词)
+    assert saved.read_bytes() == before
+    assert "已确认 ovcli.conf.local 的 timeout 契约" in capsys.readouterr().out
+    assert ovserver.users_calls == 0
+
+
+def test_provision_reuse_drifted_saved_url_preserved_with_warning(
+    sandbox, ovserver, capsys
+):
+    config, saved = _write_provision_reuse_config(sandbox, ovserver, json.dumps({
+        "url": "http://127.0.0.1:1934", "api_key": TEST_KEY,
+        "account": "default", "user": "meteor",
+    }))
+    before = saved.read_bytes()
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    # 漂移 saved:告警放行(2026-11-08 用户决策),字节级保留现场
+    assert saved.read_bytes() == before
+    assert (
+        "警告:ovcli.conf.local 身份(url/account/user)与目标不一致,"
+        "未同步 timeout,已原样保留" in capsys.readouterr().err
+    )
+    assert ovserver.users_calls == 0
+
+
+def test_provision_reuse_saved_with_root_key_preserved_with_warning(
+    sandbox, ovserver, capsys
+):
+    config, saved = _write_provision_reuse_config(sandbox, ovserver, json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor", "root_api_key": ROOT_KEY,
+    }))
+    before = saved.read_bytes()
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    # 含 root_api_key 的 saved:provision 域永不触碰(与 active 侧
+    # _cli_config_for_output 同一防线),告警放行
+    assert saved.read_bytes() == before
+    assert (
+        "警告:ovcli.conf.local 含 root_api_key,"
+        "未同步 timeout,已原样保留" in capsys.readouterr().err
+    )
+    assert ovserver.users_calls == 0
+
+
+def test_provision_reuse_unparseable_saved_preserved_with_warning(
+    sandbox, ovserver, capsys
+):
+    config, saved = _write_provision_reuse_config(
+        sandbox, ovserver, "{not-json",
+    )
+    before = saved.read_bytes()
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    # 不可解析的邻居文件不得阻断健康的 active 复用(直接换 _ensure_cli_timeout
+    # 的天真方案在此会 RC_CLI_CONFIG 硬失败——本用例即钉住告警放行语义)
+    assert saved.read_bytes() == before
+    assert (
+        "警告:ovcli.conf.local 无法解析,"
+        "未同步 timeout,已原样保留" in capsys.readouterr().err
+    )
+    assert ovserver.users_calls == 0
+
+
+def test_provision_reuse_saved_timeout_write_failure_hard_fails(
+    sandbox, ovserver, monkeypatch, capsys
+):
+    config, saved = _write_provision_reuse_config(sandbox, ovserver, json.dumps({
+        "url": ovserver.url, "api_key": TEST_KEY,
+        "account": "default", "user": "meteor",
+    }))
+    before = saved.read_bytes()
+    fail_os_replace_under_sandbox(monkeypatch, sandbox)
+    # 身份匹配(属本身份域)但写回失败:与 active 的 timeout 失败同一
+    # RC_CLI_CONFIG 硬失败,不是告警放行
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_CLI_CONFIG
+    assert saved.read_bytes() == before
+    assert "错误:无法确保 ovcli.conf.local 的 timeout=300" in capsys.readouterr().err
+
+
+def test_provision_reuse_without_saved_no_warning(sandbox, ovserver, capsys):
+    config, _saved = _write_provision_reuse_config(sandbox, ovserver)
+    assert ba.provision_user(
+        ROOT_KEY, ovserver.url, "meteor", "user", cli_config_path=str(config),
+    ) == ba.RC_OK
+    # 常见路径(saved 不存在)零新增噪音
+    captured = capsys.readouterr()
+    assert "警告" not in captured.err and "已确认" not in captured.out
     assert ovserver.users_calls == 0
 
 

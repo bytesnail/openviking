@@ -81,6 +81,39 @@ def test_text_probe_rejects_wrong_chinese_numerals(answer):
 
 
 @pytest.mark.parametrize("answer", [
+    "二氧化硫是一种气体", "答案是二进制", "二进制是一种计数系统",
+    "这是二次函数的图像", "二极管单向导电", "二手市场很热闹",
+])
+def test_text_probe_rejects_er_word_rambles(answer):
+    """"二X"构词(二氧化硫/二进制/二次/二极管/二手)不是数字答案:旧判据的
+    "独立二"证据只排除数字语境,对非数字后接字符的构词放行,再经 all([])
+    空真终检假通过(2026-11-08 评审实证;用户决策 B+C:改形状白名单)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == ["vlm-text"]
+
+
+@pytest.mark.parametrize("answer", ["二或三", "答案是二或五", "二加三"])
+def test_text_probe_rejects_other_standalone_cn_numerals(answer):
+    """中文分支补 ASCII 分支的对称防线:含其他独立中文数字(三四五…)的回答
+    是错误应答("二或三"),不得因"二"证据放行(2026-11-08 决策 C)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == ["vlm-text"]
+
+
+@pytest.mark.parametrize("answer", [
+    "两", "答案是 2", "答案:二", "这是二", "当然是二", "the answer is 2",
+])
+def test_text_probe_accepts_prefix_template_answers(answer):
+    """B 形状白名单的不损失守卫:今天经"子串证据+空真"放行的答案前缀模板
+    形态,收紧后必须继续通过("两"此前不在精确集合,经空真路径放行)。"""
+    failures = []
+    sm.smoke_vlm_text(DummyVLM(text=answer), failures)
+    assert failures == []
+
+
+@pytest.mark.parametrize("answer", [
     "blue", "The image is not red; it is blue.", "The image isn't red", "不红", "hundred", "不是红色",
 ])
 def test_image_probe_rejects_nonempty_wrong_color(monkeypatch, answer):

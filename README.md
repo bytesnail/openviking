@@ -50,10 +50,10 @@ model-serving 属 `/mnt/usr/tools/model-serving` 仓库,本仓库是其消费者
 
 | 端口 | 服务 | 谁消费 | 本仓库落点 |
 |---|---|---|---|
-| 1933 | OpenViking API(`openviking` 服务) | CLI/插件/bootstrap/全部验收 | `compose.yaml OPENVIKING_SERVER_PORT`、`scripts/prepare.sh` 空闲门禁、`scripts/bootstrap_auth.py DEFAULT_BASE_URL`、`tests/e2e_auth_matrix.sh` 与 `tests/e2e_user_isolation.sh` 的 `BASE` 兜底默认 |
+| 1933 | OpenViking API(`openviking` 服务) | CLI/插件/bootstrap/全部验收 | `compose.yaml OPENVIKING_SERVER_PORT`、`config/ov.conf` `server.port`、`scripts/prepare.sh` 空闲门禁、`scripts/bootstrap_auth.py DEFAULT_BASE_URL`、`tests/e2e_auth_matrix.sh` 与 `tests/e2e_user_isolation.sh` 的 `BASE` 兜底默认 |
 | 18351 | model-serving embedding(`embeddinggemma-2`) | 适配器上游;漂移检查;e2e 探针 | `compose.yaml EMBEDDING_UPSTREAM_URL`、`scripts/embedding_adapter.py DEFAULT_UPSTREAM`、`scripts/env_file.py check_model_drift`、`scripts/prepare.sh` loopback 门禁、`tests/e2e_adapter_probe.py` 兜底默认 |
 | 18352 | model-serving rerank(`qwen3-reranker-0.6b`,纯文本) | OpenViking 服务器直连(不经适配器);漂移检查 | `config/ov.conf` rerank `api_base`、`scripts/env_file.py`、`scripts/prepare.sh` |
-| 18353 | 多模态 embedding 适配器(`embedding-adapter` 服务) | OpenViking 服务器、healthcheck、e2e 探针 | `compose.yaml EMBEDDING_ADAPTER_PORT`、`compose.yaml` healthcheck(`http://127.0.0.1:18353/health`)、`scripts/embedding_adapter.py DEFAULT_PORT`、`scripts/prepare.sh` 空闲门禁、`tests/e2e_adapter_probe.py` 兜底默认 |
+| 18353 | 多模态 embedding 适配器(`embedding-adapter` 服务) | OpenViking 服务器、healthcheck、e2e 探针 | `compose.yaml EMBEDDING_ADAPTER_PORT`、`compose.yaml` healthcheck(`http://127.0.0.1:18353/health`)、`config/ov.conf` embedding `api_base`、`scripts/embedding_adapter.py DEFAULT_PORT`、`scripts/prepare.sh` 空闲门禁、`tests/e2e_adapter_probe.py` 兜底默认 |
 
 两层层级为有意设计:ov.conf 的 embedding `api_base` 指向 18353(适配器)而
 非 18351;rerank 纯文本直连 18352。

@@ -572,18 +572,25 @@ def _env_int(name, default, minimum=1):
     return value
 
 
-def _loopback_host(host):
-    """宿主地址必须显式是 IPv4 loopback:模块安全约束是"只监听 loopback",
-    容器为 host 网络且适配器无认证,误绑 0.0.0.0 会把无鉴权代理暴露到局域网,
-    必须 fail loud 而非静默照绑。不支持 ::1:ThreadingHTTPServer 默认
+def _require_ipv4_loopback(host, label):
+    """共享白名单谓词:监听地址与上游地址是同一安全约束的两处入口
+    (误配 0.0.0.0 暴露无鉴权代理 / 把请求正文带出本机),放行策略必须
+    单一来源,启动即 fail loud。不支持 ::1:ThreadingHTTPServer 默认
     AF_INET,接受 ::1 只会在 bind 处抛裸 gaierror,而非受控配置错误。"""
     resolved = {"localhost": "127.0.0.1"}.get(host, host)
     if resolved not in ("127.0.0.1",):
         raise SystemExit(
-            f"配置错误:EMBEDDING_ADAPTER_HOST={host} 不是 IPv4 loopback;"
-            "本适配器只允许绑定 127.0.0.1/localhost(不支持 ::1)"
+            f"配置错误:{label}={host} 不是 IPv4 loopback;"
+            "本适配器只允许 127.0.0.1/localhost(不支持 ::1)"
         )
     return resolved
+
+
+def _loopback_host(host):
+    """宿主地址必须显式是 IPv4 loopback:模块安全约束是"只监听 loopback",
+    容器为 host 网络且适配器无认证,误绑 0.0.0.0 会把无鉴权代理暴露到局域网,
+    必须 fail loud 而非静默照绑。"""
+    return _require_ipv4_loopback(host, "EMBEDDING_ADAPTER_HOST")
 
 
 def _loopback_upstream_url(url):
@@ -596,12 +603,7 @@ def _loopback_upstream_url(url):
         raise SystemExit(
             f"配置错误:EMBEDDING_UPSTREAM_URL={url} 无法解析"
         ) from None
-    resolved = {"localhost": "127.0.0.1"}.get(host, host)
-    if resolved not in ("127.0.0.1",):
-        raise SystemExit(
-            f"配置错误:EMBEDDING_UPSTREAM_URL={url} 的主机不是 IPv4 loopback;"
-            "上游只允许 127.0.0.1/localhost"
-        )
+    _require_ipv4_loopback(host, "EMBEDDING_UPSTREAM_URL")
     return url
 
 
